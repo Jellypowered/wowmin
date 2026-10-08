@@ -12,6 +12,8 @@ import jpeg from 'jpeg-js';
 import BLPFile from 'js-blp';
 import { PNG } from 'pngjs';
 
+import { exportMapScene } from './scene/export-scene.mjs';
+
 const require = createRequire(import.meta.url);
 const { MpqArchive } = require('stormlib-js');
 
@@ -76,6 +78,8 @@ const DEFAULTS = {
   output: path.resolve(process.cwd(), 'assets/maps'),
   quality: 90,
   keepWorkspace: false,
+  scenes: false,
+  sceneTextureMax: 512,
 };
 
 function readNpmConfigValue(name) {
@@ -111,6 +115,8 @@ Options:
   --workspace, -w     Temp/work directory used while extracting MPQs
   --quality, -q       JPEG quality (1-100, default: 90)
   --keep-workspace    Keep extracted minimap tiles instead of deleting temp files
+  --scenes            Also export a 3D scene (<mapId>.glb) per targeted map (needs --map or --all-instances)
+  --scene-texture-max Largest scene texture edge in pixels (default: 512)
   --help, -h          Show this message
 
 Notes:
@@ -138,6 +144,8 @@ function parseArgs(argv) {
     workspace: readNpmConfigValue('workspace'),
     quality: Number.parseInt(readNpmConfigValue('quality') ?? String(DEFAULTS.quality), 10),
     keepWorkspace: readNpmConfigBoolean('keep_workspace') ?? DEFAULTS.keepWorkspace,
+    scenes: readNpmConfigBoolean('scenes') ?? DEFAULTS.scenes,
+    sceneTextureMax: Number.parseInt(readNpmConfigValue('scene_texture_max') ?? String(DEFAULTS.sceneTextureMax), 10),
   };
   const positional = [];
 
@@ -173,6 +181,12 @@ function parseArgs(argv) {
         break;
       case '--keep-workspace':
         options.keepWorkspace = true;
+        break;
+      case '--scenes':
+        options.scenes = true;
+        break;
+      case '--scene-texture-max':
+        options.sceneTextureMax = Number.parseInt(argv[++i] ?? '', 10);
         break;
       case '--help':
       case '-h':
@@ -383,6 +397,7 @@ function parseMapDbc(buffer, requestedMapIds, allInstances = false) {
       mapType,
       mapTypeLabel: mapTypeLabels[mapType] ?? `type-${mapType}`,
       label: displayName || internalName || `Map ${mapId}`,
+      internalName,
       candidates: [internalName],
     });
   }
@@ -1260,6 +1275,75 @@ function stitchFloorTarget(target, outputDir, quality) {
   };
 }
 
+async function exportScenes(options, summaries, missingTargets) {
+  const dataDir = locateDataDir(options.source);
+  if (!dataDir) throw new Error('--scenes needs a WoW client Data directory as --source.');
+  // Highest priority first, so patches override the base archives.
+  const archives = findMpqArchives(dataDir).reverse().flatMap((archivePath) => {
+    try {
+      return [MpqArchive.open(archivePath)];
+    } catch (error) {
+      console.warn(`  ! Skipping ${path.basename(archivePath)} for scene export: ${error instanceof Error ? error.message : error}`);
+      return [];
+    }
+  });
+  const readFile = (fileName) => {
+    for (const archive of archives) {
+      const file = extractMpqFile(archive, [fileName]);
+      if (file) return file;
+    }
+    return null;
+  };
+
+  // Maps without world-map artwork still get a scene, with metadata of their own.
+  const entries = [
+    ...summaries.map(({ continent, metadataPath }) => ({ continent, metadataPath })),
+    ...missingTargets.map((target) => ({ continent: target, metadataPath: path.join(options.output, `${target.mapId}.json`) })),
+  ];
+  try {
+    for (const { continent, metadataPath } of entries) {
+      if (!continent.internalName || !metadataPath) continue;
+      console.log(`• Exporting 3D scene for ${continent.label}...`);
+      try {
+        const metadata = pathExists(metadataPath)
+          ? JSON.parse(fs.readFileSync(metadataPath, 'utf8'))
+          : {
+            mapId: continent.mapId,
+            label: continent.label,
+            mapType: continent.mapType ?? null,
+            mapTypeLabel: continent.mapTypeLabel ?? null,
+            clientDirectory: null,
+          };
+        const { scene, stats } = await exportMapScene({
+          mapId: continent.mapId,
+          internalName: continent.internalName,
+          readFile,
+          outputDir: options.output,
+          textureMax: options.sceneTextureMax,
+          floors: metadata.floors ?? [],
+        });
+        fs.writeFileSync(metadataPath, `${JSON.stringify({ ...metadata, schemaVersion: 3, scene }, null, 2)}\n`);
+        console.log(`  ✓ Wrote ${scene.file} (${(stats.bytes / 1048576).toFixed(1)} MB; ${stats.wmoCount} WMO, `
+          + `${stats.groupCount} groups, ${stats.doodadCount} doodads, ${stats.modelCount} models, ${stats.textureCount} textures)`);
+        for (const skipped of stats.skippedWmos) console.warn(`  ! Skipped WMO ${skipped}`);
+        if (stats.missing.length) {
+          console.warn(`  ! ${stats.missing.length} referenced file(s) not found in the client, e.g. ${stats.missing.slice(0, 3).join(', ')}`);
+        }
+      } catch (error) {
+        console.warn(`  ! Skipping scene for ${continent.label}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  } finally {
+    for (const archive of archives) {
+      try {
+        archive.close();
+      } catch {
+        // ignore close failures
+      }
+    }
+  }
+}
+
 async function main() {
   let options;
 
@@ -1301,6 +1385,14 @@ async function main() {
   }
   if (options.mapDir && options.mapIds.length !== 1) {
     fail('--map-dir requires exactly one --map value.');
+    return;
+  }
+  if (options.scenes && options.mapIds.length === 0 && !options.allInstances) {
+    fail('--scenes requires --map or --all-instances.');
+    return;
+  }
+  if (!Number.isInteger(options.sceneTextureMax) || options.sceneTextureMax < 1) {
+    fail(`Scene texture size must be a positive integer. Received: ${options.sceneTextureMax}`);
     return;
   }
 
@@ -1367,6 +1459,8 @@ async function main() {
   if (summaries.length === 0) {
     throw new Error('No maps were produced. Check the resolved minimap folder names and tile naming format.');
   }
+
+  if (options.scenes) await exportScenes(options, summaries, missingTargets);
 
   if (options.allInstances) {
     const indexPath = path.join(options.output, 'index.json');

@@ -8,6 +8,7 @@ import { SoapConfig, SoapResult, ConnectionProfile, DbConfig, DbConnectionState,
 import { inspectRemoteLogs, readRemoteLogTail } from './log-monitor-service';
 import { buildLiveMapTelemetryCommand, parseLiveMapTelemetrySnapshot } from './live-map-telemetry';
 import { SessionRecorder } from './session-recorder';
+import { TelemetryStream } from './telemetry-stream';
 
 const isMac = process.platform === 'darwin';
 const isWin = process.platform === 'win32';
@@ -34,6 +35,15 @@ let telemetryPollTimer: ReturnType<typeof setInterval> | null = null;
 let telemetryPollInFlight: Promise<MapPlayerSnapshot | null> | null = null;
 let latestTelemetrySnapshot: MapPlayerSnapshot | null = null;
 const telemetryPollIntervalMs = Math.max(500, Number(process.env.WOWMIN_TELEMETRY_POLL_MS) || 1000);
+// Live position stream from mod-wowmin-telemetry (WowMinTelemetry.Stream.*).
+// The UDP socket opens only while a session is being watched.
+export const telemetryStream = new TelemetryStream(
+  (command) => soapClient
+    ? soapClient.executeCommand(command)
+    : Promise.resolve({ success: false, message: 'Not connected to the worldserver.' }),
+  process.env.WOWMIN_STREAM_HOST || '127.0.0.1',
+  Number(process.env.WOWMIN_STREAM_PORT) || 7979,
+);
 
 const NAVIGATE_TAB_ITEMS: { label: string; tab: string }[] = [
   { label: 'Dashboard', tab: 'dashboard' },

@@ -3888,7 +3888,13 @@ tbody tr:hover { background: var(--tint-accent-05); }
   background: var(--bg-output);
 }
 
-#instance-watch-canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+#instance-watch-canvas { position: relative; display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+#instance-watch-canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.instance-watch-scene { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+.instance-watch-scene[hidden] { display: none; }
+.instance-view-controls.hidden { display: none; }
+.instance-view-controls .btn[aria-pressed="true"],
+#instance-follow-btn[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 #instance-watch-canvas.panning { cursor: grabbing; }
 .instance-watch-empty {
   position: absolute;

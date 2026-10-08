@@ -65,6 +65,14 @@ if (!window.electronAPI) {
       },
       disconnect: () => invoke('map:disconnect'),
       getPlayerPositions: (mapId, instanceId) => invoke('map:getPlayerPositions', mapId, instanceId),
+      streamPositions: (mapId, instanceId, onFrame, onStatus) => {
+        const source = new EventSource(`/api/stream?map=${mapId}&instance=${instanceId}`);
+        source.addEventListener('frame', (event) => onFrame(JSON.parse((event as MessageEvent<string>).data)));
+        source.addEventListener('status', (event) => onStatus(JSON.parse((event as MessageEvent<string>).data)));
+        // EventSource reconnects by itself; report the gap meanwhile.
+        source.addEventListener('error', () => onStatus('starting'));
+        return () => source.close();
+      },
       getOnlineCounts: () => invoke('map:getOnlineCounts'),
       getBotWaypoint: (request) => invoke('map:getBotWaypoint', request),
     },

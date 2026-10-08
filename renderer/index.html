@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy"
-      content="default-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; img-src 'self' https: data:" />
+      content="default-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; img-src 'self' https: data: blob:; connect-src 'self' blob:" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>WoW Admin – AzerothCore SOAP Console</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1210,12 +1210,25 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
                 <output id="instance-icon-scale-value" for="instance-icon-scale">125%</output>
               </span>
             </label>
+            <label title="How far above or below the party the 3D scene fades out">Height fade
+              <span class="player-icon-scale-control">
+                <input type="range" id="instance-fade-range" min="5" max="50" step="5" value="15" />
+                <output id="instance-fade-range-value" for="instance-fade-range">15 yd</output>
+              </span>
+            </label>
+            <label title="How far around each party member the 3D scene stays visible: solid out to half this distance, gone at the full distance. 0 turns it off.">Horizontal fade
+              <span class="player-icon-scale-control">
+                <input type="range" id="instance-horizontal-fade" min="0" max="200" step="10" value="40" />
+                <output id="instance-horizontal-fade-value" for="instance-horizontal-fade">40 yd</output>
+              </span>
+            </label>
             <div class="btn-row">
               <button id="instance-refresh-btn" class="btn btn-small">Refresh now</button>
-              <button id="instance-fit-btn" class="btn btn-small" title="Reset pan and zoom">Fit view</button>
+              <button id="instance-fit-btn" class="btn btn-small" title="Reset pan, zoom, rotation, and tilt">Fit view</button>
               <button id="instance-zoom-out-btn" class="btn btn-small" title="Zoom out">−</button>
               <button id="instance-zoom-in-btn" class="btn btn-small" title="Zoom in">+</button>
               <button id="instance-clear-focus-btn" class="btn btn-small hidden" title="Clear participant focus">Clear focus</button>
+              <button id="instance-follow-btn" class="btn btn-small" title="Keep the selected participant centred" aria-pressed="false">Follow</button>
             </div>
           </div>
         </div>
@@ -1259,7 +1272,13 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
           </div>
         </div>
         <div class="instance-canvas-wrapper">
-          <canvas id="instance-watch-canvas"></canvas>
+          <canvas id="instance-watch-scene" class="instance-watch-scene" hidden></canvas>
+          <canvas id="instance-watch-canvas" tabindex="0"></canvas>
+          <div id="instance-view-controls" class="map-zoom-controls instance-view-controls hidden">
+            <button id="instance-rotate-left-btn" class="btn btn-tiny" title="Rotate left (Q). Middle-drag or Shift+drag to rotate and tilt freely." aria-label="Rotate view left">⟲</button>
+            <button id="instance-rotate-right-btn" class="btn btn-tiny" title="Rotate right (E). Middle-drag or Shift+drag to rotate and tilt freely." aria-label="Rotate view right">⟳</button>
+            <button id="instance-view-3d-btn" class="btn btn-tiny" title="Switch between the 3D scene and the flat map" aria-pressed="true">3D</button>
+          </div>
           <div id="instance-watch-empty" class="instance-watch-empty">
             <strong>No active instance or battleground sessions</strong>
             <span>This is expected when nobody is currently inside one.</span>

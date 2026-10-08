@@ -1,4 +1,4 @@
-import './main';
+import { telemetryStream } from './main';
 import { createHash, timingSafeEqual } from 'crypto';
 import * as fs from 'fs';
 import { createServer, IncomingMessage, ServerResponse } from 'http';
@@ -46,6 +46,7 @@ const staticFiles: Record<string, string> = {
 
 const mimeTypes: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
+  '.glb': 'model/gltf-binary',
   '.html': 'text/html; charset=utf-8',
   '.ico': 'image/x-icon',
   '.jpeg': 'image/jpeg',
@@ -117,11 +118,26 @@ function resolveStaticFile(urlPath: string): string | null {
   return null;
 }
 
+const assetsRoot = path.join(projectRoot, 'assets');
+
 function serveFile(request: IncomingMessage, response: ServerResponse, filePath: string): void {
   fs.stat(filePath, (statError, stats) => {
     if (statError || !stats.isFile()) {
       sendJson(response, 404, { error: 'Not found' });
       return;
+    }
+    // Extracted map assets (scenes run to megabytes) may be cached, but are
+    // revalidated on every use so a re-extraction shows up immediately.
+    if (filePath.startsWith(`${assetsRoot}${path.sep}`)) {
+      const etag = `W/"${stats.size.toString(36)}-${Math.floor(stats.mtimeMs).toString(36)}"`;
+      response.setHeader('Cache-Control', 'no-cache');
+      response.setHeader('ETag', etag);
+      response.setHeader('Last-Modified', stats.mtime.toUTCString());
+      if (request.headers['if-none-match'] === etag) {
+        response.writeHead(304);
+        response.end();
+        return;
+      }
     }
     response.writeHead(200, {
       'Content-Type': mimeTypes[path.extname(filePath).toLowerCase()] || 'application/octet-stream',
@@ -157,6 +173,32 @@ const server = createServer(async (request, response) => {
   if (!isAuthorized(request)) {
     response.setHeader('WWW-Authenticate', 'Basic realm="WoW Admin", charset="UTF-8"');
     sendJson(response, 401, { error: 'Authentication required' });
+    return;
+  }
+
+  // Server-Sent Events: live positions for one session, from the module's UDP
+  // stream. Events: "status" (starting | streaming | unavailable) and "frame".
+  if (url.pathname === '/api/stream') {
+    const mapId = Number(url.searchParams.get('map'));
+    const instanceId = Number(url.searchParams.get('instance'));
+    if (!Number.isInteger(mapId) || mapId < 0 || !Number.isInteger(instanceId) || instanceId <= 0) {
+      sendJson(response, 400, { error: 'map and instance are required' });
+      return;
+    }
+    response.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    response.write('retry: 3000\n\n');
+    const send = (event: string, data: unknown) => response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    const unwatch = telemetryStream.watch(mapId, instanceId, (frame) => send('frame', frame), (status) => send('status', status));
+    // Comment lines keep idle connections open through proxies.
+    const keepAlive = setInterval(() => response.write(': keep-alive\n\n'), 15000);
+    request.on('close', () => {
+      clearInterval(keepAlive);
+      unwatch();
+    });
     return;
   }
 

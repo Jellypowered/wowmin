@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
-import { SoapConfig, SoapResult, DbConfig, DbConnectionState, QueryResult, FieldInfo, ConnectionProfile, UpdateCheckResult, EntityMediaPreviewRequest, EntityMediaPreviewResult, LogMonitorConfig, LogMonitorInspectionResult, LogMonitorFileTailResult, MapPlayerSnapshot, MapBotWaypointRequest, MapBotWaypoint, CharacterInventoryResult, EconomyOverview, EconomyCharacterGoldResult, EconomyAuctionRow, EconomyMarketSummaryRow, SessionIndexEntry, SessionRecord } from './types/electron';
+import { SoapConfig, SoapResult, DbConfig, DbConnectionState, QueryResult, FieldInfo, ConnectionProfile, UpdateCheckResult, EntityMediaPreviewRequest, EntityMediaPreviewResult, LogMonitorConfig, LogMonitorInspectionResult, LogMonitorFileTailResult, MapPlayerSnapshot, MapBotWaypointRequest, MapBotWaypoint, CharacterInventoryResult, EconomyOverview, EconomyCharacterGoldResult, EconomyAuctionRow, EconomyMarketSummaryRow, SessionIndexEntry, SessionRecord, StreamFrame, StreamStatus } from './types/electron';
 
 // Type-safe IPC wrapper for renderer process
 const electronAPI = {
@@ -87,6 +87,13 @@ const electronAPI = {
       ipcRenderer.invoke('map:getOnlineCounts'),
     getBotWaypoint: (request: MapBotWaypointRequest): Promise<MapBotWaypoint | null> =>
       ipcRenderer.invoke('map:getBotWaypoint', request),
+    // Live position stream; only the web service provides it (web-api.ts).
+    streamPositions: undefined as undefined | ((
+      mapId: number,
+      instanceId: number,
+      onFrame: (frame: StreamFrame) => void,
+      onStatus: (status: StreamStatus) => void,
+    ) => () => void),
   },
 
   sessions: {

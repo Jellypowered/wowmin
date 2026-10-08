@@ -158,6 +158,36 @@ export interface MapSessionEvent {
   amount: number;
 }
 
+// Live position stream (mod-wowmin-telemetry UDP stream, relayed by the web
+// service). Carries only fast-changing per-player state; the once-a-second
+// snapshot remains the source for everything else.
+export interface StreamPlayerSample {
+  guid: number;
+  name: string;
+  x: number;
+  y: number;
+  z: number;
+  orientation: number;
+  healthPct: number;
+  powerPct: number;
+  powerType: number;
+  alive: boolean;
+  inCombat: boolean;
+  waitingForResurrect: boolean;
+  stateFlags: number;
+  wmoGroupId: number;
+}
+
+export interface StreamFrame {
+  mapId: number;
+  instanceId: number;
+  sequence: number;
+  serverTimeMs: number;
+  players: StreamPlayerSample[];
+}
+
+export type StreamStatus = 'starting' | 'streaming' | 'unavailable';
+
 export interface MapPlayerSnapshot {
   players: MapPlayerPosition[];
   battlegrounds: MapBattlegroundState[];

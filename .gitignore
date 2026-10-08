@@ -49,3 +49,8 @@ docs/
 
 # Personal Dev Plans
 plans/
+# graphify knowledge-graph output
+graphify-out/
+
+# Web service runtime data (recorded sessions)
+.wowmin-data/

@@ -1,13 +1,17 @@
 /// <reference path="./types/window.d.ts" />
 import { ts, escapeHtml, showResult, debounce, getMapName, CLASS_COLORS, RACE_NAMES, CLASS_NAMES } from './utils/helpers';
 import { parseOnlineList, playersFromDatabase } from './utils/online-players';
-import { type ActiveInstanceSession, type DungeonMapFloor, type InstanceCoordinateBounds, type InstanceProjectionViewport, type InstanceViewTransform, applyInstanceViewTransform, getBattlegroundObjectiveLabels, getBattlegroundStatusLabel, getBattlegroundStrategyLabel, getInstanceCoordinateBounds, getInstanceFactionColor, getInstanceMapProfile, getInstanceProjectionViewport, getParticipantDungeonFloor, groupActiveInstanceSessions, parseInstanceSessionKey, projectInstancePosition, projectMinimapTilePosition, zoomInstanceViewAt } from './utils/instance-watch';
+import { type ActiveInstanceSession, type DungeonMapFloor, type InstanceCoordinateBounds, type InstanceProjectionViewport, type InstanceViewTransform, applyInstanceViewTransform, getBattlegroundObjectiveLabels, getBattlegroundStatusLabel, getBattlegroundStrategyLabel, getInstanceCoordinateBounds, getInstanceFactionColor, getInstanceMapProfile, getInstanceProjectionViewport, getParticipantDungeonFloor, groupActiveInstanceSessions, parseInstanceSessionKey, zoomInstanceViewAt } from './utils/instance-watch';
+import { clampIsoPitch, createFlatProjection, createIsoView, DEFAULT_ISO_YAW, type FadeSettings, getFadeVolumes, getHeightBand, getIsoPanForCenter, getNextQuarterTurn, ISO_PITCH, type IsoView, type MapProjection, resolveMinimapTileProjection, type SceneBox } from './utils/map-projection';
+import { InstanceSceneView } from './instance-scene/scene-view';
+import { applyLiveSample, LivePositionBuffer } from './utils/live-positions';
 import { CONTINENT_BOUNDS, worldToCanvas } from './utils/map-coords';
 import { getEnglishMotd, getServerUptime } from './utils/dashboard-data';
 import { calculateSessionTotalsAt, formatSessionReplayTime, isSessionRouteDiscontinuity } from './utils/session-replay';
 import { getClassIconHtml, getClassIconImage, getPlayerStateIconsHtml, getPlayerStateIndicators, getRacePortraitHtml, getResponsivePlayerIconScale, getStateIconImage, loadPlayerIconManifest } from './utils/player-icons';
 import { formatBattlegroundOutcome } from '../../src/session-outcome';
 import { AppState, createInitialState, PlayerInfo } from './types/state';
+import type { StreamStatus } from '../../src/types/electron';
 import type { ConnectionProfile, DbConfig, SoapConfig, UpdateCheckResult, EntityMediaPreviewResult, LogMonitorConfig, LogMonitorInspectionResult, MapBattlegroundState, MapInstanceDeath, MapInstanceState, MapPlayerPosition, MapBotWaypoint, CharacterInventoryResult, EconomyOverview, EconomyCharacterGoldResult, EconomyAuctionRow, EconomyMarketSummaryRow, SessionIndexEntry, SessionRecord, SessionRoutePoint } from '../../src/types/electron';
 import { bindInventoryTableTooltips, formatInventoryLocation, ITEM_QUALITY_COLOR } from './inventory/wow-item-tooltip';
 
@@ -6457,6 +6461,16 @@ const $instanceBossList = $<HTMLElement>('instance-boss-list');
 const $instanceDeathHistory = $<HTMLElement>('instance-death-history');
 const $instanceWatchCanvas = $<HTMLCanvasElement>('instance-watch-canvas');
 const $instanceWatchEmpty = $<HTMLElement>('instance-watch-empty');
+const $instanceWatchScene = $<HTMLCanvasElement>('instance-watch-scene');
+const $instanceViewControls = $<HTMLElement>('instance-view-controls');
+const $instanceRotateLeftBtn = $<HTMLButtonElement>('instance-rotate-left-btn');
+const $instanceRotateRightBtn = $<HTMLButtonElement>('instance-rotate-right-btn');
+const $instanceView3dBtn = $<HTMLButtonElement>('instance-view-3d-btn');
+const $instanceFadeRange = $<HTMLInputElement>('instance-fade-range');
+const $instanceFadeRangeValue = $<HTMLOutputElement>('instance-fade-range-value');
+const $instanceHorizontalFade = $<HTMLInputElement>('instance-horizontal-fade');
+const $instanceHorizontalFadeValue = $<HTMLOutputElement>('instance-horizontal-fade-value');
+const $instanceFollowBtn = $<HTMLButtonElement>('instance-follow-btn');
 const $instanceWatchTitle = $<HTMLElement>('instance-watch-title');
 const $instanceWatchSubtitle = $<HTMLElement>('instance-watch-subtitle');
 const $instanceWatchStatus = $<HTMLElement>('instance-watch-status');
@@ -6485,6 +6499,14 @@ interface InstanceMapAssetMetadata {
   worldMapBounds?: InstanceCoordinateBounds | null;
   projection?: { type: 'worldMapArea' | 'minimapTiles' | 'dungeonFloors' };
   floors?: DungeonMapFloor[];
+  scene?: InstanceSceneMetadata;
+}
+
+interface InstanceSceneMetadata {
+  file: string;
+  bounds: SceneBox;
+  groups: Array<{ wmoGroupId: number; exterior: boolean; minZ: number; maxZ: number }>;
+  floors: Array<{ id: number; minZ: number; maxZ: number }>;
 }
 
 interface LoadedInstanceMapAsset {
@@ -6510,8 +6532,100 @@ let instanceBaseViewport: InstanceProjectionViewport | null = null;
 let instanceMarkerHitAreas: Array<{ name: string; x: number; y: number; radius: number }> = [];
 let instancePanStart: { x: number; y: number; panX: number; panY: number; moved: boolean } | null = null;
 const instanceMapAssets = new Map<number, LoadedInstanceMapAsset | null>();
+// Live position stream for the selected session (web service only).
+const instanceLivePositions = new LivePositionBuffer();
+// Redraw cap while animating live positions.
+const INSTANCE_LIVE_FRAME_MS = 33;
+let instanceLiveStream: { key: string; stop: () => void; status: StreamStatus } | null = null;
+let instanceLiveAnimating = false;
+let instanceLiveLastDrawAt = 0;
+const INSTANCE_VIEW_3D_STORAGE_KEY = 'wowmin.instanceView3d';
+// Scene geometry fades out over this many yards above and below the height
+// range of the focused party, and is not drawn beyond it. Set per viewer.
+const INSTANCE_FADE_RANGE_STORAGE_KEY = 'wowmin.instanceFadeRange';
+const INSTANCE_FADE_RANGE_DEFAULT = 15;
+const INSTANCE_FADE_RANGE_MIN = 5;
+const INSTANCE_FADE_RANGE_MAX = 50;
+let instanceFadeRange = readStoredInstanceFadeRange();
+// Horizontal reach of the party fade in yards; 0 turns it off.
+const INSTANCE_HORIZONTAL_FADE_STORAGE_KEY = 'wowmin.instanceHorizontalFade';
+const INSTANCE_HORIZONTAL_FADE_DEFAULT = 40;
+const INSTANCE_HORIZONTAL_FADE_MAX = 200;
+let instanceHorizontalFade = readStoredInstanceHorizontalFade();
+const INSTANCE_ROTATE_DURATION_MS = 220;
+const instanceViewYaws = new Map<string, number>();
+const instanceViewPitches = new Map<string, number>();
+// Captured 3D framing per session (see renderInstanceScene).
+const instanceSceneFrames = new Map<string, { floorId: number | null; box: SceneBox }>();
+// Radians of orbit per pixel dragged.
+const INSTANCE_ORBIT_SPEED = 0.008;
+const INSTANCE_FOLLOW_STORAGE_KEY = 'wowmin.instanceFollow';
+let instanceFollowSelected = readStoredInstanceFollow();
+const INSTANCE_FOLLOW_EASE_MS = 700;
+let instanceFollowAnimation: { fromX: number; fromY: number; toX: number; toY: number; startedAt: number } | null = null;
+let instanceOrbitStart: { x: number; y: number; yaw: number; pitch: number; center: [number, number, number] } | null = null;
+let instanceView3d = readStoredInstanceView3d();
+let instanceSceneView: InstanceSceneView | null | undefined;
+let instanceIsoContext: { box: SceneBox; width: number; height: number; view: IsoView } | null = null;
+let instanceRotation: { from: number; to: number; startedAt: number; center: [number, number, number] } | null = null;
 const instanceMapAssetLoads = new Set<number>();
 const INSTANCE_DISCOVERY_INTERVAL_MS = 10_000;
+
+// Opens the stream for the selected session while Instance Watch is showing
+// with auto-refresh on, and closes it otherwise.
+function syncInstanceLiveStream(): void {
+  const streamPositions = window.electronAPI.map.streamPositions;
+  const session = getSelectedInstanceSession();
+  const wanted = streamPositions && session && session.instanceId > 0 && state.connected
+    && getActiveMainTabId() === 'instances' && $instanceAutoRefresh?.checked
+    ? session
+    : null;
+  if (instanceLiveStream && instanceLiveStream.key === wanted?.key) return;
+  instanceLiveStream?.stop();
+  instanceLiveStream = null;
+  instanceLivePositions.clear();
+  if (!wanted || !streamPositions) return;
+  const stream: { key: string; stop: () => void; status: StreamStatus } = { key: wanted.key, stop: () => {}, status: 'starting' };
+  stream.stop = streamPositions(wanted.mapId, wanted.instanceId, (frame) => {
+    if (instanceLiveStream !== stream) return;
+    instanceLivePositions.push(frame, performance.now());
+    startInstanceLiveAnimation();
+  }, (status) => {
+    if (instanceLiveStream !== stream) return;
+    stream.status = status;
+  });
+  instanceLiveStream = stream;
+}
+
+function startInstanceLiveAnimation(): void {
+  if (instanceLiveAnimating) return;
+  instanceLiveAnimating = true;
+  const step = (now: number) => {
+    if (!instanceLivePositions.isActive(now) || getActiveMainTabId() !== 'instances') {
+      instanceLiveAnimating = false;
+      return;
+    }
+    if (now - instanceLiveLastDrawAt >= INSTANCE_LIVE_FRAME_MS) {
+      instanceLiveLastDrawAt = now;
+      renderInstanceCanvas();
+    }
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+// The session with stream positions applied, for drawing the map.
+function withLivePositions(session: ActiveInstanceSession | null): ActiveInstanceSession | null {
+  if (!session || instanceLiveStream?.key !== session.key) return session;
+  const now = performance.now();
+  return {
+    ...session,
+    players: session.players.map((player) => {
+      const sample = instanceLivePositions.sampleAt(player.name, now);
+      return sample ? applyLiveSample(player, sample) : player;
+    }),
+  };
+}
 
 function getSelectedInstanceSession(): ActiveInstanceSession | null {
   return activeInstanceSessions.find((session) => session.key === selectedInstanceKey) ?? null;
@@ -6529,15 +6643,265 @@ function getSelectedInstanceDeaths(): MapInstanceDeath[] {
   return selectedInstanceKey ? activeInstanceDeaths.get(selectedInstanceKey) ?? [] : [];
 }
 
+function getInstanceMetadataUrl(mapId: number): URL {
+  return new URL(`../assets/instances/${mapId}.json`, window.location.href);
+}
+
+function clampInstanceFadeRange(yards: number): number {
+  return Number.isFinite(yards)
+    ? Math.max(INSTANCE_FADE_RANGE_MIN, Math.min(INSTANCE_FADE_RANGE_MAX, yards))
+    : INSTANCE_FADE_RANGE_DEFAULT;
+}
+
+function readStoredInstanceFadeRange(): number {
+  try {
+    const stored = window.localStorage.getItem(INSTANCE_FADE_RANGE_STORAGE_KEY);
+    return clampInstanceFadeRange(stored === null ? INSTANCE_FADE_RANGE_DEFAULT : Number(stored));
+  } catch {
+    return INSTANCE_FADE_RANGE_DEFAULT;
+  }
+}
+
+function setInstanceFadeRange(yards: number, render = true): void {
+  instanceFadeRange = clampInstanceFadeRange(yards);
+  if ($instanceFadeRange) $instanceFadeRange.value = String(instanceFadeRange);
+  if ($instanceFadeRangeValue) $instanceFadeRangeValue.textContent = `${instanceFadeRange} yd`;
+  try {
+    window.localStorage.setItem(INSTANCE_FADE_RANGE_STORAGE_KEY, String(instanceFadeRange));
+  } catch {
+    // Preference is per-session only when storage is unavailable.
+  }
+  if (render) renderInstanceCanvas();
+}
+
+function clampInstanceHorizontalFade(yards: number): number {
+  return Number.isFinite(yards) ? Math.max(0, Math.min(INSTANCE_HORIZONTAL_FADE_MAX, yards)) : INSTANCE_HORIZONTAL_FADE_DEFAULT;
+}
+
+function readStoredInstanceHorizontalFade(): number {
+  try {
+    const stored = window.localStorage.getItem(INSTANCE_HORIZONTAL_FADE_STORAGE_KEY);
+    return clampInstanceHorizontalFade(stored === null ? INSTANCE_HORIZONTAL_FADE_DEFAULT : Number(stored));
+  } catch {
+    return INSTANCE_HORIZONTAL_FADE_DEFAULT;
+  }
+}
+
+function setInstanceHorizontalFade(yards: number, render = true): void {
+  instanceHorizontalFade = clampInstanceHorizontalFade(yards);
+  if ($instanceHorizontalFade) $instanceHorizontalFade.value = String(instanceHorizontalFade);
+  if ($instanceHorizontalFadeValue) {
+    $instanceHorizontalFadeValue.textContent = instanceHorizontalFade ? `${instanceHorizontalFade} yd` : 'Off';
+  }
+  try {
+    window.localStorage.setItem(INSTANCE_HORIZONTAL_FADE_STORAGE_KEY, String(instanceHorizontalFade));
+  } catch {
+    // Preference is per-session only when storage is unavailable.
+  }
+  if (render) renderInstanceCanvas();
+}
+
+function readStoredInstanceView3d(): boolean {
+  try {
+    return window.localStorage.getItem(INSTANCE_VIEW_3D_STORAGE_KEY) !== 'false';
+  } catch {
+    return true;
+  }
+}
+
+function getInstanceSceneView(): InstanceSceneView | null {
+  if (instanceSceneView === undefined) {
+    instanceSceneView = $instanceWatchScene && InstanceSceneView.isSupported()
+      ? new InstanceSceneView($instanceWatchScene, () => renderInstanceWatcher())
+      : null;
+  }
+  return instanceSceneView?.available ? instanceSceneView : null;
+}
+
+function getInstanceSceneUrl(mapId: number, asset: LoadedInstanceMapAsset | null): string | null {
+  const scene = asset?.metadata.scene;
+  return scene ? new URL(scene.file, getInstanceMetadataUrl(mapId)).href : null;
+}
+
+function isInstanceSceneShowing(mapId: number, asset: LoadedInstanceMapAsset | null): boolean {
+  const url = getInstanceSceneUrl(mapId, asset);
+  return Boolean(url && instanceView3d && getInstanceSceneView()?.state(url) === 'ready');
+}
+
+function getInstanceViewYaw(): number {
+  return (selectedInstanceKey ? instanceViewYaws.get(selectedInstanceKey) : undefined) ?? DEFAULT_ISO_YAW;
+}
+
+function getInstanceViewPitch(): number {
+  return (selectedInstanceKey ? instanceViewPitches.get(selectedInstanceKey) : undefined) ?? ISO_PITCH;
+}
+
+function readStoredInstanceFollow(): boolean {
+  try {
+    return window.localStorage.getItem(INSTANCE_FOLLOW_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function setInstanceFollowSelected(enabled: boolean): void {
+  instanceFollowSelected = enabled;
+  if (!enabled) instanceFollowAnimation = null;
+  $instanceFollowBtn?.setAttribute('aria-pressed', String(enabled));
+  try {
+    window.localStorage.setItem(INSTANCE_FOLLOW_STORAGE_KEY, String(enabled));
+  } catch {
+    // Preference is per-session only when storage is unavailable.
+  }
+  renderInstanceCanvas();
+}
+
+// Starts an orbit drag (middle button, or Shift with the main button) when the
+// 3D scene is showing. Spins and tilts about the point under the view centre.
+function beginInstanceOrbit(event: PointerEvent): boolean {
+  const session = getSelectedInstanceSession();
+  if (!session || !instanceIsoContext || !isInstanceSceneShowing(session.mapId, instanceMapAssets.get(session.mapId) ?? null)) {
+    return false;
+  }
+  instanceRotation = null;
+  instanceFollowAnimation = null;
+  instanceOrbitStart = {
+    x: event.clientX,
+    y: event.clientY,
+    yaw: getInstanceViewYaw(),
+    pitch: getInstanceViewPitch(),
+    center: instanceIsoContext.view.center,
+  };
+  return true;
+}
+
+function updateInstanceOrbit(event: PointerEvent): void {
+  if (!instanceOrbitStart || !selectedInstanceKey || !instanceIsoContext) return;
+  const yaw = instanceOrbitStart.yaw - (event.clientX - instanceOrbitStart.x) * INSTANCE_ORBIT_SPEED;
+  const pitch = clampIsoPitch(instanceOrbitStart.pitch + (event.clientY - instanceOrbitStart.y) * INSTANCE_ORBIT_SPEED);
+  const { box, width, height } = instanceIsoContext;
+  const { zoom } = getInstanceViewTransform();
+  instanceViewYaws.set(selectedInstanceKey, yaw);
+  instanceViewPitches.set(selectedInstanceKey, pitch);
+  setInstanceViewTransform({ zoom, ...getIsoPanForCenter(box, width, height, yaw, pitch, zoom, instanceOrbitStart.center) });
+  renderInstanceCanvas();
+}
+
+// Draws the 3D scene under the overlay and returns its projection, or null
+// when the flat view should be used (no scene, 3D off, still loading, no WebGL).
+function renderInstanceScene(
+  session: ActiveInstanceSession,
+  asset: LoadedInstanceMapAsset | null,
+  floor: DungeonMapFloor | null,
+  width: number,
+  height: number,
+): IsoView | null {
+  const scene = asset?.metadata.scene;
+  const url = getInstanceSceneUrl(session.mapId, asset);
+  const sceneView = getInstanceSceneView();
+  if (!scene || !url || !instanceView3d || !sceneView) return null;
+  sceneView.load(url);
+  if (sceneView.state(url) !== 'ready') return null;
+
+  const floorHeights = floor ? scene.floors.find((candidate) => candidate.id === floor.id) : undefined;
+  // The party is whoever is drawn: the players on the focused floor.
+  const floorPlayers = floor
+    ? session.players.filter((player) => getParticipantDungeonFloor(player, asset.metadata.floors ?? [])?.id === floor.id)
+    : session.players;
+  const fade: FadeSettings = { height: instanceFadeRange, horizontal: instanceHorizontalFade || null };
+  const volumes = getFadeVolumes(floorPlayers.map((player) => [player.position_x, player.position_y, player.position_z]), fade);
+  const band = getHeightBand(floorPlayers.map((player) => player.position_z));
+  let fitBox: SceneBox = floor && floorHeights
+    ? { ...floor.bounds, minZ: floorHeights.minZ, maxZ: floorHeights.maxZ }
+    : scene.bounds;
+  // With a horizontal fade most of the floor is hidden, so frame the party's
+  // bubble instead. The framing is captured, not live: it is taken on the
+  // first view, on Fit view, and when the party changes floor, so the view
+  // does not drift as the party moves (Follow handles tracking).
+  if (fade.horizontal && floorPlayers.length) {
+    const floorId = floor?.id ?? null;
+    let framed = instanceSceneFrames.get(session.key);
+    if (!framed || framed.floorId !== floorId) {
+      const xs = floorPlayers.map((player) => player.position_x);
+      const ys = floorPlayers.map((player) => player.position_y);
+      framed = {
+        floorId,
+        box: {
+          minX: Math.min(...xs) - fade.horizontal, maxX: Math.max(...xs) + fade.horizontal,
+          minY: Math.min(...ys) - fade.horizontal, maxY: Math.max(...ys) + fade.horizontal,
+          minZ: fitBox.minZ, maxZ: fitBox.maxZ,
+        },
+      };
+      if (instanceSceneFrames.has(session.key)) setInstanceViewTransform({ zoom: 1, panX: 0, panY: 0 });
+      instanceSceneFrames.set(session.key, framed);
+    }
+    fitBox = framed.box;
+  }
+  // Frame only the heights that can still be seen.
+  const minZ = band ? Math.max(fitBox.minZ, band.minZ - instanceFadeRange) : fitBox.minZ;
+  const maxZ = band ? Math.min(fitBox.maxZ, band.maxZ + instanceFadeRange) : fitBox.maxZ;
+  const box: SceneBox = { ...fitBox, minZ: Math.min(minZ, maxZ - 1), maxZ };
+  const view = createIsoView(box, width, height, getInstanceViewYaw(), getInstanceViewPitch(), getInstanceViewTransform());
+  if (!sceneView.render(url, view, width, height, volumes, fade)) return null;
+  instanceIsoContext = { box, width, height, view };
+  return view;
+}
+
+function rotateInstanceView(quarterTurns: number): void {
+  const session = getSelectedInstanceSession();
+  if (!session || !instanceIsoContext || !isInstanceSceneShowing(session.mapId, instanceMapAssets.get(session.mapId) ?? null)) return;
+  // Repeated presses during an animation step on from its destination.
+  const animating = Boolean(instanceRotation);
+  const destination = instanceRotation?.to ?? getInstanceViewYaw();
+  instanceRotation = {
+    from: getInstanceViewYaw(),
+    to: getNextQuarterTurn(destination, quarterTurns > 0 ? 1 : -1),
+    startedAt: performance.now(),
+    center: instanceRotation?.center ?? instanceIsoContext.view.center,
+  };
+  if (!animating) requestAnimationFrame(stepInstanceRotation);
+}
+
+function stepInstanceRotation(now: number): void {
+  if (!instanceRotation || !selectedInstanceKey || !instanceIsoContext) {
+    instanceRotation = null;
+    return;
+  }
+  const progress = Math.min(1, (now - instanceRotation.startedAt) / INSTANCE_ROTATE_DURATION_MS);
+  const eased = 1 - (1 - progress) ** 3;
+  const yaw = instanceRotation.from + (instanceRotation.to - instanceRotation.from) * eased;
+  const { box, width, height } = instanceIsoContext;
+  const { zoom } = getInstanceViewTransform();
+  instanceViewYaws.set(selectedInstanceKey, yaw);
+  setInstanceViewTransform({
+    zoom,
+    ...getIsoPanForCenter(box, width, height, yaw, getInstanceViewPitch(), zoom, instanceRotation.center),
+  });
+  renderInstanceCanvas();
+  if (progress < 1) requestAnimationFrame(stepInstanceRotation);
+  else instanceRotation = null;
+}
+
+function setInstanceView3d(enabled: boolean): void {
+  instanceView3d = enabled;
+  try {
+    window.localStorage.setItem(INSTANCE_VIEW_3D_STORAGE_KEY, String(enabled));
+  } catch {
+    // Preference is per-session only when storage is unavailable.
+  }
+  setInstanceViewTransform({ zoom: 1, panX: 0, panY: 0 });
+  renderInstanceWatcher();
+}
+
 async function loadInstanceMapAsset(mapId: number): Promise<void> {
   if (instanceMapAssets.has(mapId) || instanceMapAssetLoads.has(mapId)) return;
   instanceMapAssetLoads.add(mapId);
   try {
-    const metadataUrl = new URL(`../assets/instances/${mapId}.json`, window.location.href);
+    const metadataUrl = getInstanceMetadataUrl(mapId);
     const response = await fetch(metadataUrl);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const metadata = await response.json() as InstanceMapAssetMetadata;
-    if (![1, 2].includes(metadata.schemaVersion) || metadata.mapId !== mapId) {
+    if (![1, 2, 3].includes(metadata.schemaVersion) || metadata.mapId !== mapId) {
       throw new Error('unsupported instance map metadata');
     }
     const loadImage = async (relativePath: string): Promise<HTMLImageElement> => {
@@ -6557,8 +6921,8 @@ async function loadInstanceMapAsset(mapId: number): Promise<void> {
       }));
     } else if (metadata.image) {
       image = await loadImage(metadata.image);
-    } else {
-      throw new Error('instance map metadata has no images');
+    } else if (!metadata.scene) {
+      throw new Error('instance map metadata has no images or scene');
     }
     instanceMapAssets.set(mapId, { metadata, image, floorImages });
   } catch {
@@ -6642,6 +7006,10 @@ function fitSelectedInstanceView(): void {
   if (!session) return;
   const profile = getInstanceMapProfile(session.mapId);
   instanceViewBounds.set(session.key, profile?.bounds ?? getInstanceCoordinateBounds(session.players));
+  instanceViewYaws.delete(session.key);
+  instanceViewPitches.delete(session.key);
+  instanceSceneFrames.delete(session.key);
+  instanceRotation = null;
   setInstanceViewTransform({ zoom: 1, panX: 0, panY: 0 });
   renderInstanceCanvas();
 }
@@ -6883,7 +7251,75 @@ function renderInstancePlayerList(session: ActiveInstanceSession | null): void {
     }).join('');
 }
 
-function renderInstanceCanvas(): void {
+function drawInstanceFlatBackground(
+  ctx: CanvasRenderingContext2D,
+  viewport: InstanceProjectionViewport,
+  image: HTMLImageElement | undefined,
+  hasProfile: boolean,
+): void {
+  if (image) {
+    ctx.drawImage(image, viewport.x, viewport.y, viewport.width, viewport.height);
+    ctx.fillStyle = 'rgba(3, 10, 18, 0.18)';
+    ctx.fillRect(viewport.x, viewport.y, viewport.width, viewport.height);
+  } else {
+    if (hasProfile) {
+      ctx.fillStyle = '#0a1624';
+      ctx.fillRect(viewport.x, viewport.y, viewport.width, viewport.height);
+    }
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    for (let index = 1; index < 10; index += 1) {
+      const x = viewport.x + viewport.width * index / 10;
+      const y = viewport.y + viewport.height * index / 10;
+      ctx.beginPath(); ctx.moveTo(x, viewport.y); ctx.lineTo(x, viewport.y + viewport.height); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(viewport.x, y); ctx.lineTo(viewport.x + viewport.width, y); ctx.stroke();
+    }
+  }
+  ctx.strokeStyle = 'rgba(96,165,250,0.28)';
+  ctx.strokeRect(viewport.x + 0.5, viewport.y + 0.5, viewport.width - 1, viewport.height - 1);
+}
+
+// Eases the pan towards a follow target. Telemetry arrives once a second, so
+// the glide settles before the next position comes in.
+function followInstancePan(targetX: number, targetY: number): void {
+  const { panX, panY, zoom } = getInstanceViewTransform();
+  const target = instanceFollowAnimation;
+  if (Math.abs(targetX - panX) + Math.abs(targetY - panY) <= 0.5) return;
+  if (target && Math.abs(target.toX - targetX) + Math.abs(target.toY - targetY) <= 0.5) return;
+  if (prefersReducedMotion()) {
+    instanceFollowAnimation = null;
+    setInstanceViewTransform({ zoom, panX: targetX, panY: targetY });
+    requestAnimationFrame(() => renderInstanceCanvas(true));
+    return;
+  }
+  const running = Boolean(instanceFollowAnimation);
+  instanceFollowAnimation = { fromX: panX, fromY: panY, toX: targetX, toY: targetY, startedAt: performance.now() };
+  if (!running) requestAnimationFrame(stepInstanceFollow);
+}
+
+function stepInstanceFollow(now: number): void {
+  const animation = instanceFollowAnimation;
+  if (!animation || !instanceFollowSelected) {
+    instanceFollowAnimation = null;
+    return;
+  }
+  const progress = Math.min(1, (now - animation.startedAt) / INSTANCE_FOLLOW_EASE_MS);
+  const eased = 1 - (1 - progress) ** 3;
+  setInstanceViewTransform({
+    zoom: getInstanceViewTransform().zoom,
+    panX: animation.fromX + (animation.toX - animation.fromX) * eased,
+    panY: animation.fromY + (animation.toY - animation.fromY) * eased,
+  });
+  renderInstanceCanvas(true);
+  if (progress < 1) requestAnimationFrame(stepInstanceFollow);
+  else instanceFollowAnimation = null;
+}
+
+function prefersReducedMotion(): boolean {
+  return window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+}
+
+function renderInstanceCanvas(followPass = false): void {
   if (!$instanceWatchCanvas) return;
   const wrapper = $instanceWatchCanvas.parentElement;
   if (!wrapper) return;
@@ -6896,12 +7332,17 @@ function renderInstanceCanvas(): void {
   if (!ctx) return;
   instanceMarkerHitAreas = [];
   instanceBaseViewport = null;
+  instanceIsoContext = null;
 
   ctx.fillStyle = '#08111d';
   ctx.fillRect(0, 0, width, height);
-  const session = getSelectedInstanceSession();
+  const session = withLivePositions(getSelectedInstanceSession());
   $instanceWatchEmpty?.classList.toggle('hidden', Boolean(session));
-  if (!session) return;
+  if (!session) {
+    if ($instanceWatchScene) $instanceWatchScene.hidden = true;
+    $instanceViewControls?.classList.add('hidden');
+    return;
+  }
 
   if (!instanceMapAssets.has(session.mapId) && !instanceMapAssetLoads.has(session.mapId)) {
     void loadInstanceMapAsset(session.mapId);
@@ -6922,49 +7363,42 @@ function renderInstanceCanvas(): void {
   const aspectRatio = assetWidth && assetHeight
     ? assetWidth / assetHeight
     : profile?.aspectRatio;
-  const baseViewport = aspectRatio
-    ? getInstanceProjectionViewport(width, height, aspectRatio)
-    : { x: 0, y: 0, width, height };
-  instanceBaseViewport = baseViewport;
+  const isoView = renderInstanceScene(session, loadedAsset, floor, width, height);
+  // Read after the scene, which may reset it when it reframes.
   const viewTransform = getInstanceViewTransform();
-  const viewport = applyInstanceViewTransform(baseViewport, viewTransform);
-  const project = (position: Pick<MapPlayerPosition, 'position_x' | 'position_y'>) => {
-    if (asset?.metadata.projection?.type === 'minimapTiles') {
-      const metadata = asset.metadata;
-      const projected = projectMinimapTilePosition(position, {
-        gridSize: metadata.gridSize ?? 64,
-        worldUnitsPerTile: metadata.worldUnitsPerTile ?? 533.3333333333334,
-        minTileX: metadata.minTileX ?? 0,
-        minTileY: metadata.minTileY ?? 0,
-        maxTileX: metadata.maxTileX ?? metadata.minTileX ?? 0,
-        maxTileY: metadata.maxTileY ?? metadata.minTileY ?? 0,
-      }, viewport.width, viewport.height);
-      return { x: viewport.x + projected.x, y: viewport.y + projected.y };
-    }
-    const point = projectInstancePosition(position, bounds, viewport.width, viewport.height);
-    return { x: point.x + viewport.x, y: point.y + viewport.y };
-  };
-
-  if (asset && assetImage) {
-    ctx.drawImage(assetImage, viewport.x, viewport.y, viewport.width, viewport.height);
-    ctx.fillStyle = 'rgba(3, 10, 18, 0.18)';
-    ctx.fillRect(viewport.x, viewport.y, viewport.width, viewport.height);
+  if ($instanceWatchScene) $instanceWatchScene.hidden = !isoView;
+  const hasScene = Boolean(loadedAsset?.metadata.scene && getInstanceSceneView());
+  $instanceViewControls?.classList.toggle('hidden', !hasScene);
+  if ($instanceRotateLeftBtn) $instanceRotateLeftBtn.disabled = !isoView;
+  if ($instanceRotateRightBtn) $instanceRotateRightBtn.disabled = !isoView;
+  if ($instanceView3dBtn) $instanceView3dBtn.setAttribute('aria-pressed', String(instanceView3d));
+  let projection: MapProjection;
+  if (isoView) {
+    instanceBaseViewport = isoView.baseViewport;
+    projection = isoView.projection;
+    ctx.clearRect(0, 0, width, height);
   } else {
-    if (profile) {
-      ctx.fillStyle = '#0a1624';
-      ctx.fillRect(viewport.x, viewport.y, viewport.width, viewport.height);
-    }
-    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
-    ctx.lineWidth = 1;
-    for (let index = 1; index < 10; index += 1) {
-      const x = viewport.x + viewport.width * index / 10;
-      const y = viewport.y + viewport.height * index / 10;
-      ctx.beginPath(); ctx.moveTo(x, viewport.y); ctx.lineTo(x, viewport.y + viewport.height); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(viewport.x, y); ctx.lineTo(viewport.x + viewport.width, y); ctx.stroke();
-    }
+    const baseViewport = aspectRatio
+      ? getInstanceProjectionViewport(width, height, aspectRatio)
+      : { x: 0, y: 0, width, height };
+    instanceBaseViewport = baseViewport;
+    const viewport = applyInstanceViewTransform(baseViewport, viewTransform);
+    projection = createFlatProjection(asset?.metadata.projection?.type === 'minimapTiles'
+      ? { type: 'minimapTiles', tiles: resolveMinimapTileProjection(asset.metadata) }
+      : { type: 'bounds', bounds }, viewport);
+    drawInstanceFlatBackground(ctx, viewport, assetImage, Boolean(profile));
   }
-  ctx.strokeStyle = 'rgba(96,165,250,0.28)';
-  ctx.strokeRect(viewport.x + 0.5, viewport.y + 0.5, viewport.width - 1, viewport.height - 1);
+  const project = (position: Pick<MapPlayerPosition, 'position_x' | 'position_y' | 'position_z'>) =>
+    projection.worldToScreen(position.position_x, position.position_y, position.position_z);
+
+  // Follow: glide the view so the selected player ends up at the centre.
+  const followed = instanceFollowSelected && !followPass
+    ? session.players.find((player) => player.name === selectedInstancePlayerName)
+    : undefined;
+  if (followed) {
+    const point = project(followed);
+    followInstancePan(viewTransform.panX + width / 2 - point.x, viewTransform.panY + height / 2 - point.y);
+  }
 
   const visiblePlayers = floor && asset?.metadata.floors
     ? session.players.filter((player) => getParticipantDungeonFloor(player, asset.metadata.floors ?? [])?.id === floor.id)
@@ -7045,6 +7479,7 @@ function renderInstanceCanvas(): void {
 }
 
 function renderInstanceWatcher(): void {
+  syncInstanceLiveStream();
   const session = getSelectedInstanceSession();
   if ($instanceSessionCount) $instanceSessionCount.textContent = String(activeInstanceSessions.length);
   renderInstanceSessionOptions();
@@ -7072,7 +7507,10 @@ function renderInstanceWatcher(): void {
         difficulty,
         age ? `active ${age}` : null,
         selectedFloor ? `floor ${selectedFloor.floorIndex}` : null,
-        hasArtwork ? 'client artwork' : profile ? 'client-calibrated bounds' : 'auto-fit bounds',
+        session && isInstanceSceneShowing(session.mapId, loadedAsset ?? null)
+          ? '3D scene'
+          : hasArtwork ? 'client artwork' : profile ? 'client-calibrated bounds' : 'auto-fit bounds',
+        instanceLiveStream?.status === 'streaming' ? 'live stream' : null,
       ].filter(Boolean).join(' · ')
       : null;
     $instanceWatchSubtitle.textContent = details
@@ -7138,6 +7576,9 @@ async function refreshInstanceWatcher(forceDiscovery = false): Promise<void> {
       for (const key of instanceSelectedFloorIds.keys()) {
         if (!activeKeys.has(key)) instanceSelectedFloorIds.delete(key);
       }
+      for (const key of instanceSceneFrames.keys()) {
+        if (!activeKeys.has(key)) instanceSceneFrames.delete(key);
+      }
     } else if (selectedInstanceKey) {
       activeBattlegrounds.delete(selectedInstanceKey);
       activeInstanceStates.delete(selectedInstanceKey);
@@ -7189,12 +7630,14 @@ function startInstanceWatcherPolling(): void {
   }
   instanceRefreshInterval = setInterval(() => {
     if (getActiveMainTabId() === 'instances') void refreshInstanceWatcher();
+    else syncInstanceLiveStream();
   }, 1000);
 }
 
 function stopInstanceWatcherPolling(): void {
   if (instanceRefreshInterval) clearInterval(instanceRefreshInterval);
   instanceRefreshInterval = null;
+  syncInstanceLiveStream();
 }
 
 $instanceSessionSelect?.addEventListener('change', () => {
@@ -7227,6 +7670,15 @@ $instanceWatchCanvas?.addEventListener('wheel', (event) => {
     (event.clientY - rect.top) * scaleY);
 }, { passive: false });
 $instanceWatchCanvas?.addEventListener('pointerdown', (event) => {
+  if (event.button === 1 || (event.button === 0 && event.shiftKey)) {
+    // Also stops the browser's middle-click autoscroll.
+    event.preventDefault();
+    if (beginInstanceOrbit(event)) {
+      $instanceWatchCanvas.setPointerCapture(event.pointerId);
+      $instanceWatchCanvas.classList.add('panning');
+    }
+    return;
+  }
   if (event.button !== 0) return;
   const transform = getInstanceViewTransform();
   instancePanStart = {
@@ -7240,11 +7692,19 @@ $instanceWatchCanvas?.addEventListener('pointerdown', (event) => {
   $instanceWatchCanvas.classList.add('panning');
 });
 $instanceWatchCanvas?.addEventListener('pointermove', (event) => {
+  if (instanceOrbitStart) {
+    updateInstanceOrbit(event);
+    return;
+  }
   if (!instancePanStart) return;
   const rect = $instanceWatchCanvas.getBoundingClientRect();
   const deltaX = (event.clientX - instancePanStart.x) * $instanceWatchCanvas.width / rect.width;
   const deltaY = (event.clientY - instancePanStart.y) * $instanceWatchCanvas.height / rect.height;
-  if (Math.hypot(deltaX, deltaY) > 3) instancePanStart.moved = true;
+  if (Math.hypot(deltaX, deltaY) > 3 && !instancePanStart.moved) {
+    instancePanStart.moved = true;
+    // Dragging the map by hand takes over from following.
+    if (instanceFollowSelected) setInstanceFollowSelected(false);
+  }
   const transform = getInstanceViewTransform();
   setInstanceViewTransform({
     zoom: transform.zoom,
@@ -7254,6 +7714,12 @@ $instanceWatchCanvas?.addEventListener('pointermove', (event) => {
   renderInstanceCanvas();
 });
 $instanceWatchCanvas?.addEventListener('pointerup', (event) => {
+  if (instanceOrbitStart) {
+    instanceOrbitStart = null;
+    $instanceWatchCanvas.releasePointerCapture(event.pointerId);
+    $instanceWatchCanvas.classList.remove('panning');
+    return;
+  }
   if (!instancePanStart) return;
   const moved = instancePanStart.moved;
   instancePanStart = null;
@@ -7268,8 +7734,25 @@ $instanceWatchCanvas?.addEventListener('pointerup', (event) => {
 });
 $instanceWatchCanvas?.addEventListener('pointercancel', () => {
   instancePanStart = null;
+  instanceOrbitStart = null;
   $instanceWatchCanvas.classList.remove('panning');
 });
+$instanceWatchCanvas?.addEventListener('keydown', (event) => {
+  if (event.altKey || event.ctrlKey || event.metaKey) return;
+  const key = event.key.toLowerCase();
+  if (key !== 'q' && key !== 'e') return;
+  event.preventDefault();
+  rotateInstanceView(key === 'q' ? -1 : 1);
+});
+$instanceRotateLeftBtn?.addEventListener('click', () => rotateInstanceView(-1));
+$instanceRotateRightBtn?.addEventListener('click', () => rotateInstanceView(1));
+$instanceView3dBtn?.addEventListener('click', () => setInstanceView3d(!instanceView3d));
+$instanceFollowBtn?.setAttribute('aria-pressed', String(instanceFollowSelected));
+$instanceFollowBtn?.addEventListener('click', () => setInstanceFollowSelected(!instanceFollowSelected));
+setInstanceFadeRange(instanceFadeRange, false);
+$instanceFadeRange?.addEventListener('input', () => setInstanceFadeRange(Number($instanceFadeRange.value)));
+setInstanceHorizontalFade(instanceHorizontalFade, false);
+$instanceHorizontalFade?.addEventListener('input', () => setInstanceHorizontalFade(Number($instanceHorizontalFade.value)));
 $instanceAutoRefresh?.addEventListener('change', () => {
   if ($instanceAutoRefresh.checked) {
     void refreshInstanceWatcher();
@@ -7574,22 +8057,10 @@ function renderSessionReplayCanvas(): void {
     ? getInstanceProjectionViewport(width, height, imageWidth / imageHeight)
     : { x: 0, y: 0, width, height };
   if (image) ctx.drawImage(image, viewport.x, viewport.y, viewport.width, viewport.height);
-  const project = (point: SessionRoutePoint): { x: number; y: number } => {
-    if (metadata?.projection?.type === 'minimapTiles') {
-      const projected = projectMinimapTilePosition({ position_x: point.x, position_y: point.y }, {
-        gridSize: metadata.gridSize ?? 64,
-        worldUnitsPerTile: metadata.worldUnitsPerTile ?? 533.3333333333334,
-        minTileX: metadata.minTileX ?? 0,
-        minTileY: metadata.minTileY ?? 0,
-        maxTileX: metadata.maxTileX ?? metadata.minTileX ?? 0,
-        maxTileY: metadata.maxTileY ?? metadata.minTileY ?? 0,
-      }, viewport.width, viewport.height);
-      return { x: viewport.x + projected.x, y: viewport.y + projected.y };
-    }
-    const projected = projectInstancePosition({ position_x: point.x, position_y: point.y }, bounds,
-      viewport.width, viewport.height);
-    return { x: viewport.x + projected.x, y: viewport.y + projected.y };
-  };
+  const projection = createFlatProjection(metadata?.projection?.type === 'minimapTiles'
+    ? { type: 'minimapTiles', tiles: resolveMinimapTileProjection(metadata) }
+    : { type: 'bounds', bounds }, viewport);
+  const project = (point: SessionRoutePoint) => projection.worldToScreen(point.x, point.y, point.z);
 
   const replayMarkerScale = getCanvasPlayerIconScale();
   const participantColors = new Map(record.participants.map((participant) => [participant.name,
