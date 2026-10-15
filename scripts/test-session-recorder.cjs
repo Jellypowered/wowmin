@@ -210,6 +210,34 @@ test('purges completed history only when explicitly requested', async () => {
   assert.equal((await fs.readdir(path.join(sessionDir, '.active'))).filter((name) => name.endsWith('.json')).length, 1);
 });
 
+test('disabling recording discards active checkpoints without deleting completed sessions', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-recording-toggle-'));
+  const recorder = new SessionRecorder({ dataDir, routeIntervalMs: 1, completionGraceMs: 1, checkpointIntervalMs: 1 });
+  const startedAt = Math.floor(Date.now() / 1000);
+
+  const completed = snapshot(startedAt * 1000 + 10, [player(1, startedAt)]);
+  await recorder.ingest(completed);
+  await recorder.ingest(snapshot(completed.capturedAt + 10, []));
+  await recorder.ingest(snapshot(completed.capturedAt + 20, []));
+
+  await recorder.ingest(snapshot(completed.capturedAt + 30, [player(2, startedAt + 1)]));
+  const activeDir = path.join(dataDir, 'sessions', '.active');
+  assert.equal((await fs.readdir(activeDir)).filter((name) => name.endsWith('.json')).length, 1);
+  assert.equal(await recorder.setEnabled(false), false);
+  assert.equal(await recorder.isEnabled(), false);
+  assert.deepEqual(await fs.readdir(activeDir), []);
+  assert.equal((await recorder.list()).length, 1);
+
+  await recorder.ingest(snapshot(completed.capturedAt + 40, [player(3, startedAt + 2)]));
+  assert.deepEqual(await fs.readdir(activeDir), []);
+  const restartedDisabledRecorder = new SessionRecorder({ dataDir });
+  assert.equal(await restartedDisabledRecorder.isEnabled(), false);
+
+  assert.equal(await restartedDisabledRecorder.setEnabled(true), true);
+  const restartedEnabledRecorder = new SessionRecorder({ dataDir });
+  assert.equal(await restartedEnabledRecorder.isEnabled(), true);
+});
+
 test('derives objective transitions once and retains all completed records', async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-history-'));
   const recorder = new SessionRecorder({ dataDir, routeIntervalMs: 1, completionGraceMs: 1 });

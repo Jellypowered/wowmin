@@ -6450,7 +6450,10 @@ setPlayerIconScale(playerIconScale * 100, false);
 $mapIconScale?.addEventListener('input', () => setPlayerIconScale(Number($mapIconScale.value)));
 $instanceIconScale?.addEventListener('input', () => setPlayerIconScale(Number($instanceIconScale.value)));
 const $instanceClearFocusBtn = $<HTMLButtonElement>('instance-clear-focus-btn');
+const $instanceActiveCard = $<HTMLElement>('instance-active-card');
+const $instanceParticipantsCard = $<HTMLElement>('instance-participants-card');
 const $instancePlayerList = $<HTMLElement>('instance-player-list');
+const $instanceRecordSessions = $<HTMLInputElement>('instance-record-sessions');
 const $instanceBattlegroundCard = $<HTMLElement>('instance-battleground-card');
 const $instanceBattlegroundPhase = $<HTMLElement>('instance-battleground-phase');
 const $instanceBattlegroundScore = $<HTMLElement>('instance-battleground-score');
@@ -6651,6 +6654,7 @@ const INSTANCE_LIVE_FRAME_MS = 33;
 let instanceLiveStream: { key: string; stop: () => void; status: StreamStatus } | null = null;
 let instanceLiveAnimating = false;
 let instanceLiveLastDrawAt = 0;
+let instancePlayerStatusSignature = '';
 const INSTANCE_VIEW_3D_STORAGE_KEY = 'wowmin.instanceView3d';
 // Scene geometry fades out over this many yards above and below the height
 // range of the focused party, and is not drawn beyond it. Set per viewer.
@@ -6732,6 +6736,9 @@ function syncInstanceLiveStream(): void {
         instanceDebugLastFrameAt = now;
       }
       instanceLivePositions.push(frame, now);
+      const liveSession = withLivePositions(getSelectedInstanceSession());
+      const statusSignature = getInstancePlayerStatusSignature(liveSession);
+      if (statusSignature !== instancePlayerStatusSignature) renderInstancePlayerList(liveSession);
       startInstanceLiveAnimation();
     },
     onStatus: (status) => {
@@ -6752,11 +6759,13 @@ function syncInstanceLiveStream(): void {
     onBots: (update) => {
       if (instanceLiveStream !== stream) return;
       instanceLiveBots.push(update, performance.now());
+      renderInstancePlayerList(withLivePositions(getSelectedInstanceSession()));
       noteInstanceDebug('bots', update.bots.length);
     },
     onAppearances: (update) => {
       if (instanceLiveStream !== stream) return;
       instanceLiveAppearances.push(update, performance.now());
+      renderInstancePlayerList(withLivePositions(getSelectedInstanceSession()));
       noteInstanceDebug('appearances', update.units.length);
     },
     onCombatEvents: (update) => {
@@ -6807,17 +6816,51 @@ function startInstanceLiveAnimation(): void {
   requestAnimationFrame(step);
 }
 
-// The session with stream positions applied, for drawing the map.
+// The session with stream positions applied, for drawing the map and lists.
+// The database fallback can omit active playerbots, so live players absent
+// from the polled session are synthesized from their stream and appearance.
 function withLivePositions(session: ActiveInstanceSession | null): ActiveInstanceSession | null {
   if (!session || instanceLiveStream?.key !== session.key) return session;
   const now = performance.now();
-  return {
-    ...session,
-    players: session.players.map((player) => {
-      const sample = instanceLivePositions.sampleAt(player.name, now);
-      return sample ? applyLiveSample(player, sample) : player;
-    }),
-  };
+  const playersByName = new Map(session.players.map((player) => [player.name, player]));
+  const representative = session.players[0];
+  const players: MapPlayerPosition[] = [];
+  for (const sample of instanceLivePositions.samples(now)) {
+    let player = playersByName.get(sample.name);
+    if (!player && representative) {
+      const appearance = instanceLiveAppearances.get(false, sample.guid, now);
+      player = {
+        name: sample.name,
+        map: session.mapId,
+        instanceId: session.instanceId,
+        position_x: sample.x,
+        position_y: sample.y,
+        position_z: sample.z,
+        orientation: sample.orientation,
+        level: representative.level,
+        race: appearance?.race ?? 0,
+        class: appearance?.classId ?? 0,
+        gender: appearance?.gender,
+        account: '',
+        accountId: 0,
+        isBot: Boolean(instanceLiveBots.get(sample.name, now)),
+        alive: sample.alive,
+        inCombat: sample.inCombat,
+        mapType: representative.mapType,
+        difficulty: representative.difficulty,
+        sessionStartedAt: representative.sessionStartedAt,
+        powerType: sample.powerType,
+      };
+    }
+    if (player) {
+      const isBot = player.isBot || Boolean(instanceLiveBots.get(sample.name, now));
+      players.push(applyLiveSample({ ...player, isBot }, sample));
+      playersByName.delete(sample.name);
+    }
+  }
+  // Keep polled players while their first stream frame is still arriving.
+  players.push(...playersByName.values());
+  return { ...session, players };
 }
 
 function getSelectedInstanceSession(): ActiveInstanceSession | null {
@@ -7687,6 +7730,9 @@ function stepInstanceRotation(now: number): void {
 function setInstanceView3d(enabled: boolean): void {
   instanceView3d = enabled;
   storeSetting(INSTANCE_VIEW_3D_STORAGE_KEY, String(enabled));
+  for (const control of document.querySelectorAll<HTMLElement>('.instance-3d-control')) {
+    control.classList.toggle('hidden', !enabled);
+  }
   setInstanceViewTransform({ zoom: 1, panX: 0, panY: 0 });
   renderInstanceWatcher();
 }
@@ -7911,24 +7957,28 @@ function updateInstanceTrails(session: ActiveInstanceSession): void {
 
 function renderInstanceSessionOptions(): void {
   if (!$instanceSessionSelect) return;
-  if (!activeInstanceSessions.length) {
-    $instanceSessionSelect.innerHTML = '<option value="">No active sessions</option>';
-    $instanceSessionSelect.disabled = true;
-    return;
-  }
-  $instanceSessionSelect.disabled = false;
-  $instanceSessionSelect.innerHTML = activeInstanceSessions.map((session) =>
-    `<option value="${escapeHtml(session.key)}"${session.key === selectedInstanceKey ? ' selected' : ''}>${escapeHtml(session.label)} (${session.players.length})</option>`
-  ).join('');
+  // Replacing a native select's options closes its open menu. Keep every
+  // refresh away from it while the operator is choosing a session.
+  if (document.activeElement === $instanceSessionSelect) return;
+  const hasSessions = activeInstanceSessions.length > 0;
+  const html = hasSessions
+    ? activeInstanceSessions.map((session) => {
+      const participantCount = session.key === selectedInstanceKey
+        ? withLivePositions(session)?.players.length ?? session.players.length
+        : session.players.length;
+      return `<option value="${escapeHtml(session.key)}"${session.key === selectedInstanceKey ? ' selected' : ''}>${escapeHtml(session.label)} (${participantCount})</option>`;
+    }).join('')
+    : '<option value="">No active sessions</option>';
+  $instanceSessionSelect.disabled = !hasSessions;
+  if ($instanceSessionSelect.innerHTML !== html) $instanceSessionSelect.innerHTML = html;
 }
 
 function getInstanceRoleLabel(roleMask?: number): string | null {
   if (!roleMask) return null;
   const roles: string[] = [];
   if (roleMask & 0x02) roles.push('Tank');
-  if (roleMask & 0x04) roles.push('Healer');
-  if (roleMask & 0x08) roles.push('Damage');
-  if (roleMask & 0x01) roles.push('Leader');
+  if (roleMask & 0x04) roles.push('Heal');
+  if (roleMask & 0x08) roles.push('DPS');
   return roles.length > 0 ? roles.join('/') : null;
 }
 
@@ -8002,8 +8052,12 @@ function renderInstanceBattleground(battleground: MapBattlegroundState | null): 
   }
 }
 
-function renderInstanceEncounters(instance: MapInstanceState | null, deaths: MapInstanceDeath[]): void {
-  const visible = Boolean(instance?.bosses.length || deaths.length);
+function renderInstanceEncounters(
+  instance: MapInstanceState | null,
+  deaths: MapInstanceDeath[],
+  keepVisible = false,
+): void {
+  const visible = keepVisible || Boolean(instance?.bosses.length || deaths.length);
   $instanceEncounterCard?.classList.toggle('hidden', !visible);
   if (!visible) return;
 
@@ -8029,13 +8083,34 @@ function renderInstanceEncounters(instance: MapInstanceState | null, deaths: Map
   }
 }
 
+function getInstancePlayerStatusSignature(session: ActiveInstanceSession | null): string {
+  return session?.players.map((player) => [
+    player.name,
+    Number(player.alive),
+    Number(player.inCombat),
+    Number(Boolean(player.onTaxi)),
+    Number(Boolean(player.mounted)),
+    Number(Boolean(player.sapped)),
+    Number(Boolean(player.stunned)),
+    Number(Boolean(player.spiritForm)),
+    Number(Boolean(player.flagCarrier)),
+    Number(Boolean(player.waitingForResurrect)),
+    player.roleMask ?? 0,
+  ].join(':')).join('|') ?? '';
+}
+
 function renderInstancePlayerList(session: ActiveInstanceSession | null): void {
   if (!$instancePlayerList) return;
+  instancePlayerStatusSignature = getInstancePlayerStatusSignature(session);
   if (!session) {
     $instancePlayerList.innerHTML = '<p class="placeholder">No active participants</p>';
     return;
   }
   const floors = getInstanceFloors(session.mapId);
+  const mapType = session.players[0]?.mapType;
+  // Database fallback does not know mapType; a non-battleground runtime
+  // session is still treated as a dungeon/raid so its role stays visible.
+  const showDungeonRole = mapType !== 3;
   $instancePlayerList.innerHTML = [...session.players]
     .sort((left, right) => Number(left.isBot) - Number(right.isBot) || left.name.localeCompare(right.name))
     .map((player) => {
@@ -8048,8 +8123,7 @@ function renderInstancePlayerList(session: ActiveInstanceSession | null): void {
       if (player.battlegroundRole !== undefined && player.battlegroundRole >= 0) {
         details.push(`Tactical role ${player.battlegroundRole}`);
       }
-      const role = getInstanceRoleLabel(player.roleMask);
-      if (role) details.push(role);
+      const role = showDungeonRole ? getInstanceRoleLabel(player.roleMask) : null;
       if (player.groupId) {
         const groupLabel = player.isRaidGroup ? 'Raid' : 'Group';
         const subgroup = player.isRaidGroup && player.subgroup !== undefined ? `/${player.subgroup + 1}` : '';
@@ -8060,19 +8134,18 @@ function renderInstancePlayerList(session: ActiveInstanceSession | null): void {
         ? getCurrentBotAction(instanceLiveBots.get(player.name, performance.now()))
         : null;
       if (action) details.push(`Doing: ${action}`);
-      const markerColor = getInstanceFactionColor(player.teamId) ?? '#94a3b8';
       const selected = player.name === selectedInstancePlayerName ? ' selected' : '';
       const factionClass = player.teamId === TEAM_ALLIANCE ? ' alliance' : player.teamId === TEAM_HORDE ? ' horde' : '';
       const identity = `<span class="map-player-identity">${getRacePortraitHtml(player.race, player.gender)}${getClassIconHtml(player.class)}</span>`;
-      const stateIcons = getPlayerStateIconsHtml(player);
+      const stateIcons = getPlayerStateIconsHtml(player, 5);
       return `<div class="instance-player-row${factionClass}${player.inCombat ? ' in-combat' : ''}${selected}" data-instance-player="${escapeHtml(player.name)}">
-        <span class="map-player-dot" style="background:${markerColor}"></span>
         ${identity}
         <span class="instance-player-info">
           <span class="instance-player-name">${escapeHtml(player.name)}</span>
-          <span class="instance-player-state">${escapeHtml(details.join(' · '))}</span>
+          ${showDungeonRole ? `<span class="instance-player-role">- ${escapeHtml(role ?? 'Role unknown')}</span>` : ''}
         </span>
-        ${stateIcons}
+        <span class="instance-player-status-icons">${stateIcons}</span>
+        <span class="instance-player-state">${escapeHtml(details.join(' · '))}</span>
       </div>`;
     }).join('');
 }
@@ -8710,8 +8783,19 @@ function renderInstanceBotCard(session: ActiveInstanceSession | null, now: numbe
       return decision ? [{ player, decision }] : [];
     })
     : [];
-  $instanceBotCard.classList.toggle('hidden', !bots.length);
-  if (!bots.length) return;
+  const keepVisible = Boolean(session && !session.players.some((player) => player.mapType === 3));
+  $instanceBotCard.classList.toggle('hidden', !bots.length && !keepVisible);
+  if (!bots.length) {
+    if (keepVisible) {
+      const message = !live
+        ? 'Bot decisions require the live stream.'
+        : !instanceShowDecisions
+          ? 'Turn on Decisions to show bot activity.'
+          : 'No bot decisions are available yet.';
+      $instanceBotDecisions.innerHTML = `<p class="placeholder">${message}</p>`;
+    }
+    return;
+  }
   const focused = bots.find(({ player }) => player.name === selectedInstancePlayerName);
   const html = focused ? getInstanceBotDetailHtml(focused.player.name, focused.decision) : bots
     .sort((left, right) => left.player.name.localeCompare(right.player.name))
@@ -8804,14 +8888,35 @@ function renderInstanceDebugOverlay(now: number): void {
   $instanceDebugOverlay.textContent = lines.join('\n');
 }
 
+function reorderInstanceCards(isBattleground: boolean): void {
+  const sidebar = $instanceActiveCard?.parentElement;
+  if (!sidebar || !$instanceActiveCard || !$instanceParticipantsCard
+    || !$instanceEncounterCard || !$instanceBotCard || !$instanceBattlegroundCard) return;
+  const cards = isBattleground
+    ? [$instanceActiveCard, $instanceBattlegroundCard, $instanceParticipantsCard, $instanceBotCard, $instanceEncounterCard]
+    : [$instanceActiveCard, $instanceParticipantsCard, $instanceEncounterCard, $instanceBotCard, $instanceBattlegroundCard];
+  const currentCards = Array.from(sidebar.children).filter((child) =>
+    cards.includes(child as HTMLElement));
+  if (cards.every((card, index) => currentCards[index] === card)) return;
+  // Moving a card in the DOM closes any native select menu inside it. Delay a
+  // type-driven reorder until the operator has finished with any dropdown.
+  if (document.activeElement instanceof HTMLSelectElement && sidebar.contains(document.activeElement)) return;
+  for (const card of cards) sidebar.appendChild(card);
+}
+
 function renderInstanceWatcher(): void {
   syncInstanceLiveStream();
   const session = getSelectedInstanceSession();
+  const displayedSession = withLivePositions(session);
+  const battleground = getSelectedBattleground();
+  const isBattleground = Boolean(battleground || session?.players.some((player) => player.mapType === 3));
+  reorderInstanceCards(isBattleground);
   if ($instanceSessionCount) $instanceSessionCount.textContent = String(activeInstanceSessions.length);
   renderInstanceSessionOptions();
-  renderInstanceBattleground(getSelectedBattleground());
-  renderInstanceEncounters(getSelectedInstanceState(), getSelectedInstanceDeaths());
-  renderInstancePlayerList(session);
+  renderInstanceBattleground(battleground);
+  const isDungeonRaid = Boolean(session && !isBattleground);
+  renderInstanceEncounters(getSelectedInstanceState(), getSelectedInstanceDeaths(), isDungeonRaid);
+  renderInstancePlayerList(displayedSession);
   if ($instanceWatchTitle) $instanceWatchTitle.textContent = session?.label ?? 'No active instance';
   if ($instanceWatchSubtitle) {
     const profile = session ? getInstanceMapProfile(session.mapId) : null;
@@ -8845,8 +8950,10 @@ function renderInstanceWatcher(): void {
     $instanceClearFocusBtn?.classList.toggle('hidden', !selectedInstancePlayerName);
   }
   if ($instanceWatchPlayerCount) {
-    const bots = session?.players.filter((player) => player.isBot).length ?? 0;
-    $instanceWatchPlayerCount.textContent = session ? `${session.players.length} participants · ${bots} bots` : '';
+    const bots = displayedSession?.players.filter((player) => player.isBot).length ?? 0;
+    $instanceWatchPlayerCount.textContent = displayedSession
+      ? `${displayedSession.players.length} participants · ${bots} bots`
+      : '';
   }
   renderInstanceCanvas();
 }
@@ -8974,6 +9081,7 @@ $instanceSessionSelect?.addEventListener('change', () => {
   if (session) updateInstanceTrails(session);
   renderInstanceWatcher();
 });
+$instanceSessionSelect?.addEventListener('blur', renderInstanceSessionOptions);
 $instanceRefreshBtn?.addEventListener('click', () => void refreshInstanceWatcher(true));
 $instanceFitBtn?.addEventListener('click', fitSelectedInstanceView);
 $instanceZoomOutBtn?.addEventListener('click', () => adjustInstanceZoom(0.8));
@@ -9073,6 +9181,36 @@ $instanceWatchCanvas?.addEventListener('keydown', (event) => {
 $instanceRotateLeftBtn?.addEventListener('click', () => rotateInstanceView(-1));
 $instanceRotateRightBtn?.addEventListener('click', () => rotateInstanceView(1));
 $instanceView3dBtn?.addEventListener('click', () => setInstanceView3d(!instanceView3d));
+for (const control of document.querySelectorAll<HTMLElement>('.instance-3d-control')) {
+  control.classList.toggle('hidden', !instanceView3d);
+}
+
+async function syncSessionRecordingToggle(): Promise<void> {
+  if (!$instanceRecordSessions) return;
+  $instanceRecordSessions.disabled = true;
+  try {
+    $instanceRecordSessions.checked = await window.wowminAPI.sessions.isRecordingEnabled();
+  } catch (error) {
+    console.warn('[instance watch] Could not read session recording state.', error);
+  } finally {
+    $instanceRecordSessions.disabled = false;
+  }
+}
+
+$instanceRecordSessions?.addEventListener('change', async () => {
+  if (!$instanceRecordSessions) return;
+  const requested = $instanceRecordSessions.checked;
+  $instanceRecordSessions.disabled = true;
+  try {
+    $instanceRecordSessions.checked = await window.wowminAPI.sessions.setRecordingEnabled(requested);
+  } catch (error) {
+    $instanceRecordSessions.checked = !requested;
+    console.warn('[instance watch] Could not change session recording state.', error);
+  } finally {
+    $instanceRecordSessions.disabled = false;
+  }
+});
+void syncSessionRecordingToggle();
 $instanceFollowBtn?.setAttribute('aria-pressed', String(instanceFollowSelected));
 $instanceFollowBtn?.addEventListener('click', () => setInstanceFollowSelected(!instanceFollowSelected));
 $instancePathsBtn?.setAttribute('aria-pressed', String(instanceShowPaths));

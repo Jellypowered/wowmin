@@ -1157,6 +1157,11 @@ apiRouter.handle('sessions:list', async (): Promise<SessionIndexEntry[]> => sess
 
 apiRouter.handle('sessions:get', async (_event, id: string): Promise<SessionRecord | null> => sessionRecorder.get(id));
 
+apiRouter.handle('sessions:isRecordingEnabled', async (): Promise<boolean> => sessionRecorder.isEnabled());
+
+apiRouter.handle('sessions:setRecordingEnabled', async (_event, enabled: boolean): Promise<boolean> =>
+  sessionRecorder.setEnabled(Boolean(enabled)));
+
 apiRouter.handle('sessions:purgeCompleted', async (): Promise<number> => sessionRecorder.purgeCompleted());
 
 // Names, levels, and ranks for creatures in the live stream, by entry.

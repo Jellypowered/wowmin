@@ -240,6 +240,7 @@ export class SessionRecorder {
   private readonly sessionDir: string;
   private readonly activeDir: string;
   private readonly indexPath: string;
+  private readonly settingsPath: string;
   private readonly mapAssetIndexPath?: string;
   private readonly routeIntervalMs: number;
   private readonly completionGraceMs: number;
@@ -249,6 +250,7 @@ export class SessionRecorder {
   private readonly activeSessions = new Map<string, ActiveSession>();
   private readonly mapNames = new Map<number, string>();
   private index: SessionIndexEntry[] = [];
+  private recordingEnabled = true;
   private initialized: Promise<void> | null = null;
   private operationChain: Promise<void> = Promise.resolve();
 
@@ -256,6 +258,7 @@ export class SessionRecorder {
     this.sessionDir = path.join(options.dataDir, 'sessions');
     this.activeDir = path.join(this.sessionDir, '.active');
     this.indexPath = path.join(this.sessionDir, 'index.json');
+    this.settingsPath = path.join(options.dataDir, 'session-recording.json');
     this.mapAssetIndexPath = options.mapAssetIndexPath;
     this.routeIntervalMs = positiveInteger(options.routeIntervalMs, 5000);
     this.completionGraceMs = positiveInteger(options.completionGraceMs, 15000);
@@ -271,6 +274,30 @@ export class SessionRecorder {
     };
     const result = this.operationChain.then(run, run);
     this.operationChain = result.catch(() => undefined);
+    return result;
+  }
+
+  async isEnabled(): Promise<boolean> {
+    await this.ensureInitialized();
+    await this.operationChain;
+    return this.recordingEnabled;
+  }
+
+  setEnabled(enabled: boolean): Promise<boolean> {
+    const run = async (): Promise<boolean> => {
+      await this.ensureInitialized();
+      this.recordingEnabled = enabled;
+      await this.writeJsonAtomic(this.settingsPath, { schemaVersion: 1, enabled });
+      if (!enabled) {
+        const activeRecords = [...this.activeSessions.values()];
+        this.activeSessions.clear();
+        await Promise.all(activeRecords.map((active) =>
+          fs.rm(path.join(this.activeDir, `${active.record.id}.json`), { force: true })));
+      }
+      return this.recordingEnabled;
+    };
+    const result = this.operationChain.then(run, run);
+    this.operationChain = result.then(() => undefined, () => undefined);
     return result;
   }
 
@@ -318,6 +345,14 @@ export class SessionRecorder {
 
   private async initialize(): Promise<void> {
     await fs.mkdir(this.activeDir, { recursive: true });
+    try {
+      const stored = JSON.parse(await fs.readFile(this.settingsPath, 'utf8')) as { enabled?: unknown };
+      this.recordingEnabled = typeof stored.enabled === 'boolean' ? stored.enabled : true;
+    } catch {
+      this.recordingEnabled = true;
+    }
+    await this.writeJsonAtomic(this.settingsPath, { schemaVersion: 1, enabled: this.recordingEnabled });
+
     try {
       const stored = JSON.parse(await fs.readFile(this.indexPath, 'utf8')) as { sessions?: SessionIndexEntry[] };
       this.index = Array.isArray(stored.sessions) ? stored.sessions : [];
@@ -375,7 +410,7 @@ export class SessionRecorder {
   }
 
   private async ingestSnapshot(snapshot: MapPlayerSnapshot): Promise<void> {
-    if (snapshot.source !== 'worldserver') return;
+    if (snapshot.source !== 'worldserver' || !this.recordingEnabled) return;
     const now = snapshot.capturedAt;
     const playersBySession = new Map<string, MapPlayerPosition[]>();
     for (const player of snapshot.players) {

@@ -31,10 +31,10 @@ const {
 const near = (actual, expected, label) => assert.ok(Math.abs(actual - expected) < 1e-4, `${label}: ${actual} != ${expected}`);
 
 // Builds a datagram exactly as BuildStreamDatagrams in WowMinTelemetry.cpp does.
-function datagram({ mapId = 601, instanceId = 7, sequence = 1, serverTimeMs = 5000, part = 0, partCount = 1, players }) {
+function datagram({ version = 2, mapId = 601, instanceId = 7, sequence = 1, serverTimeMs = 5000, part = 0, partCount = 1, players }) {
   const header = Buffer.alloc(28);
   header.write('WMS1', 0, 'latin1');
-  header.writeUInt8(1, 4);
+  header.writeUInt8(version, 4);
   header.writeUInt8(part, 5);
   header.writeUInt8(partCount, 6);
   header.writeUInt32LE(mapId, 8);
@@ -44,7 +44,7 @@ function datagram({ mapId = 601, instanceId = 7, sequence = 1, serverTimeMs = 50
   header.writeUInt16LE(players.length, 24);
   const records = players.map((player) => {
     const name = Buffer.from(player.name, 'utf8');
-    const record = Buffer.alloc(30);
+    const record = Buffer.alloc(version >= 2 ? 31 : 30);
     record.writeUInt32LE(player.guid, 0);
     record.writeFloatLE(player.x, 4);
     record.writeFloatLE(player.y, 8);
@@ -55,15 +55,21 @@ function datagram({ mapId = 601, instanceId = 7, sequence = 1, serverTimeMs = 50
     record.writeInt8(player.powerType, 22);
     record.writeUInt8(player.flags, 23);
     record.writeUInt8(player.stateFlags, 24);
-    record.writeUInt8(name.length, 25);
-    record.writeInt32LE(player.wmoGroupId, 26);
+    if (version >= 2) {
+      record.writeUInt8(player.roleMask ?? 0, 25);
+      record.writeUInt8(name.length, 26);
+      record.writeInt32LE(player.wmoGroupId, 27);
+    } else {
+      record.writeUInt8(name.length, 25);
+      record.writeInt32LE(player.wmoGroupId, 26);
+    }
     return Buffer.concat([record, name]);
   });
   return Buffer.concat([header, ...records]);
 }
 
 const tankard = { guid: 42, name: 'Tankard', x: 529.5, y: 652.25, z: 777.5, orientation: 1.5, healthPct: 87,
-  powerPct: 30, powerType: 1, flags: 3, stateFlags: 2, wmoGroupId: 25050 };
+  powerPct: 30, powerType: 1, flags: 3, stateFlags: 2, roleMask: 2, wmoGroupId: 25050 };
 
 test('parses a stream datagram into session and player state', () => {
   const parsed = parseStreamDatagram(datagram({ sequence: 9, players: [tankard, { ...tankard, guid: 7, name: 'Wéb', flags: 4, wmoGroupId: -1 }] }));
@@ -82,11 +88,19 @@ test('parses a stream datagram into session and player state', () => {
   assert.equal(first.inCombat, true);
   assert.equal(first.waitingForResurrect, false);
   assert.equal(first.stateFlags, 2);
+  assert.equal(first.roleMask, 2);
   assert.equal(first.wmoGroupId, 25050);
   assert.equal(second.name, 'Wéb');
   assert.equal(second.alive, false);
   assert.equal(second.waitingForResurrect, true);
   assert.equal(second.wmoGroupId, -1);
+});
+
+test('keeps accepting version 1 stream players without a role mask', () => {
+  const parsed = parseStreamDatagram(datagram({ version: 1, players: [tankard] }));
+  assert.equal(parsed.players[0].name, 'Tankard');
+  assert.equal(parsed.players[0].roleMask, undefined);
+  assert.equal(parsed.players[0].wmoGroupId, 25050);
 });
 
 test('rejects foreign, truncated, and malformed datagrams', () => {
@@ -105,6 +119,7 @@ test('interpolates between stream samples a little behind live', () => {
   buffer.push(frame(510, 0.4), 1100);
   near(buffer.sampleAt('Tankard', 1050 + LIVE_RENDER_DELAY_MS).x, 505, 'halfway');
   near(buffer.sampleAt('Tankard', 1050 + LIVE_RENDER_DELAY_MS).orientation, 0.3, 'facing');
+  assert.equal([...buffer.samples(1050 + LIVE_RENDER_DELAY_MS)].map((sample) => sample.name).join(','), 'Tankard');
   assert.equal(buffer.sampleAt('Tankard', 2000).x, 510, 'holds the newest sample');
   assert.equal(buffer.sampleAt('Tankard', 1100 + 2001), null, 'stale');
   assert.equal(buffer.sampleAt('Nobody', 1100), null);
@@ -126,14 +141,16 @@ test('turns the short way round when interpolating facing', () => {
 test('overlays live fields on the polled player record and keeps the rest', () => {
   const { applyLiveSample } = loadModule('../renderer/scripts/utils/live-positions.ts');
   const polled = { name: 'Tankard', class: 1, level: 80, position_x: 0, position_y: 0, position_z: 0, orientation: 0,
-    alive: true, inCombat: false, healthPct: 100, wmoGroupId: 1, mounted: false };
-  const live = applyLiveSample(polled, { ...tankard, alive: false, inCombat: true, waitingForResurrect: true, stateFlags: 2 | 32 | 64 });
+    alive: true, inCombat: false, healthPct: 100, roleMask: 0, wmoGroupId: 1, mounted: false };
+  const live = applyLiveSample(polled, { ...tankard, alive: false, inCombat: true, waitingForResurrect: true,
+    roleMask: 4, stateFlags: 2 | 32 | 64 });
   assert.equal(live.class, 1);
   assert.equal(live.level, 80);
   near(live.position_x, 529.5, 'x');
   assert.equal(live.healthPct, 87);
   assert.equal(live.alive, false);
   assert.equal(live.inCombat, true);
+  assert.equal(live.roleMask, 4);
   assert.equal(live.mounted, true);
   assert.equal(live.flagCarrier, true);
   assert.equal(live.flying, true);

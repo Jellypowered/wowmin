@@ -36,9 +36,15 @@ const DEBUFF_SIZE = 16;
 const MARKER_SIZE = 8;
 const GAMEOBJECT_SIZE = 48;
 const PASSENGER_SIZE = 12;
-const VERSION = 1;
+const VERSION = 2;
+const LEGACY_VERSION = 1;
 const HEADER_SIZE = 28;
-const PLAYER_SIZE = 30;
+const PLAYER_SIZE_V1 = 30;
+const PLAYER_SIZE_V2 = 31;
+
+function supportedVersion(version: number): boolean {
+  return version === LEGACY_VERSION || version === VERSION;
+}
 // Path, creature, and bot datagrams share a 24-byte header.
 const PATH_HEADER_SIZE = 24;
 const PATH_ENTRY_SIZE = 12;
@@ -64,9 +70,10 @@ const STREAM_LAPSED_MS = 3000;
 const STREAM_UNAVAILABLE_MS = 8000;
 
 export function parseStreamDatagram(buffer: Buffer): StreamDatagram | null {
-  if (buffer.length < HEADER_SIZE || buffer.toString('latin1', 0, 4) !== MAGIC || buffer.readUInt8(4) !== VERSION) {
-    return null;
-  }
+  if (buffer.length < HEADER_SIZE || buffer.toString('latin1', 0, 4) !== MAGIC) return null;
+  const version = buffer.readUInt8(4);
+  if (!supportedVersion(version)) return null;
+  const playerSize = version >= 2 ? PLAYER_SIZE_V2 : PLAYER_SIZE_V1;
   const partCount = buffer.readUInt8(6);
   const part = buffer.readUInt8(5);
   if (!partCount || part >= partCount) return null;
@@ -74,9 +81,9 @@ export function parseStreamDatagram(buffer: Buffer): StreamDatagram | null {
   const players: StreamPlayerSample[] = [];
   let offset = HEADER_SIZE;
   for (let index = 0; index < playerCount; index += 1) {
-    if (offset + PLAYER_SIZE > buffer.length) return null;
-    const nameLength = buffer.readUInt8(offset + 25);
-    if (offset + PLAYER_SIZE + nameLength > buffer.length) return null;
+    if (offset + playerSize > buffer.length) return null;
+    const nameLength = buffer.readUInt8(offset + (version >= 2 ? 26 : 25));
+    if (offset + playerSize + nameLength > buffer.length) return null;
     const flags = buffer.readUInt8(offset + 23);
     players.push({
       guid: buffer.readUInt32LE(offset),
@@ -91,10 +98,11 @@ export function parseStreamDatagram(buffer: Buffer): StreamDatagram | null {
       inCombat: Boolean(flags & 2),
       waitingForResurrect: Boolean(flags & 4),
       stateFlags: buffer.readUInt8(offset + 24),
-      wmoGroupId: buffer.readInt32LE(offset + 26),
-      name: buffer.toString('utf8', offset + PLAYER_SIZE, offset + PLAYER_SIZE + nameLength),
+      roleMask: version >= 2 ? buffer.readUInt8(offset + 25) : undefined,
+      wmoGroupId: buffer.readInt32LE(offset + (version >= 2 ? 27 : 26)),
+      name: buffer.toString('utf8', offset + playerSize, offset + playerSize + nameLength),
     });
-    offset += PLAYER_SIZE + nameLength;
+    offset += playerSize + nameLength;
   }
   return {
     mapId: buffer.readUInt32LE(8),
@@ -115,7 +123,8 @@ export interface PathDatagram {
 }
 
 function readEntryHeader(buffer: Buffer, magic: string): { mapId: number; instanceId: number; serverTimeMs: number; count: number } | null {
-  if (buffer.length < PATH_HEADER_SIZE || buffer.toString('latin1', 0, 4) !== magic || buffer.readUInt8(4) !== VERSION) {
+  if (buffer.length < PATH_HEADER_SIZE || buffer.toString('latin1', 0, 4) !== magic
+    || !supportedVersion(buffer.readUInt8(4))) {
     return null;
   }
   return {

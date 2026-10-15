@@ -103,6 +103,20 @@ export class LivePositionBuffer {
     if (!samples?.length || now - samples[samples.length - 1].at > LIVE_STALE_MS) return null;
     return sampleHistory(samples, now);
   }
+
+  // Every player in the latest live frame. This also recovers playerbots that
+  // the character-database fallback cannot reliably report as online.
+  samples(now: number): StreamPlayerSample[] {
+    const current: StreamPlayerSample[] = [];
+    for (const [name, samples] of this.history) {
+      if (!samples.length || now - samples[samples.length - 1].at > LIVE_STALE_MS) {
+        this.history.delete(name);
+      } else {
+        current.push(sampleHistory(samples, now));
+      }
+    }
+    return current;
+  }
 }
 
 // Idle creatures are re-sent once a second; one missing for longer than this
@@ -156,6 +170,7 @@ export function applyLiveSample(player: MapPlayerPosition, sample: StreamPlayerS
     alive: sample.alive,
     inCombat: sample.inCombat,
     waitingForResurrect: sample.waitingForResurrect,
+    roleMask: sample.roleMask ?? player.roleMask,
     wmoGroupId: sample.wmoGroupId,
     onTaxi: (sample.stateFlags & 1) !== 0,
     mounted: (sample.stateFlags & 2) !== 0,

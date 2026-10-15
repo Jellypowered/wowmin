@@ -96,6 +96,8 @@ const wowminAPI: WowminAPI = {
   sessions: {
     list: () => invoke('sessions:list'),
     get: (id) => invoke('sessions:get', id),
+    isRecordingEnabled: () => invoke('sessions:isRecordingEnabled'),
+    setRecordingEnabled: (enabled) => invoke('sessions:setRecordingEnabled', enabled),
     purgeCompleted: () => invoke('sessions:purgeCompleted'),
   },
   economy: {

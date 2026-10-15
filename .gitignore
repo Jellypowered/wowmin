@@ -20,6 +20,7 @@ Desktop.ini
 *.swp
 *.swo
 *~
+.pi/
 
 # Electron
 *.asar

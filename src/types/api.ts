@@ -190,6 +190,8 @@ export interface StreamPlayerSample {
   inCombat: boolean;
   waitingForResurrect: boolean;
   stateFlags: number;
+  // Core LFG role mask. Added in live stream protocol v2; absent on v1.
+  roleMask?: number;
   wmoGroupId: number;
 }
 
@@ -925,6 +927,8 @@ export type ApiChannels = {
   'map:getCreatureInfo': (entries: number[]) => CreatureInfo[];
   'sessions:list': () => SessionIndexEntry[];
   'sessions:get': (id: string) => SessionRecord | null;
+  'sessions:isRecordingEnabled': () => boolean;
+  'sessions:setRecordingEnabled': (enabled: boolean) => boolean;
   'sessions:purgeCompleted': () => number;
 
   'economy:connect': (config: DbConfig) => DbConnectionState;

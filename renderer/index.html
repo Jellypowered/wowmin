@@ -1180,7 +1180,7 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
   <div id="tab-instances" role="tabpanel" class="tab-content" aria-labelledby="tab-btn-instances" aria-hidden="true">
     <div class="instance-watch-layout">
       <aside class="instance-watch-sidebar">
-        <div class="card">
+        <div id="instance-active-card" class="card">
           <div class="card-header">
             <h3>Active Sessions</h3>
             <span id="instance-session-count" class="map-status-count">0</span>
@@ -1200,19 +1200,19 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
                 <output id="instance-icon-scale-value" for="instance-icon-scale">125%</output>
               </span>
             </label>
-            <label title="How far above or below the party the 3D scene fades out">Height fade
+            <label class="instance-3d-control" title="How far above or below the party the 3D scene fades out">Height fade
               <span class="player-icon-scale-control">
                 <input type="range" id="instance-fade-range" min="5" max="50" step="5" value="15" />
                 <output id="instance-fade-range-value" for="instance-fade-range">15 yd</output>
               </span>
             </label>
-            <label title="How far around each party member the 3D scene stays visible: solid out to half this distance, gone at the full distance. 0 turns it off.">Horizontal fade
+            <label class="instance-3d-control" title="How far around each party member the 3D scene stays visible: solid out to half this distance, gone at the full distance. 0 turns it off.">Horizontal fade
               <span class="player-icon-scale-control">
                 <input type="range" id="instance-horizontal-fade" min="0" max="200" step="10" value="40" />
                 <output id="instance-horizontal-fade-value" for="instance-horizontal-fade">40 yd</output>
               </span>
             </label>
-            <label title="Draws the 3D scene at this share of the screen's resolution and stretches it to fit. Lower is faster but blurrier.">Render scale
+            <label class="instance-3d-control" title="Draws the 3D scene at this share of the screen's resolution and stretches it to fit. Lower is faster but blurrier.">Render scale
               <span class="player-icon-scale-control">
                 <input type="range" id="instance-render-scale" min="0.5" max="1" step="0.05" value="1" />
                 <output id="instance-render-scale-value" for="instance-render-scale">100%</output>
@@ -1225,7 +1225,7 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
                 <option value="off">Off</option>
               </select>
             </label>
-            <label title="How names show over units in the 3D view: nameplates with health, level, and casts, in the look of the TidyPlates addon's Neon, Grey, or Quatre themes, or plain labels.">Plates
+            <label class="instance-3d-control" title="How names show over units in the 3D view: nameplates with health, level, and casts, in the look of the TidyPlates addon's Neon, Grey, or Quatre themes, or plain labels.">Plates
               <select id="instance-plates-mode">
                 <option value="neon">Neon</option>
                 <option value="grey">Grey</option>
@@ -1233,7 +1233,7 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
                 <option value="labels">Labels</option>
               </select>
             </label>
-            <label title="How the 3D view is lit: by each map's own light from the client, at your local time of day, or by a fixed neutral white.">Lighting
+            <label class="instance-3d-control" title="How the 3D view is lit: by each map's own light from the client, at your local time of day, or by a fixed neutral white.">Lighting
               <select id="instance-lighting-mode">
                 <option value="client">Client</option>
                 <option value="neutral">Neutral</option>
@@ -1249,10 +1249,10 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
               <button id="instance-trails-btn" class="btn btn-small" title="Show the faded line of where each player has been." aria-pressed="true">Trails</button>
               <button id="instance-paths-btn" class="btn btn-small" title="Show where bots and mobs are heading. Needs the live stream." aria-pressed="true">Paths</button>
               <button id="instance-decisions-btn" class="btn btn-small" title="Show what each bot is doing and where it chose to move. Needs the live stream and mod-playerbots." aria-pressed="true">Decisions</button>
-              <button id="instance-models-btn" class="btn btn-small" title="Draw players and mobs with their game models, animated. Needs the live stream and 3D." aria-pressed="true">Models</button>
+              <button id="instance-models-btn" class="btn btn-small instance-3d-control" title="Draw players and mobs with their game models, animated. Needs the live stream and 3D." aria-pressed="true">Models</button>
               <button id="instance-numbers-btn" class="btn btn-small" title="Float damage and healing numbers over units, like the game's combat text. Needs the live stream." aria-pressed="false">Numbers</button>
-              <button id="instance-fades-btn" class="btn btn-small" title="Fade the 3D scene out away from the party, by the height and horizontal fade settings. Turn off to see the whole map, as suits battlegrounds and outdoor areas." aria-pressed="true">Fade</button>
-              <button id="instance-object-lights-btn" class="btn btn-small" title="Light the ground, props, and units near the party with the torches, braziers, and lamps on the map. Turn off if the 3D view is slow." aria-pressed="true">Lights</button>
+              <button id="instance-fades-btn" class="btn btn-small instance-3d-control" title="Fade the 3D scene out away from the party, by the height and horizontal fade settings. Turn off to see the whole map, as suits battlegrounds and outdoor areas." aria-pressed="true">Fade</button>
+              <button id="instance-object-lights-btn" class="btn btn-small instance-3d-control" title="Light the ground, props, and units near the party with the torches, braziers, and lamps on the map. Turn off if the 3D view is slow." aria-pressed="true">Lights</button>
             </div>
           </div>
         </div>
@@ -1280,7 +1280,7 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
           <div id="instance-bot-decisions" class="card-body instance-bot-decisions"></div>
         </div>
 
-        <div class="card instance-player-list-card">
+        <div id="instance-participants-card" class="card instance-player-list-card">
           <div class="card-header"><h3>Participants</h3></div>
           <div id="instance-player-list" class="instance-player-list">
             <p class="placeholder">Select an active session</p>
@@ -1294,10 +1294,10 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
             <h2 id="instance-watch-title">No active instance</h2>
             <p id="instance-watch-subtitle">Sessions appear automatically while players or bots are inside an instance or battleground.</p>
           </div>
-          <div class="instance-watch-legend">
-            <span><i class="instance-legend-dot player"></i> Player</span>
-            <span><i class="instance-legend-dot bot"></i> Bot</span>
-            <span><i class="instance-legend-dot combat"></i> Combat</span>
+          <div class="instance-watch-heading-controls">
+            <label class="instance-recording-toggle" title="Record newly completed instance sessions in Session History. Turning this off discards any recording currently in progress.">
+              <input type="checkbox" id="instance-record-sessions" checked /> Record sessions
+            </label>
           </div>
         </div>
         <div class="instance-canvas-wrapper">

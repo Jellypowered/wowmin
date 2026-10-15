@@ -80,6 +80,8 @@ export interface WowminAPI {
   sessions: {
     list(): Promise<SessionIndexEntry[]>;
     get(id: string): Promise<SessionRecord | null>;
+    isRecordingEnabled(): Promise<boolean>;
+    setRecordingEnabled(enabled: boolean): Promise<boolean>;
     purgeCompleted(): Promise<number>;
   };
   economy: {

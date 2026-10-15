@@ -3870,10 +3870,10 @@ tbody tr:hover { background: var(--tint-accent-05); }
 
 .instance-player-row {
   display: grid;
-  grid-template-columns: 8px auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 7px;
-  padding: 6px 7px;
+  gap: 4px 8px;
+  padding: 8px 7px;
   border-radius: 4px;
   font-size: 12px;
 }
@@ -3882,9 +3882,23 @@ tbody tr:hover { background: var(--tint-accent-05); }
 .instance-player-row.alliance.in-combat { background: rgba(59, 130, 246, 0.10); }
 .instance-player-row.horde.in-combat { background: var(--tint-danger-08); }
 .instance-player-row.selected { box-shadow: inset 0 0 0 1px #fbbf24; }
-.instance-player-info { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-.instance-player-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.instance-player-state { overflow: hidden; color: var(--text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.instance-player-info { display: flex; min-width: 0; align-items: baseline; gap: 5px; }
+.instance-player-name { overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.instance-player-role { color: var(--text); font-size: 11px; white-space: nowrap; }
+.instance-player-status-icons { min-width: calc(16px * var(--player-icon-scale)); min-height: calc(16px * var(--player-icon-scale)); justify-self: end; }
+.instance-player-state {
+  display: -webkit-box;
+  grid-column: 1 / -1;
+  height: 2.8em;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  white-space: normal;
+}
 
 .instance-watch-heading {
   display: flex;
@@ -3896,11 +3910,9 @@ tbody tr:hover { background: var(--tint-accent-05); }
 
 .instance-watch-heading h2 { margin: 0 0 4px; font-size: 18px; }
 .instance-watch-heading p { margin: 0; color: var(--text-muted); font-size: 12px; }
-.instance-watch-legend { display: flex; gap: 12px; color: var(--text-muted); font-size: 11px; }
-.instance-watch-legend span { display: inline-flex; align-items: center; gap: 5px; }
-.instance-legend-dot { width: 8px; height: 8px; border-radius: 50%; background: #94a3b8; }
-.instance-legend-dot.player { background: #4fc3f7; }
-.instance-legend-dot.combat { border: 2px solid #ef4444; background: transparent; box-sizing: border-box; }
+.instance-watch-heading-controls { display: flex; align-items: flex-end; flex-direction: column; gap: 7px; }
+.instance-recording-toggle { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 11px; cursor: pointer; }
+.instance-recording-toggle input { margin: 0; accent-color: var(--accent); }
 
 .instance-canvas-wrapper {
   position: relative;
