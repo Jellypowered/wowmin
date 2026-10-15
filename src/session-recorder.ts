@@ -25,6 +25,7 @@ export interface SessionRecorderOptions {
   checkpointIntervalMs?: number;
   maxEventsPerSession?: number;
   maxRoutePointsPerSession?: number;
+  recordingEnabledDefault?: boolean;
 }
 
 interface ActiveSession {
@@ -247,10 +248,11 @@ export class SessionRecorder {
   private readonly checkpointIntervalMs: number;
   private readonly maxEventsPerSession: number;
   private readonly maxRoutePointsPerSession: number;
+  private readonly recordingEnabledDefault: boolean;
   private readonly activeSessions = new Map<string, ActiveSession>();
   private readonly mapNames = new Map<number, string>();
   private index: SessionIndexEntry[] = [];
-  private recordingEnabled = true;
+  private recordingEnabled = false;
   private initialized: Promise<void> | null = null;
   private operationChain: Promise<void> = Promise.resolve();
 
@@ -265,6 +267,8 @@ export class SessionRecorder {
     this.checkpointIntervalMs = positiveInteger(options.checkpointIntervalMs, 10000);
     this.maxEventsPerSession = positiveInteger(options.maxEventsPerSession, 10000);
     this.maxRoutePointsPerSession = positiveInteger(options.maxRoutePointsPerSession, 50000);
+    this.recordingEnabledDefault = options.recordingEnabledDefault ?? false;
+    this.recordingEnabled = this.recordingEnabledDefault;
   }
 
   ingest(snapshot: MapPlayerSnapshot): Promise<void> {
@@ -347,9 +351,11 @@ export class SessionRecorder {
     await fs.mkdir(this.activeDir, { recursive: true });
     try {
       const stored = JSON.parse(await fs.readFile(this.settingsPath, 'utf8')) as { enabled?: unknown };
-      this.recordingEnabled = typeof stored.enabled === 'boolean' ? stored.enabled : true;
+      this.recordingEnabled = typeof stored.enabled === 'boolean'
+        ? stored.enabled
+        : this.recordingEnabledDefault;
     } catch {
-      this.recordingEnabled = true;
+      this.recordingEnabled = this.recordingEnabledDefault;
     }
     await this.writeJsonAtomic(this.settingsPath, { schemaVersion: 1, enabled: this.recordingEnabled });
 

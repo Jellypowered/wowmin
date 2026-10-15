@@ -30,6 +30,8 @@ and session recording built on the separate `mod-wowmin-telemetry` module.
 - **World lighting** in the 3D view, from the client: each map's own light (its colours through the day, the client's sun, local time or the map's fixed time), drawn as the client lights terrain, buildings (both its render paths, batch by batch), props, and units, including indoor light from the floor under a unit or a building's prop, doorway faces that blend indoor light into outdoor, and dungeons' brighter character ambient; the lights of torches and braziers near the party (a Lights toggle); and a Lighting setting (Client or Neutral).
 - **Rendering performance** for battleground scale: a shared fade uniform buffer, instanced props, skeletons kept out of the scene graph with an animation budget (48 nearest units at full rate, the rest at 10 Hz, off-screen units skipped), merged unit draw calls, a 1.5 pixel-ratio cap, and a Render scale control; `?debug` shows frame rate, draws, and stream rates.
 - Added synchronized, persisted icon-size controls to Live Map and Instance Watch. Canvas markers now scale progressively with zoom, participant-list icons are larger, and pre-v6 telemetry uses extracted male race portraits instead of emoji when gender is unavailable.
+- Instance Watch participant rows now use a stable two-line status layout with live state icons and Tank/Heal/DPS labels. Extracted client icons remain optional; the same layout uses emoji fallbacks when they are absent.
+- Added live-stream protocol v2 participant role masks. `mod-wowmin-telemetry` uses assigned core LFG roles first and, when available, `mod-playerbots` talent/gear role classification for manually assembled groups; WoWMin remains compatible with stream v1.
 
 ### Changed
 
@@ -37,10 +39,13 @@ and session recording built on the separate `mod-wowmin-telemetry` module.
 - WoWMin is now a web-only Node.js service; Electron entrypoints, packaging, desktop update checks, and platform installers were removed.
 - The content security policy allows WebAssembly (meshopt decoding of 3D scenes) and `blob:` images and connections (glTF textures).
 - The web service reads its settings files itself, without `--env-file`: `/etc/wowmin.env` (`%ProgramData%\wowmin\wowmin.env` on Windows) takes precedence over the project's `.env`, and variables already set in the environment over both.
+- Instance Watch now orders sidebar cards by session type. Battlegrounds place Battleground before Participants; dungeons and raids hide only Battleground while retaining Participants, Encounters, and Bot Decisions with empty-state guidance. Flat-map mode hides controls that only affect 3D rendering.
 
 ### Fixed
 
 - Expected database fallback probes no longer flood server logs while SOAP or telemetry keeps the UI functional; genuine API failures now identify their channel and suppress identical repeats.
+- Instance Watch now merges live-stream participants into database-fallback sessions so active playerbots remain visible, and protects focused dropdowns from periodic refreshes and card reordering.
+- The persisted **Record sessions** control defaults off when no preference exists, can discard an in-progress recording without deleting completed history, and retains its setting across WoWMin restarts.
 - Battleground Session History and replay now interpret the core `PvPTeamId` winner correctly, retain authoritative final state after participants leave, and classify Eye of the Storm resource gains as score objectives rather than flag captures.
 - Session History now loads persisted local records at application startup and remains available while disconnected from SOAP, the worldserver, and realm databases.
 - New Session History files now use familiar dungeon, raid, and battleground abbreviations in names such as `WSG-3-Oct08-26.json` and `Ramps(H)-22-Oct08-26.json`; collision suffixes preserve every run, and existing numeric filenames remain readable.

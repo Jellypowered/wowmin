@@ -54,10 +54,19 @@ test('builds readable session file names', () => {
   assert.equal(readableSessionId(568, "Zul'Aman", 24, startedAt), 'ZA-24-Oct08-26');
 });
 
+test('defaults recording off when no persisted setting exists', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-recording-default-'));
+  const recorder = new SessionRecorder({ dataDir });
+  assert.equal(await recorder.isEnabled(), false);
+  const settings = JSON.parse(await fs.readFile(path.join(dataDir, 'session-recording.json'), 'utf8'));
+  assert.equal(settings.enabled, false);
+});
+
 test('records, deduplicates, persists, and indexes a completed session', async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-recorder-'));
   const recorder = new SessionRecorder({
     dataDir,
+    recordingEnabledDefault: true,
     routeIntervalMs: 1,
     completionGraceMs: 10,
     checkpointIntervalMs: 1,
@@ -91,7 +100,7 @@ test('records, deduplicates, persists, and indexes a completed session', async (
 
 test('persists and indexes a completed battleground outcome', async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-bg-outcome-'));
-  const recorder = new SessionRecorder({ dataDir, routeIntervalMs: 1, completionGraceMs: 1 });
+  const recorder = new SessionRecorder({ dataDir, recordingEnabledDefault: true, routeIntervalMs: 1, completionGraceMs: 1 });
   const startedAt = Math.floor(Date.now() / 1000);
   const bgPlayer = { ...player(55, startedAt), map: 489, mapType: 3, teamId: 0 };
   const battleground = {
@@ -128,7 +137,7 @@ test('formats battleground-specific outcomes', () => {
 
 test('records a final battleground state after all players leave', async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-bg-final-'));
-  const recorder = new SessionRecorder({ dataDir, routeIntervalMs: 1, completionGraceMs: 10 });
+  const recorder = new SessionRecorder({ dataDir, recordingEnabledDefault: true, routeIntervalMs: 1, completionGraceMs: 10 });
   const startedAt = Math.floor(Date.now() / 1000);
   const bgPlayer = { ...player(56, startedAt), map: 489, mapType: 3, teamId: 0 };
   const battleground = {
@@ -152,7 +161,7 @@ test('records a final battleground state after all players leave', async () => {
 
 test('records EotS resource gains as objectives rather than flag captures', async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-eots-score-'));
-  const recorder = new SessionRecorder({ dataDir, routeIntervalMs: 1, completionGraceMs: 1 });
+  const recorder = new SessionRecorder({ dataDir, recordingEnabledDefault: true, routeIntervalMs: 1, completionGraceMs: 1 });
   const startedAt = Math.floor(Date.now() / 1000);
   const bgPlayer = { ...player(57, startedAt), map: 566, mapType: 3, teamId: 0 };
   const battleground = {
@@ -175,7 +184,7 @@ test('records EotS resource gains as objectives rather than flag captures', asyn
 
 test('purges abandoned incomplete checkpoints and temporary files on startup', async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-incomplete-'));
-  const options = { dataDir, routeIntervalMs: 1, checkpointIntervalMs: 1 };
+  const options = { dataDir, recordingEnabledDefault: true, routeIntervalMs: 1, checkpointIntervalMs: 1 };
   const startedAt = Math.floor(Date.now() / 1000);
   const firstRecorder = new SessionRecorder(options);
   await firstRecorder.ingest(snapshot(startedAt * 1000 + 1000, [player(77, startedAt)]));
@@ -194,7 +203,7 @@ test('purges abandoned incomplete checkpoints and temporary files on startup', a
 
 test('purges completed history only when explicitly requested', async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-purge-'));
-  const recorder = new SessionRecorder({ dataDir, routeIntervalMs: 1, completionGraceMs: 1, checkpointIntervalMs: 1 });
+  const recorder = new SessionRecorder({ dataDir, recordingEnabledDefault: true, routeIntervalMs: 1, completionGraceMs: 1, checkpointIntervalMs: 1 });
   const startedAt = Math.floor(Date.now() / 1000);
   const completed = snapshot(startedAt * 1000 + 10, [player(1, startedAt)]);
   await recorder.ingest(completed);
@@ -212,7 +221,7 @@ test('purges completed history only when explicitly requested', async () => {
 
 test('disabling recording discards active checkpoints without deleting completed sessions', async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-recording-toggle-'));
-  const recorder = new SessionRecorder({ dataDir, routeIntervalMs: 1, completionGraceMs: 1, checkpointIntervalMs: 1 });
+  const recorder = new SessionRecorder({ dataDir, recordingEnabledDefault: true, routeIntervalMs: 1, completionGraceMs: 1, checkpointIntervalMs: 1 });
   const startedAt = Math.floor(Date.now() / 1000);
 
   const completed = snapshot(startedAt * 1000 + 10, [player(1, startedAt)]);
@@ -240,7 +249,7 @@ test('disabling recording discards active checkpoints without deleting completed
 
 test('derives objective transitions once and retains all completed records', async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'wowmin-history-'));
-  const recorder = new SessionRecorder({ dataDir, routeIntervalMs: 1, completionGraceMs: 1 });
+  const recorder = new SessionRecorder({ dataDir, recordingEnabledDefault: true, routeIntervalMs: 1, completionGraceMs: 1 });
   const baseStartedAt = Math.floor(Date.now() / 1000);
   for (const [instanceId, startedAt] of [[1, baseStartedAt], [2, baseStartedAt + 1]]) {
     const active = snapshot(startedAt * 1000 + 10, [player(instanceId, startedAt)], {

@@ -71,8 +71,11 @@ accessed from a browser.
   multi-floor instances), with stable projection bounds and letterboxing
 - Live participant markers with faction colors, health bars, movement trails,
   headings, and combat indicators
-- Group/raid membership, subgroup, faction/team, core LFG role, and runtime
-  session age per participant
+- Participant rows with race/class artwork, compact live state icons, wrapped
+  two-line status text, and Tank/Heal/DPS beside each dungeon/raid participant;
+  roles use the core LFG assignment or `mod-playerbots` talent/gear inference
+  for manually assembled groups. Emoji fallbacks preserve the same layout when
+  client icons have not been extracted
 - Battleground match state: phase, team scores, alive counts, decoded
   objectives (scores, captures, timers, flag state), and resurrection state;
   the active server-selected bot strategy is shown read-only when available
@@ -82,6 +85,9 @@ accessed from a browser.
 - Floor-aware dungeons: participants are classified onto the correct dungeon
   floor from WMO/height context and only that floor's markers and trails are
   shown
+- Contextual sidebar order: battlegrounds show Active Sessions, Battleground,
+  Participants, Bot Decisions, and Encounters; dungeons/raids hide only the
+  Battleground card and keep the other cards visible with empty-state guidance
 
 ### 3D Instance Watch (New)
 - An isometric 3D view of every instance, raid, battleground, and arena,
@@ -103,7 +109,9 @@ accessed from a browser.
   bars with spell names and icons, debuffs, threat, and battleground crests
 - A party fade that keeps the floors and rooms around the party solid and
   fades the rest, by height and by distance, so multi-level dungeons stay
-  readable; turned off, the whole map is shown, as suits battlegrounds
+  readable; turned off, the whole map is shown, as suits battlegrounds. When
+  flat-map mode is selected, 3D-only controls (fade ranges, render scale,
+  plates, lighting, models, fade, and lights) are hidden
 - Rotate (Q/E, or middle-drag to rotate and tilt freely), zoom about the
   pointer, and Follow a participant
 - Built for battleground scale: in testing on a GeForce RTX 2060 SUPER, about
@@ -137,9 +145,10 @@ accessed from a browser.
 - Replay renders the map artwork with per-participant colored routes (broken
   across death/release/teleport jumps), a chronological event log, and running
   totals at the seek position
-- Interrupted checkpoints from crashes or shutdowns are purged automatically
-  at startup; completed history is only ever removed by the explicit
-  **Purge all** button
+- Instance Watch includes a persisted **Record sessions** checkbox that is off
+  by default on a new install. Turning it off discards recordings currently in progress without touching completed
+  history; interrupted checkpoints are also purged at startup, and completed
+  history is only removed by the explicit **Purge all** button
 
 ### Live telemetry – `mod-wowmin-telemetry`
 - Live position/state telemetry is produced by the standalone companion module
@@ -155,10 +164,12 @@ accessed from a browser.
   Live Map, Instance Watch, and session recorder, configurable via
   `WOWMIN_TELEMETRY_POLL_MS` (default 1000, minimum 500)
 - For the 3D Instance Watch it also streams the watched instance over UDP at
-  10 Hz (positions, mobs, paths, appearances, combat events, auras, game
-  objects, markers). The stream runs only while a page is watching: WoWMin
-  renews it every few seconds with the `wowmin stream <mapId> <instanceId>`
-  SOAP command, and the module stops sending when renewals stop
+  10 Hz (positions, roles, mobs, paths, appearances, combat events, auras,
+  game objects, markers). Live-stream protocol v2 adds each participant's role
+  mask while WoWMin retains v1 parsing. The stream runs only while a page is
+  watching: WoWMin renews it every few seconds with the
+  `wowmin stream <mapId> <instanceId>` SOAP command, and the module stops
+  sending when renewals stop
 
 ### Economy Monitor
 - Dedicated **Economy** tab for monitoring the live in-game auction house and character wealth
@@ -549,15 +560,16 @@ when Test Deck is not available from the browser at the default
 
 ### Instance / Battleground Watch
 1. Navigate to the **Instance Watch** tab (keyboard shortcut **Alt+7**). Active runtime instances, raids, battlegrounds, and arenas are discovered automatically and appear as cards in the sidebar; nothing to configure beyond a SOAP connection.
-2. Switch the **Session** dropdown to inspect another session; **Auto (1 s)** keeps the selected session fresh, with a full re-discovery every 10 s.
+2. Switch the **Session** dropdown to inspect another session; **Auto (1 s)** keeps the selected session fresh, with a full re-discovery every 10 s. Refreshes never replace or move an actively used dropdown.
 3. The map pane uses extracted client artwork when available (with per-floor dungeon artwork for multi-floor dungeons), otherwise calibrated or auto-fit bounds.
 4. **Click a participant marker or sidebar row** to focus the view on them; **Fit** restores a view that fits everyone, **−**/**+** zoom around the cursor, and **Clear focus** releases the focused participant.
-5. Battlegrounds additionally show the match phase, team scores, alive counts, decoded objectives, resurrection state, and the server-selected bot strategy (read-only).
-6. The encounter card lists boss states and the session death history; the participant list shows faction, group/subgroup, LFG role, health and power, and target.
+5. Battleground cards are ordered Active Sessions, Battleground, Participants, Bot Decisions, Encounters. Dungeon/raid cards are ordered Active Sessions, Participants, Encounters, Bot Decisions; only Battleground is hidden, and cards without current data remain visible with an explanation.
+6. The participant list shows live players and bots even during database fallback, with race/class artwork, state icons, a stable two-line wrapped status, and Tank/Heal/DPS beside dungeon/raid names. Roles prefer the core LFG assignment and fall back to `mod-playerbots` classification for manually assembled groups. Without extracted icons the same layout uses emoji fallbacks.
 7. Where a 3D scene has been generated, the map opens in 3D (the **3D** button switches back to the flat map). **Q**/**E** rotate by a quarter turn; middle-drag or Shift+drag rotates and tilts freely; the compass under the buttons shows where north is; the scroll wheel zooms about the pointer.
-8. **Fade** keeps the area around the party solid and fades the rest; **Height fade** and **Horizontal fade** set how far. Turn **Fade** off to see a whole battleground. **Render scale** lowers the 3D resolution on slow GPUs.
+8. **Fade** keeps the area around the party solid and fades the rest; **Height fade** and **Horizontal fade** set how far. Turn **Fade** off to see a whole battleground. **Render scale** lowers the 3D resolution on slow GPUs. These and the other 3D-only controls are hidden while flat-map mode is selected.
 9. **Mobs** (Near party, All, Off), **Plates** (Neon, Grey, Quatre, or plain Labels), and the **Follow**, **Trails**, **Paths**, **Decisions**, **Models**, and **Numbers** toggles choose what is drawn; each remembers its setting per browser.
-10. Add `?debug` to the page URL for a frame-rate, draw-call, and stream-rate overlay, and open `/spell-preview` to play any spell's client art on test models.
+10. **Record sessions**, below the heading, is off by default when no saved preference exists and persists across service restarts. Unchecking it deletes active checkpoints but leaves every completed session file in place.
+11. Add `?debug` to the page URL for a frame-rate, draw-call, and stream-rate overlay, and open `/spell-preview` to play any spell's client art on test models.
 
 ### Dungeon Clear
 1. Add WoWMin's exact origin to Test Deck's
