@@ -162,17 +162,20 @@ function scheduleLoop(at: number): number {
   return length;
 }
 
-// Auras the loop has put on units, as the module's aura lists would say.
+// Auras the loop has put on units, as the module's aura lists would say:
+// a unit whose aura has just ended keeps an empty list for a moment.
 const auraWindows: Array<{ unit: UnitKey; spellId: number; from: number; to: number }> = [];
+const AURA_EMPTY_LIST_MS = 2000;
 function currentAuras(now: number): Map<UnitKey, number[]> {
   const auras = new Map<UnitKey, number[]>();
   for (let index = auraWindows.length - 1; index >= 0; index -= 1) {
     const window = auraWindows[index];
-    if (window.to <= now) {
+    if (window.to + AURA_EMPTY_LIST_MS <= now) {
       auraWindows.splice(index, 1);
       continue;
     }
-    if (window.from <= now) auras.set(window.unit, [...(auras.get(window.unit) ?? []), window.spellId]);
+    if (window.to <= now) auras.set(window.unit, auras.get(window.unit) ?? []);
+    else if (window.from <= now) auras.set(window.unit, [...(auras.get(window.unit) ?? []), window.spellId]);
   }
   return auras;
 }
@@ -216,8 +219,13 @@ function frame(): void {
   })), virtualNow);
   visuals.update(store, virtualNow, {
     anchor,
+    attachment: (unit, attachment, offset) => units.attachmentOf(unit, attachment, offset),
+    isDrawn: (unit) => units.isDrawn(unit),
     scale: (unit) => units.scaleOf(unit) ?? 1,
+    height: (unit) => units.heightOf(unit) ?? 2,
     facing: (unit) => facing.get(unit) ?? 0,
+    // No scene: falling models land on the preview's flat floor.
+    ground: (center, target) => [target[0], target[1], center[2]],
   }, camera, currentAuras(virtualNow));
   glows.update(field('glows').checked ? store : null, virtualNow, anchor, (entry) => visuals.handles(entry));
   renderer.render(scene, camera);

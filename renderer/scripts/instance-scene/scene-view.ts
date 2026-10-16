@@ -11,6 +11,7 @@ import {
   Frustum,
   InstancedBufferAttribute,
   InstancedMesh,
+  type Intersection,
   Material,
   Matrix4,
   Mesh,
@@ -166,6 +167,14 @@ const TERRAIN_COLOR = 0x4a5a3c;
 const DEFAULT_UNIT_HEIGHT = 2;
 const CHEST_HEIGHT = 0.6;
 const HEAD_HEIGHT = 0.9;
+// A falling model (Blizzard's ice) finds the ground as the client does: a
+// ray from just above the area's middle towards a point this high over its
+// landing spot stops short of any roof (at this share of the way), then a
+// ray this far down from there finds the ground.
+const SHARD_START_LIFT = 1 / 6;
+const SHARD_SEARCH_HEIGHT = 50 / 3;
+const SHARD_ROOF_SHARE = 0.95;
+const SHARD_GROUND_DEPTH = 100 / 3;
 
 // Party fade, matching getSceneFade() in map-projection.ts: each volume keeps
 // its surroundings solid, fading out over the height range above and below and
@@ -806,8 +815,12 @@ export class InstanceSceneView {
     const anchor = (unit: UnitKey, role: UnitAnchorRole) => this.anchor(positions, unit, role);
     const units: UnitInfo = {
       anchor,
+      attachment: (unit, attachment, offset) => (positions.has(unit) ? this.units.attachmentOf(unit, attachment, offset) : null),
+      isDrawn: (unit) => this.units.isDrawn(unit),
       scale: (unit) => this.units.scaleOf(unit) ?? 1,
+      height: (unit) => this.units.heightOf(unit) ?? DEFAULT_UNIT_HEIGHT,
       facing: (unit) => this.units.orientationOf(unit) ?? 0,
+      ground: (center, target) => this.groundUnder(center, target),
     };
     this.spellVisuals.update(store, now, units, this.camera, auras);
     const looks = this.spellVisuals.unitLooks(now);
@@ -827,6 +840,37 @@ export class InstanceSceneView {
     // One more frame after the last effect ends, to clear it.
     this.effectsShown = count > 0 || before > 0;
     return count;
+  }
+
+  // Where a falling model aimed at `target` lands, searched from `center`:
+  // the first surface under it, below any roof, or `center` if none.
+  private groundUnder(center: Point3, [x, y]: Point3): Point3 {
+    const root = this.shown;
+    if (!root) return center;
+    const start = serverToThree([center[0], center[1], center[2] + SHARD_START_LIFT]);
+    const end = serverToThree([x, y, center[2] + SHARD_SEARCH_HEIGHT]);
+    const length = start.distanceTo(end);
+    this.raycaster.set(start, end.clone().sub(start).normalize());
+    this.raycaster.far = length;
+    const roof = this.solidHit(root);
+    const top = roof ? start.lerp(end, (roof.distance / length) * SHARD_ROOF_SHARE) : end;
+    this.raycaster.set(top, DOWN);
+    this.raycaster.far = SHARD_GROUND_DEPTH;
+    const ground = this.solidHit(root);
+    this.raycaster.far = Infinity;
+    return ground ? threeToServer(ground.point) : center;
+  }
+
+  // The raycaster's nearest hit on the map's terrain and buildings (not its
+  // props), drawn now.
+  private solidHit(root: Object3D): Intersection | null {
+    for (const hit of this.raycaster.intersectObject(root, true)) {
+      if (hit.object instanceof InstancedMesh) continue;
+      let shown = true;
+      for (let object: Object3D | null = hit.object; object; object = object.parent) shown &&= object.visible;
+      if (shown) return hit;
+    }
+    return null;
   }
 
   // Puts bearer areas round their units' feet into the fade block, for the

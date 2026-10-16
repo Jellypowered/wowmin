@@ -107,7 +107,8 @@ test('instant spells streak; no missile without both units; triggered spells onl
   const cues = (triggered.push(update([event({ triggered: true, area: true, radius: 8, missileSpeed: 20 })]), 0),
     triggered.advance(LIVE_RENDER_DELAY_MS, tenYards));
   assert.deepEqual(plain(cues), []);
-  assert.equal(triggered.casts.length, 0);
+  // Its cast art plays as the client's does, without WowMin's glow.
+  assert.deepEqual(plain(triggered.casts.map(({ release, glow }) => ({ release, glow }))), [{ release: true, glow: false }]);
   // A triggered spell with a missile (a channel's bolts) flies; one without doesn't.
   assert.equal(triggered.projectiles.length, 1);
   assert.equal(triggered.rings.length, 1);
@@ -292,4 +293,44 @@ test('a chain links its caster to its target, then each unit its spell goes on t
   assert.equal(store.chains.length, 3);
   store.advance(LIVE_RENDER_DELAY_MS + CHAIN_LINK_MS, tenYards);
   assert.equal(store.chains.length, 0);
+});
+
+test('a weapon strike plays its cast art without a glow', () => {
+  const store = new CombatEffectStore();
+  store.push(update([event({ spellId: 12294, schoolMask: 1 })]), 0);
+  store.advance(LIVE_RENDER_DELAY_MS, tenYards);
+  assert.deepEqual(plain(store.casts.map(({ spellId, release, glow }) => ({ spellId, release, glow }))),
+    [{ spellId: 12294, release: true, glow: false }]);
+  assert.equal(store.projectiles.length, 0);
+});
+
+test('a helpful cast lands on its target as its missile arrives, and its heal plays no second impact', () => {
+  const store = new CombatEffectStore();
+  store.push(update([event({ spellId: 1459, schoolMask: 64, helpful: true, targetCreature: false })]), 0);
+  store.advance(LIVE_RENDER_DELAY_MS, tenYards);
+  assert.deepEqual(plain(store.impacts.map(({ source, target, spellId, at, kit, glow }) => ({ source, target, spellId, at, kit, glow }))),
+    [{ source: 'p1', target: 'p900', spellId: 1459, at: LIVE_RENDER_DELAY_MS, kit: true, glow: false }]);
+
+  const heal = new CombatEffectStore();
+  heal.push(update([
+    event({ spellId: 2061, schoolMask: 2, helpful: true, targetCreature: false }),
+    event({ kind: 'heal', spellId: 2061, schoolMask: 2, value: 900, targetCreature: false, ageMs: -100 }),
+  ]), 0);
+  heal.advance(LIVE_RENDER_DELAY_MS + 100, tenYards);
+  // The cast's landing plays the art; the heal keeps its glow and number.
+  assert.deepEqual(plain(heal.impacts.map(({ kit, glow }) => ({ kit, glow }))), [{ kit: true, glow: false }, { kit: false, glow: true }]);
+  assert.equal(heal.numbers.length, 1);
+
+  // A missile's landing waits for it; harmful casts wait for their hit.
+  const bolt = new CombatEffectStore();
+  bolt.push(update([event({ helpful: true, missileSpeed: 20, targetCreature: false }), event({ sourceGuid: 2, missileSpeed: 20 })]), 0);
+  bolt.advance(LIVE_RENDER_DELAY_MS, tenYards);
+  assert.deepEqual(plain(bolt.impacts.map(({ source, at }) => ({ source, at }))), [{ source: 'p1', at: LIVE_RENDER_DELAY_MS + 500 }]);
+});
+
+test('an area carries its missile speed, for its impact art to wait on', () => {
+  const store = new CombatEffectStore();
+  store.push(update([event({ area: true, radius: 8, point: [10, 20, 30], targetGuid: 0, missileSpeed: 25 })]), 0);
+  store.advance(LIVE_RENDER_DELAY_MS, tenYards);
+  assert.equal(store.areas[0].missileSpeed, 25);
 });

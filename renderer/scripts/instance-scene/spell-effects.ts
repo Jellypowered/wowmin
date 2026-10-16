@@ -197,7 +197,7 @@ export class SpellEffectLayer {
     const effects = store ?? NO_EFFECTS;
 
     for (const cast of effects.casts) {
-      if (cast.startAt > now || skip(cast)) continue;
+      if (!cast.glow || cast.startAt > now || skip(cast)) continue;
       const right = anchor(cast.caster, 'handRight');
       if (!right) continue;
       drawn += 1;
@@ -251,7 +251,7 @@ export class SpellEffectLayer {
     }
 
     for (const impact of effects.impacts) {
-      if (impact.at > now || skip(impact)) continue;
+      if (!impact.glow || impact.at > now || skip(impact)) continue;
       const t = clamp01((now - impact.at) / IMPACT_LIFETIME_MS);
       const scale = impact.small ? 0.5 : 1;
       if (impact.heal) {

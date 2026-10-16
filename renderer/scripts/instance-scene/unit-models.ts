@@ -173,8 +173,16 @@ function copyMaterial(material: Material): Material {
 // The id a rider's mount is drawn under.
 const mountUnitId = (riderId: string): string => `${riderId}#mount`;
 
-// Effect points the converter exports on the skeleton.
+// Points on a unit WowMin's own drawing uses (its glows, plates, a rider's
+// saddle), by the M2 attachments that can serve each, the first the model
+// has winning: 22/21 the spell hands, 1/2 the hands, 15 the chest, 11 the
+// helm (20 the head), 17 the mouth (breath), 18 the name point above the
+// head, and 0 a mount's saddle (a character's shield otherwise; only mounts'
+// is used). The client's own art asks for attachments by ID instead.
 type UnitPointRole = 'handRight' | 'handLeft' | 'chest' | 'head' | 'breath' | 'overhead' | 'mount';
+const ROLE_ATTACHMENTS: Record<UnitPointRole, number[]> = {
+  handRight: [22, 1], handLeft: [21, 2], chest: [15], head: [11, 20], breath: [17, 11, 20], overhead: [18, 11], mount: [0],
+};
 
 // The ring on the floor under a model, with a pointer the way it faces.
 export interface UnitMarkerStyle {
@@ -264,7 +272,10 @@ interface UnitInstance {
   sheathItems: Object3D[];
   marker: UnitMarker;
   model: Object3D;
-  points: Map<string, Object3D>;
+  // The converter's effect points on its skeleton: attachments by M2 ID,
+  // and spell release events by name ('$CSL').
+  effectAttachments: Map<number, Object3D>;
+  effectEvents: Map<string, Object3D>;
   // How its spells change its model (UnitLook), as a key, and the shared
   // materials swapped out for changed copies, by mesh.
   look: string;
@@ -357,6 +368,16 @@ function mergeSkinnedParts(scene: Object3D): void {
 }
 
 const scratchVector = new Vector3();
+const ZERO_OFFSET: Point3 = [0, 0, 0];
+
+// The first of a role's attachments a unit's model has.
+function rolePoint(unit: UnitInstance, role: UnitPointRole): Object3D | undefined {
+  for (const id of ROLE_ATTACHMENTS[role]) {
+    const point = unit.effectAttachments.get(id);
+    if (point) return point;
+  }
+  return undefined;
+}
 const tintColor = new Color();
 const scratchSphere = new Sphere();
 
@@ -486,14 +507,29 @@ export class UnitModelLayer {
   // unit isn't drawn as a model or its model has no such point.
   pointOf(id: string, role: UnitPointRole): Point3 | null {
     const unit = this.units.get(id);
-    const point = unit?.points.get(role);
-    if (!unit || !point) return null;
-    return threeToServer(this.pointWorld(unit, point, scratchVector));
+    const point = unit && rolePoint(unit, role);
+    return unit && point ? threeToServer(this.pointWorld(unit, point, scratchVector.set(0, 0, 0))) : null;
   }
 
-  // A point in a unit's skeleton, in world space.
-  private pointWorld(unit: UnitInstance, point: Object3D, target: Vector3): Vector3 {
-    return target.setFromMatrixPosition(point.matrixWorld).applyMatrix4(unit.skeletonToTop).applyMatrix4(unit.top.matrixWorld);
+  // Whether a unit is drawn as its model, so its attachments are known.
+  isDrawn(id: string): boolean {
+    return this.units.has(id);
+  }
+
+  // A drawn unit's attachment (M2 ID), or its release event ('$CSL'), in
+  // server coordinates, `offset` (model space) from it the way the point
+  // turns; null if the unit isn't drawn or its model has no such point.
+  attachmentOf(id: string, attachment: number | string, offset: Point3 = ZERO_OFFSET): Point3 | null {
+    const unit = this.units.get(id);
+    const point = typeof attachment === 'number' ? unit?.effectAttachments.get(attachment) : unit?.effectEvents.get(attachment);
+    if (!unit || !point) return null;
+    return threeToServer(this.pointWorld(unit, point, scratchVector.set(offset[0], offset[1], offset[2])));
+  }
+
+  // A point in a unit's skeleton, in world space: `local` is in the point's
+  // own space and is overwritten with the result.
+  private pointWorld(unit: UnitInstance, point: Object3D, local: Vector3): Vector3 {
+    return local.applyMatrix4(point.matrixWorld).applyMatrix4(unit.skeletonToTop).applyMatrix4(unit.top.matrixWorld);
   }
 
   // Which way a drawn unit faces (radians about Z), or null.
@@ -602,11 +638,11 @@ export class UnitModelLayer {
     const mount = this.unitFor(mountPose, template, nowMs);
     this.place(mount, mountPose, nowMs);
     shown.add(mountPose.id);
-    const saddle = mount.points.get('mount');
+    const saddle = rolePoint(mount, 'mount');
     if (!saddle) return null;
     // The saddle as of the mount's last pose, where the mount is now.
     mount.top.updateWorldMatrix(true, false);
-    const [x, y, z] = threeToServer(this.pointWorld(mount, saddle, scratchVector));
+    const [x, y, z] = threeToServer(this.pointWorld(mount, saddle, scratchVector.set(0, 0, 0)));
     return {
       ...pose, x, y, z, orientation: mount.root.rotation.z, riding: true,
       marker: { ...pose.marker, hidden: true },
@@ -702,7 +738,8 @@ export class UnitModelLayer {
       sheathItems: [],
       marker,
       model,
-      points: new Map(),
+      effectAttachments: new Map(),
+      effectEvents: new Map(),
       look: '',
       changed: new Map(),
       sitting: null,
@@ -711,7 +748,8 @@ export class UnitModelLayer {
       if (object.userData.wowSheath) unit.sheathItems.push(object);
     });
     skeleton.traverse((object) => {
-      if (object.userData.wowPoint) unit.points.set(object.userData.wowPoint as string, object);
+      if (typeof object.userData.wowAttachment === 'number') unit.effectAttachments.set(object.userData.wowAttachment, object);
+      if (typeof object.userData.wowEvent === 'string') unit.effectEvents.set(object.userData.wowEvent, object);
     });
     this.pose(unit);
     // The clone gives each skinned part its own copy of the skeleton; parts

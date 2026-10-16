@@ -10,8 +10,9 @@ import { EffectInstance, type EffectPlacement, type EffectTemplate, EffectTempla
 import type { UnitAnchor } from './spell-effects';
 import type { UnitLook } from './unit-models';
 import {
-  AREA_ART_SCALE, artForSchool, castKit, type ColorFlash, DEFAULT_ALPHA_FADE_MS, flashColor, kitAlpha, kitAnimationName, kitColor,
-  kitColorFlash, pointInDisc, RAIN_SPREAD, rainRate, slotAnchor, type SpellVisual, type VisualKit,
+  AREA_ART_SCALE, areaRain, artForSchool, castKit, type ColorFlash, DEFAULT_ALPHA_FADE_MS, DIRECTED_HAND_ATTACHMENT, flashColor, groundSlot,
+  kitAlpha, kitAnimationName, kitColor, kitColorFlash, MISSILE_HEIGHT_SHARE, missileAttachment, missileOffset, RAIN_MAX_DELAY_MS, rainPoint,
+  slotAttachment, type SpellVisual, type UnitAnchorRole, type VisualKit, type VisualMissile,
 } from '../utils/spell-kits';
 
 // Plays the client's own spell art (level 2) for the combat effect store's
@@ -22,12 +23,44 @@ import {
 // models. Spells without art, or whose art is still loading, are left to the
 // level 1 glows (SpellEffectLayer), which asks `handles` first.
 
-// What the layer needs to know about units: where a point on one is, its
-// overall scale, and which way it faces.
+// What the layer needs to know about units and the scene: where a point on
+// a unit is, by role (estimated when its model lacks it) or by the model's
+// own attachment or release event (null when the model lacks it), whether
+// the unit is drawn as its model, its overall scale, standing height
+// (yards), and which way it faces; and where a falling model lands.
 export interface UnitInfo {
   anchor: UnitAnchor;
+  attachment: (unit: UnitKey, attachment: number | string, offset?: Point3) => Point3 | null;
+  isDrawn: (unit: UnitKey) => boolean;
   scale: (unit: UnitKey) => number;
+  height: (unit: UnitKey) => number;
   facing: (unit: UnitKey) => number;
+  // The ground under `target`, searched from `center` (the area's middle),
+  // or `center` if there is none.
+  ground: (center: Point3, target: Point3) => Point3;
+}
+
+// Kit slots onto WowMin's estimated points, for units not drawn as models.
+function slotRole(slot: string): UnitAnchorRole {
+  switch (slot) {
+    case 'head': return 'head';
+    case 'breath': return 'breath';
+    case 'base': case 'world': return 'feet';
+    case 'leftHand': case 'leftWeapon': return 'handLeft';
+    case 'rightHand': case 'rightWeapon': return 'handRight';
+    default: return 'chest';
+  }
+}
+
+// The release events a missile leaves from when its visual names no point:
+// the hand or weapon the cast animation throws from.
+const RELEASE_EVENTS = ['$CSR', '$CSL', '$CST'];
+
+// `offset` turned to face `yaw`, from `origin`.
+function offsetFrom(origin: Point3, offset: Point3, yaw: number, up = 0): Point3 {
+  const cos = Math.cos(yaw);
+  const sin = Math.sin(yaw);
+  return [origin[0] + offset[0] * cos - offset[1] * sin, origin[1] + offset[0] * sin + offset[1] * cos, origin[2] + offset[2] + up];
 }
 
 // Animations a unit should play for its spells: a loop while casting or
@@ -65,14 +98,18 @@ export class SpellVisualLayer {
   private readonly visuals = new Map<number, SpellVisual | null | 'loading'>();
   private readonly templates: EffectTemplateCache;
   private readonly playing: PlayingEffect[] = [];
-  private readonly missiles = new Map<Projectile, PlayingEffect>();
+  private readonly missiles = new Map<Projectile, { effect: PlayingEffect; targeting: PlayingEffect[] }>();
   private readonly casts = new Map<CastGlow, { kit: VisualKit; effects: PlayingEffect[]; startedAt: number }>();
   private readonly seenImpacts = new WeakSet<Impact>();
   // Areas being played: their lasting effects, and what they rain.
+  // An impact area kit waits for the missile to reach the ground point.
   private readonly areas = new Map<AreaEffect, {
     lasting: PlayingEffect[];
-    rain: { template: EffectTemplate; scale: number; rate: number; carry: number; center: Point3; yaw: number } | null;
+    rain: { template: EffectTemplate; rate: number; carry: number; center: Point3; shards: Array<{ at: number; position: Point3 }> } | null;
+    impactAt: number | null;
   }>();
+  // Each unit's art auras as last seen, to tell when one ends (state done).
+  private lastAuras = new Map<UnitKey, ReadonlySet<number>>();
   private lastUpdateAt = 0;
   // Aura art on units, by unit and state kit: its effects, and the pose it
   // names (an aura's pose wins over a cast's: a stunned unit isn't casting).
@@ -86,7 +123,9 @@ export class SpellVisualLayer {
   private particleCount = 0;
   // This frame's units. Effects that follow a unit read it every frame, so
   // they keep up with it (each frame brings new positions).
-  private units: UnitInfo = { anchor: () => null, scale: () => 1, facing: () => 0 };
+  private units: UnitInfo = {
+    anchor: () => null, attachment: () => null, isDrawn: () => false, scale: () => 1, height: () => 2, facing: () => 0, ground: (center) => center,
+  };
   private readonly chains: ChainRibbons;
   // Spells that auras with a bearer area cast (Starfall's 30 yard search),
   // whose own rings the steady area replaces.
@@ -229,27 +268,44 @@ export class SpellVisualLayer {
       if (!cast.release) for (const effect of effects) effect.instance.stop();
       this.casts.delete(cast);
     }
-    // Areas: rain while they last; when they end, lasting effects end too.
+    // Areas: an impact area once its missile lands; rain while they last,
+    // the models already falling finishing after. When they end, lasting
+    // effects end too.
     for (const [area, playing] of this.areas) {
-      if (!areasNow.has(area) || now >= area.endAt) {
-        for (const effect of playing.lasting) effect.instance.stop(now);
-        if (!areasNow.has(area)) this.areas.delete(area);
-        else playing.rain = null;
-        continue;
+      if (playing.impactAt !== null && now >= playing.impactAt) {
+        playing.impactAt = null;
+        const visual = this.visual(area.spellId);
+        if (visual?.kits.impactArea) this.playGroundKit(visual.kits.impactArea, area, now);
       }
       const rain = playing.rain;
-      if (!rain) continue;
-      rain.carry += rain.rate * seconds;
-      for (; rain.carry >= 1; rain.carry -= 1) {
-        const position = pointInDisc(rain.center, area.radius * RAIN_SPREAD, Math.random(), Math.random());
-        const drop = this.play(rain.template, now, false, () => ({ position, yaw: rain.yaw, scale: rain.scale }));
-        drop.stopAt = now + drop.instance.duration;
+      if (rain) {
+        if (now < area.endAt) {
+          rain.carry += rain.rate * seconds;
+          for (; rain.carry >= 1; rain.carry -= 1) {
+            const target = rainPoint(rain.center, area.radius, Math.random(), Math.random());
+            rain.shards.push({ at: now + 2 * Math.floor(Math.random() * (RAIN_MAX_DELAY_MS / 2)), position: this.units.ground(rain.center, target) });
+          }
+        }
+        rain.shards = rain.shards.filter(({ at, position }) => {
+          if (now < at) return true;
+          const shard = this.play(rain.template, now, false, () => ({ position, yaw: 0, scale: 1 }));
+          shard.stopAt = now + shard.instance.duration;
+          return false;
+        });
+      }
+      if (!areasNow.has(area) || now >= area.endAt) {
+        for (const effect of playing.lasting) effect.instance.stop(now);
+        playing.lasting = [];
+        if (rain && !rain.shards.length) playing.rain = null;
+        if (!areasNow.has(area) && !playing.rain && playing.impactAt === null) this.areas.delete(area);
       }
     }
-    // Missiles the store has finished with have landed.
-    for (const [projectile, effect] of this.missiles) {
+    // Missiles the store has finished with have landed, and their
+    // targeting art with them.
+    for (const [projectile, { effect, targeting }] of this.missiles) {
       if (!store || now >= projectile.startAt + projectile.travelMs) {
         effect.instance.stop();
+        for (const playing of targeting) playing.instance.stop(now);
         this.missiles.delete(projectile);
       }
     }
@@ -289,7 +345,8 @@ export class SpellVisualLayer {
         for (const art of visual ? [visual, ...Object.values(visual.bySchool ?? {})] : []) {
           if (art.missile) this.template(art.missile.id);
           for (const kit of Object.values(art.kits)) kit?.effects.forEach((effect) => this.template(effect.id));
-          if (art.falling) this.template(art.falling.id);
+          const rain = areaRain(art);
+          if (rain) this.areaTemplate(rain.model);
         }
         for (const trigger of visual?.bearerArea?.triggers ?? []) this.bearerTriggers.add(trigger);
         this.onLoaded();
@@ -327,6 +384,11 @@ export class SpellVisualLayer {
     return this.templates.get(`assets/models/effect/${effectId}.glb`);
   }
 
+  // A model a lasting area rains (a SpellVisualKitAreaModel row).
+  private areaTemplate(row: number): EffectTemplate | null | undefined {
+    return this.templates.get(`assets/models/effect/area-${row}.glb`);
+  }
+
   // The kit's templates once all are in (null for any that failed), or
   // undefined while some are loading, so a kit plays together.
   private kitTemplates(kit: VisualKit): Array<EffectTemplate | null> | undefined {
@@ -343,18 +405,45 @@ export class SpellVisualLayer {
   }
 
   // Each of a kit's effects on its body slot of `unit`, following it, and
-  // any colour flash it starts there.
-  private playKit(kit: VisualKit, templates: Array<EffectTemplate | null>, unit: UnitKey, now: number, loop: boolean): PlayingEffect[] {
+  // any colour flash it starts there. A slot the unit's model lacks shows
+  // nothing, as in the client; a unit not drawn as a model shows each at
+  // WowMin's estimate. The world effect stands at the unit's feet, and
+  // follows it only for a spell that roots it (`follows`).
+  private playKit(kit: VisualKit, templates: Array<EffectTemplate | null>, unit: UnitKey, now: number, loop: boolean, follows = false): PlayingEffect[] {
     const flash = kitColorFlash(kit);
     if (flash) this.flashes.set(unit, { flash, startAt: now });
+    const drawn = this.units.isDrawn(unit);
     return kit.effects.flatMap((effect, index) => {
       const template = templates[index];
       if (!template) return [];
-      const role = slotAnchor(effect.slot);
+      const attachment = slotAttachment(effect.slot);
+      if (drawn && attachment !== null && !this.units.attachment(unit, attachment)) return [];
+      let fixed: Point3 | null = null;
+      if (attachment === null && !follows) fixed = this.units.anchor(unit, 'feet');
       const playing = this.play(template, now, loop, () => {
-        const point = this.units.anchor(unit, role);
+        const point = fixed ?? (attachment !== null && this.units.isDrawn(unit)
+          ? this.units.attachment(unit, attachment) : this.units.anchor(unit, slotRole(effect.slot)));
         return point ? { position: point, yaw: this.units.facing(unit), scale: effect.scale * this.units.scale(unit) } : null;
       });
+      if (!loop) playing.stopAt = now + playing.instance.duration;
+      return [playing];
+    });
+  }
+
+  // An area kit at its ground point, as the client plays one there: its
+  // world and base effects at the point, its head effect on the caster.
+  // Lasting effects (`loop`) are returned so they can end with the area.
+  private playGroundKit(kit: VisualKit, area: AreaEffect, now: number, loop = false): PlayingEffect[] {
+    const templates = this.kitTemplates(kit);
+    const center = area.point ?? this.units.anchor(area.caster, 'feet');
+    if (!templates || !center) return [];
+    const yaw = this.units.facing(area.caster);
+    return kit.effects.flatMap((effect, index) => {
+      const template = templates[index];
+      const where = groundSlot(effect.slot);
+      if (!template || !where) return [];
+      if (where === 'caster') return this.playKit({ ...kit, effects: [effect], procs: [] }, [template], area.caster, now, loop);
+      const playing = this.play(template, now, loop, () => ({ position: center, yaw, scale: effect.scale * AREA_ART_SCALE }));
       if (!loop) playing.stopAt = now + playing.instance.duration;
       return [playing];
     });
@@ -367,7 +456,7 @@ export class SpellVisualLayer {
     if (!kit) return;
     const templates = this.kitTemplates(kit);
     if (!templates) return;
-    this.casts.set(cast, { kit, effects: this.playKit(kit, templates, cast.caster, now, !cast.release), startedAt: now });
+    this.casts.set(cast, { kit, effects: this.playKit(kit, templates, cast.caster, now, !cast.release, art?.rootsUnit), startedAt: now });
     if (cast.release) {
       const once = kitAnimationName(kit.anim);
       if (once) this.onceAnimations.set(cast.caster, once);
@@ -375,16 +464,19 @@ export class SpellVisualLayer {
   }
 
   // Plays each shown unit's aura art and colour (its spells' state kits,
-  // once per kit), ending art for auras that have gone with its Death.
+  // once per kit), ending art for auras that have gone with its Death, and
+  // playing a gone aura's state done kit once. A unit whose list went
+  // (stale, or no longer shown) ends its art without one.
   private syncStates(auras: ReadonlyMap<UnitKey, readonly number[]>, now: number, units: UnitInfo): void {
-    const wanted = new Map<string, { unit: UnitKey; kit: VisualKit }>();
+    const wanted = new Map<string, { unit: UnitKey; kit: VisualKit; follows: boolean }>();
     for (const [unit, spellIds] of auras) {
       if (!units.anchor(unit, 'feet')) continue;
       for (const spellId of spellIds) {
-        const kit = this.visual(spellId)?.kits.state;
+        const visual = this.visual(spellId);
+        const kit = visual?.kits.state;
         if (!kit || (!kit.effects.length && kit.anim < 0 && kitColor(kit) === null && !kitAlpha(kit))) continue;
         const key = `${unit}|${kit.id}`;
-        if (!wanted.has(key)) wanted.set(key, { unit, kit });
+        if (!wanted.has(key)) wanted.set(key, { unit, kit, follows: Boolean(visual.rootsUnit) });
       }
     }
     for (const [key, state] of this.states) {
@@ -392,62 +484,134 @@ export class SpellVisualLayer {
       for (const effect of state.effects) effect.instance.stop(now);
       this.states.delete(key);
     }
-    for (const [key, { unit, kit }] of wanted) {
+    for (const [key, { unit, kit, follows }] of wanted) {
       if (this.states.has(key)) continue;
       const templates = this.kitTemplates(kit);
       if (!templates) continue;
-      this.states.set(key, { unit, kit, effects: this.playKit(kit, templates, unit, now, true), startedAt: now });
+      this.states.set(key, { unit, kit, effects: this.playKit(kit, templates, unit, now, true, follows), startedAt: now });
     }
+    const seen = new Map<UnitKey, ReadonlySet<number>>();
+    for (const [unit, spellIds] of auras) {
+      const current = new Set(spellIds);
+      seen.set(unit, current);
+      const before = this.lastAuras.get(unit);
+      if (!before || !units.anchor(unit, 'feet')) continue;
+      for (const spellId of before) {
+        if (current.has(spellId)) continue;
+        const kit = this.visual(spellId)?.kits.stateDone;
+        const templates = kit && this.kitTemplates(kit);
+        if (kit && templates) this.playKit(kit, templates, unit, now, false);
+      }
+    }
+    this.lastAuras = seen;
   }
 
+  // A spell's area art. At a ground point: the instant area kit as the
+  // spell is cast, and the impact area kit once its missile reaches the
+  // point (at once without one), unless its visual has a chain. A lasting
+  // area (a channel's, or a lasting area's) draws its own model, the
+  // persistent area kit's world effect or else its base one, at the point
+  // or round the caster, and rains what that kit names.
   private startArea(area: AreaEffect, now: number, units: UnitInfo): void {
     if (this.areas.has(area) || now < area.startAt) return;
     const visual = this.visual(area.spellId);
     if (visual === undefined) return;
     if (visual === null) {
-      this.areas.set(area, { lasting: [], rain: null });
+      this.areas.set(area, { lasting: [], rain: null, impactAt: null });
       return;
     }
-    const once = [visual.kits.instantArea, visual.kits.impactArea].filter((kit): kit is VisualKit => Boolean(kit));
     const lasting = visual.kits.persistentArea;
-    const rate = rainRate(visual);
+    const rain = area.endAt > area.startAt ? areaRain(visual) : null;
     // Wait until every model is in, so the area plays together.
-    const kitTemplates = [...once, ...(lasting ? [lasting] : [])].map((kit) => this.kitTemplates(kit));
-    const rainTemplate = rate > 0 && visual.falling ? this.template(visual.falling.id) : null;
-    if (kitTemplates.some((templates) => !templates) || rainTemplate === undefined) return;
+    const kits = [visual.kits.instantArea, visual.kits.impactArea, lasting].filter((kit): kit is VisualKit => Boolean(kit));
+    const rainTemplate = rain ? this.areaTemplate(rain.model) : null;
+    if (kits.some((kit) => !this.kitTemplates(kit)) || rainTemplate === undefined) return;
     const center = area.point ?? units.anchor(area.caster, 'feet');
     if (!center) return;
-    const yaw = units.facing(area.caster);
-    const placeAt = (scale: number) => () => ({ position: center, yaw, scale: scale * AREA_ART_SCALE });
-    once.forEach((kit, index) => kit.effects.forEach((effect, slot) => {
-      const template = kitTemplates[index]![slot];
-      if (!template) return;
-      const playing = this.play(template, now, false, placeAt(effect.scale));
-      playing.stopAt = now + playing.instance.duration;
-    }));
+    let impactAt: number | null = null;
+    if (area.point) {
+      if (visual.kits.instantArea) this.playGroundKit(visual.kits.instantArea, area, now);
+      if (visual.kits.impactArea && !visual.chainEffect) {
+        const feet = units.anchor(area.caster, 'feet');
+        const yards = feet ? Math.hypot(feet[0] - center[0], feet[1] - center[1], feet[2] - center[2]) : 0;
+        impactAt = area.startAt + (area.missileSpeed > 0 ? (yards / area.missileSpeed) * 1000 : 0);
+      }
+    }
     const lasts = area.endAt > area.startAt;
-    const lastingEffects = lasting ? lasting.effects.flatMap((effect, slot) => {
-      const template = kitTemplates[once.length]![slot];
-      if (!template) return [];
-      const playing = this.play(template, now, lasts, placeAt(effect.scale));
-      if (!lasts) playing.stopAt = now + playing.instance.duration;
-      return lasts ? [playing] : [];
-    }) : [];
+    let lastingEffects: PlayingEffect[] = [];
+    if (lasting) {
+      const effect = lasting.effects.find((candidate) => candidate.slot === 'world') ?? lasting.effects.find((candidate) => candidate.slot === 'base');
+      const template = effect ? this.kitTemplates(lasting)![lasting.effects.indexOf(effect)] : null;
+      if (effect && template) {
+        const yaw = units.facing(area.caster);
+        const playing = this.play(template, now, lasts, () => ({ position: center, yaw, scale: effect.scale * AREA_ART_SCALE }));
+        if (lasts) lastingEffects = [playing];
+        else playing.stopAt = now + playing.instance.duration;
+      }
+    }
     this.areas.set(area, {
       lasting: lastingEffects,
-      rain: rainTemplate && lasts ? { template: rainTemplate, scale: visual.falling!.scale, rate, carry: 0, center, yaw } : null,
+      rain: rain && rainTemplate ? { template: rainTemplate, rate: rain.rate, carry: 0, center, shards: [] } : null,
+      impactAt,
     });
   }
 
+  // Where a missile leaves its caster, as the client picks it: the visual's
+  // point and offset when the model has that point; with no point but an
+  // offset, the offset from the directed spell hand, or from the feet; else
+  // where the cast animation throws from, or three quarters up the caster.
+  private firePoint(missile: VisualMissile, caster: UnitKey): Point3 | null {
+    const feet = this.units.anchor(caster, 'feet');
+    if (!feet) return null;
+    const offset = missileOffset(missile.castOffset);
+    const drawn = this.units.isDrawn(caster);
+    const point = missileAttachment(missile.attachment, missile.rawAttachments);
+    if (drawn && point !== null) {
+      const at = this.units.attachment(caster, point, offset);
+      if (at) return at;
+    } else if (point === null && offset.some((value) => value !== 0)) {
+      return (drawn && this.units.attachment(caster, DIRECTED_HAND_ATTACHMENT, offset))
+        || offsetFrom(feet, offset, this.units.facing(caster));
+    }
+    if (drawn) {
+      for (const event of RELEASE_EVENTS) {
+        const at = this.units.attachment(caster, event);
+        if (at) return at;
+      }
+    }
+    return [feet[0], feet[1], feet[2] + this.units.height(caster) * MISSILE_HEIGHT_SHARE];
+  }
+
+  // Where a missile lands on its target: the visual's point and offset when
+  // the model has that point, else the offset from three quarters up it.
+  private landingPoint(missile: VisualMissile, target: UnitKey): Point3 | null {
+    const offset = missileOffset(missile.impactOffset);
+    const point = missileAttachment(missile.destinationAttachment, missile.rawAttachments);
+    if (point !== null && this.units.isDrawn(target)) {
+      const at = this.units.attachment(target, point, offset);
+      if (at) return at;
+    }
+    const feet = this.units.anchor(target, 'feet');
+    return feet && offsetFrom(feet, offset, this.units.facing(target), this.units.height(target) * MISSILE_HEIGHT_SHARE);
+  }
+
+  // A missile flies from where it left its caster to its landing point on
+  // the target, following the target; the spell's missile targeting kit
+  // plays on the target while it flies.
   private startMissile(projectile: Projectile, now: number): void {
     if (this.missiles.has(projectile) || now < projectile.startAt) return;
-    const missile = this.art(projectile.spellId, projectile.schoolMask)?.missile;
+    const art = this.art(projectile.spellId, projectile.schoolMask);
+    const missile = art?.missile;
     if (!missile) return;
     const template = this.template(missile.id);
     if (!template) return;
+    const targetingKit = art.kits.missileTargeting;
+    const targetingTemplates = targetingKit ? this.kitTemplates(targetingKit) : null;
+    if (targetingTemplates === undefined) return;
+    let from: Point3 | null = null;
     const effect = this.play(template, now, true, (time) => {
-      const from = this.units.anchor(projectile.source, 'handRight');
-      const to = this.units.anchor(projectile.target, 'chest');
+      from ??= this.firePoint(missile, projectile.source);
+      const to = this.landingPoint(missile, projectile.target);
       if (!from || !to) return null;
       const t = Math.min(1, Math.max(0, (time - projectile.startAt) / projectile.travelMs));
       const position: Point3 = [from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t, from[2] + (to[2] - from[2]) * t];
@@ -455,18 +619,22 @@ export class SpellVisualLayer {
       const dy = to[1] - from[1];
       return { position, yaw: Math.atan2(dy, dx), pitch: Math.atan2(to[2] - from[2], Math.hypot(dx, dy)), scale: missile.scale };
     });
-    this.missiles.set(projectile, effect);
+    const targeting = targetingKit && targetingTemplates ? this.playKit(targetingKit, targetingTemplates, projectile.target, now, true) : [];
+    this.missiles.set(projectile, { effect, targeting });
   }
 
+  // A spell landing on a unit: on its caster the caster impact kit, on
+  // anyone else the target impact kit, else the impact kit.
   private startImpact(impact: Impact, now: number): void {
-    if (this.seenImpacts.has(impact) || now < impact.at || impact.small) return;
+    if (this.seenImpacts.has(impact) || now < impact.at || !impact.kit) return;
     const art = this.art(impact.spellId, impact.schoolMask);
-    const kit = art?.kits.targetImpact ?? art?.kits.impact;
+    const own = impact.target === impact.source ? art?.kits.casterImpact : art?.kits.targetImpact;
+    const kit = own ?? art?.kits.impact;
     if (!kit) return;
     const templates = this.kitTemplates(kit);
     if (!templates) return;
     this.seenImpacts.add(impact);
-    this.playKit(kit, templates, impact.target, now, false);
+    this.playKit(kit, templates, impact.target, now, false, art?.rootsUnit);
     const once = kitAnimationName(kit.anim);
     if (once) this.onceAnimations.set(impact.target, once);
   }

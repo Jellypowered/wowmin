@@ -141,7 +141,7 @@ test('builds a skinned GLB document: joints at pivots, every animated channel in
     textureFor: () => null,
     scale: 1.5,
     attachments: [{ bone: 1, position: [0.2, 0, 1.5], mesh: sword, textureFor: () => null, role: 'mainHand', sheath: 'drawn' }],
-    points: [{ role: 'handRight', bone: 1, position: [0.1, -0.4, 1.2] }, { role: 'overhead', bone: 9, position: [0, 0, 2] }],
+    points: [{ attachment: 22, bone: 1, position: [0.1, -0.4, 1.2] }, { attachment: 18, bone: 9, position: [0, 0, 2] }],
   });
   const root = document.getRoot();
   const skin = root.listSkins()[0];
@@ -162,27 +162,21 @@ test('builds a skinned GLB document: joints at pivots, every animated channel in
   assert.deepEqual(item.getExtras(), { wowItem: 'mainHand', wowSheath: 'drawn' });
   // Effect points ride on their bone too; one on a missing bone is skipped.
   const hand = skin.listJoints()[1].listChildren()[1];
-  assert.deepEqual(hand.getExtras(), { wowPoint: 'handRight' });
+  assert.deepEqual(hand.getExtras(), { wowAttachment: 22 });
   [0.1, -0.4, -0.3].forEach((value, axis) => near(hand.getTranslation()[axis], value, `hand ${axis}`));
-  assert.equal(root.listNodes().filter((node) => node.getExtras().wowPoint).length, 1);
+  assert.equal(root.listNodes().filter((node) => node.getExtras().wowAttachment !== undefined).length, 1);
 });
 
-test('picks effect points from the attachment table, preferring spell hands', async () => {
+test('keeps every attachment and release event as an effect point, the first of each', async () => {
   const { effectPoints } = await load('unit-model.mjs');
   const point = (id, bone) => ({ id, bone, position: [id, 0, 0] });
-  assert.deepEqual(effectPoints([point(1, 10), point(2, 11), point(22, 12), point(15, 13), point(11, 14)]), [
-    { role: 'handRight', bone: 12, position: [22, 0, 0] },
-    { role: 'handLeft', bone: 11, position: [2, 0, 0] },
-    { role: 'chest', bone: 13, position: [15, 0, 0] },
-    { role: 'head', bone: 14, position: [11, 0, 0] },
-    // No mouth point: breath falls back to the helm.
-    { role: 'breath', bone: 14, position: [11, 0, 0] },
-    { role: 'overhead', bone: 14, position: [11, 0, 0] },
+  assert.deepEqual(effectPoints([point(1, 10), point(22, 12), point(22, 13)], [
+    { name: '$CSL', bone: 4, position: [0, 1, 0] }, { name: '$CSL', bone: 5, position: [0, 2, 0] },
+  ]), [
+    { attachment: 1, bone: 10, position: [1, 0, 0] },
+    { attachment: 22, bone: 12, position: [22, 0, 0] },
+    { event: '$CSL', bone: 4, position: [0, 1, 0] },
   ]);
-  assert.deepEqual(effectPoints([point(17, 86), point(20, 56)]).filter((entry) => entry.role === 'breath'),
-    [{ role: 'breath', bone: 86, position: [17, 0, 0] }]);
-  // A mount's saddle (attachment 0), where its rider sits.
-  assert.deepEqual(effectPoints([point(0, 3)]), [{ role: 'mount', bone: 3, position: [0, 0, 0] }]);
   // Spiders and the like have no attachment points at all.
   assert.deepEqual(effectPoints([]), []);
 });
@@ -217,6 +211,18 @@ test('reads M2 attachment points from the header', async () => {
   // A count that runs past the file reads as none.
   buffer.writeUInt32LE(50, 240);
   assert.deepEqual(readM2Attachments(buffer), []);
+});
+
+test('reads the M2 events asked for from the header', async () => {
+  const { readM2Events } = await load('character.mjs');
+  const buffer = Buffer.alloc(400);
+  buffer.writeUInt32LE(2, 256);
+  buffer.writeUInt32LE(300, 260);
+  buffer.write('$CSR', 300, 'latin1'); buffer.writeUInt16LE(9, 308); buffer.writeFloatLE(1.5, 316);
+  buffer.write('$FSD', 336, 'latin1'); buffer.writeUInt16LE(3, 344);
+  assert.deepEqual(readM2Events(buffer, ['$CSR', '$CSL']), [{ name: '$CSR', bone: 9, position: [0, 1.5, 0] }]);
+  buffer.writeUInt32LE(50, 256);
+  assert.deepEqual(readM2Events(buffer, ['$CSR']), []);
 });
 
 test('chooses character geosets: body, hair by ID, groups by value, and gear overrides', async () => {

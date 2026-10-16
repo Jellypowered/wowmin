@@ -228,26 +228,52 @@ test('picks the kit a cast plays, its body slots, and the animations it names', 
   // A channel without its own kit keeps the precast one.
   assert.equal(kits.castKit({ missile: null, kits: { precast: kit(52) } }, { release: false, channeled: true }).anim, 52);
   assert.equal(kits.castKit({ missile: null, kits: {} }, { release: true, channeled: false }), undefined);
-  assert.equal(kits.slotAnchor('leftHand'), 'handLeft');
-  assert.equal(kits.slotAnchor('rightWeapon'), 'handRight');
-  assert.equal(kits.slotAnchor('base'), 'feet');
-  assert.equal(kits.slotAnchor('breath'), 'breath');
-  assert.equal(kits.slotAnchor('special2'), 'chest');
+  // Slots sit on the client's attachments; the world effect on none.
+  assert.equal(kits.slotAttachment('head'), 20);
+  assert.equal(kits.slotAttachment('chest'), 34);
+  assert.equal(kits.slotAttachment('base'), 19);
+  assert.equal(kits.slotAttachment('special2'), 24);
+  assert.equal(kits.slotAttachment('rightWeapon'), 1);
+  assert.equal(kits.slotAttachment('world'), null);
+  // At a ground point only the world and base effects stand there, the
+  // head effect goes on the caster, and the rest are skipped.
+  assert.equal(kits.groundSlot('world'), 'ground');
+  assert.equal(kits.groundSlot('base'), 'ground');
+  assert.equal(kits.groundSlot('head'), 'caster');
+  assert.equal(kits.groundSlot('chest'), null);
   assert.equal(kits.kitAnimationName(125), 'ChannelCastOmni');
   assert.equal(kits.kitAnimationName(9), 'CombatWound');
   assert.equal(kits.kitAnimationName(-1), null);
 });
 
-test('rains only for spells whose area runs procedure 9, at its rate, spread over the disc', () => {
+test('rains the area model procedure 9 names in a lasting area, at its rate, more near the middle', () => {
   const kits = loadModule('../renderer/scripts/utils/spell-kits.ts');
   const kit = (procs) => ({ anim: -1, effects: [], procs });
-  const blizzard = { missile: null, falling: { id: 398, scale: 1 }, kits: { persistentArea: kit([{ code: 9, params: [0, 5, 0, 0] }]) } };
-  assert.equal(kits.rainRate(blizzard), 5);
-  assert.equal(kits.rainRate({ ...blizzard, falling: null }), 0);
-  assert.equal(kits.rainRate({ ...blizzard, kits: { persistentArea: kit([{ code: 3, params: [0, 5, 0, 0] }]) } }), 0);
-  assert.equal(kits.rainRate({ ...blizzard, kits: { impactArea: kit([{ code: 9, params: [0, 0, 0, 0] }]) } }), 5);
-  assert.deepEqual(plain(kits.pointInDisc([10, 20, 3], 8, 1, 0)), [18, 20, 3]);
-  assert.deepEqual(plain(kits.pointInDisc([10, 20, 3], 8, 0, 0.5)), [10, 20, 3]);
+  const rainOfFire = { missile: null, kits: { persistentArea: kit([{ code: 9, params: [1, 7, 0, 0] }]) } };
+  assert.deepEqual(plain(kits.areaRain(rainOfFire)), { model: 1, rate: 7 });
+  // No rate: the default.
+  assert.deepEqual(plain(kits.areaRain({ missile: null, kits: { persistentArea: kit([{ code: 9, params: [0, 0, 0, 0] }]) } })), { model: 0, rate: 5 });
+  assert.equal(kits.areaRain({ missile: null, kits: { persistentArea: kit([{ code: 3, params: [0, 5, 0, 0] }]) } }), null);
+  // Only a lasting area rains.
+  assert.equal(kits.areaRain({ missile: null, kits: { impactArea: kit([{ code: 9, params: [0, 5, 0, 0] }]) } }), null);
+  assert.deepEqual(plain(kits.rainPoint([10, 20, 3], 8, 1, 0)), [18, 20, 3]);
+  // Half way out by the first number, not by its square root.
+  assert.deepEqual(plain(kits.rainPoint([10, 20, 3], 8, 0.5, 0)), [14, 20, 3]);
+  assert.deepEqual(plain(kits.rainPoint([10, 20, 3], 8, 0, 0.5)), [10, 20, 3]);
+});
+
+test('finds a missile\'s points in the client\'s effect attachments, offsets with Y flipped', () => {
+  const kits = loadModule('../renderer/scripts/utils/spell-kits.ts');
+  // Index 1 is the chest, 4 the right spell hand; 13 the weapon (its hand).
+  assert.equal(kits.missileAttachment(1), 34);
+  assert.equal(kits.missileAttachment(4), 22);
+  assert.equal(kits.missileAttachment(13), 22);
+  assert.equal(kits.missileAttachment(-1), null);
+  assert.equal(kits.missileAttachment(undefined), null);
+  // Raw: the M2 attachment itself.
+  assert.equal(kits.missileAttachment(18, true), 18);
+  assert.deepEqual(plain(kits.missileOffset([1, 2, 3])), [1, -2, 3]);
+  assert.deepEqual(plain(kits.missileOffset(undefined)), [0, 0, 0]);
 });
 
 test('plays the art of the cast\'s school for a spell with art by school', () => {
@@ -334,6 +360,45 @@ test('exports a spell\'s chain, the area its aura keeps casting round its bearer
   const shoot = visuals.forSpell(5019);
   assert.deepEqual(Object.keys(shoot.bySchool), ['32']);
   assert.equal(shoot.bySchool[32].missile.id, 3493);
+});
+
+test('exports a missile\'s points and offsets, the missile targeting kit, roots, chain effects, and rain models', async () => {
+  const { SpellVisuals } = await load('spell-visuals.mjs');
+  const files = {
+    'DBFilesClient\\Spell.dbc': dbc(234, [
+      { 0: 116, 131: 13, 95: 26 },
+      { 0: 421, 131: 37 },
+    ]),
+    'DBFilesClient\\SpellVisual.dbc': dbc(32, [
+      { 0: 13, 8: 3493, 10: 1, 13: 0x200, 16: 18, 22: 500, 26: float(0.5), 27: float(1), 28: float(-2), 30: float(3) },
+      { 0: 37, 3: 600 },
+    ]),
+    'DBFilesClient\\SpellVisualKit.dbc': dbc(38, [
+      kitRecord(500, { 5: 3493 }),
+      kitRecord(600, { 17: 12, 21: float(5) }),
+    ]),
+    'DBFilesClient\\SpellVisualEffectName.dbc': dbc(8, [{ 0: 3493, 2: 'Spells\\Frostbolt.mdx', 4: float(1) }]),
+    'DBFilesClient\\SpellVisualKitAreaModel.dbc': dbc(3, [
+      { 0: 1, 1: 'Spells\\Blizzard_Impact_Base.mdx' },
+      { 0: 2, 1: 'Spells\\RainOfFire_Impact_Base.mdx' },
+    ]),
+  };
+  const present = new Set(['spells\\frostbolt.m2', 'spells\\blizzard_impact_base.m2', 'spells\\rainoffire_impact_base.m2']);
+  const visuals = new SpellVisuals((name) => files[name] ?? (present.has(name.toLowerCase()) ? Buffer.alloc(1) : null));
+
+  const frostbolt = visuals.forSpell(116);
+  assert.deepEqual(plain(frostbolt.missile), {
+    id: 3493, scale: 1, areaSize: 0, attachment: 18, destinationAttachment: 1, rawAttachments: true,
+    castOffset: [0.5, 1, -2], impactOffset: [0, 3, 0],
+  });
+  assert.equal(frostbolt.kits.missileTargeting.id, 500);
+  assert.equal(frostbolt.rootsUnit, true);
+  assert.equal(frostbolt.chainEffect, undefined);
+  // A chain procedure (12 as well as 0) in an impact kit counts.
+  assert.equal(visuals.forSpell(421).chainEffect, true);
+  // Rain models by row, counted from 0; a row past the end falls back to the first.
+  assert.equal(visuals.areaModel(1), 'Spells\\RainOfFire_Impact_Base.m2');
+  assert.equal(visuals.areaModel(9), 'Spells\\Blizzard_Impact_Base.m2');
 });
 
 test('kits colour their unit as the client does: procedure 1 while they play, 13 as a flash fading to white', () => {

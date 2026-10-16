@@ -19,7 +19,9 @@ const BUILD_TIMEOUT_MS = 60000;
 // 7: flying mounts' Fly and Hover animations.
 // 8: creature displays' model opacity (a Shadowfiend's see-through look).
 // 9: sitting on the ground (SitGroundDown, SitGround, SitGroundUp).
-export const UNIT_MODEL_CACHE_VERSION = 9;
+// 10: every attachment by M2 ID, and the spell release events ($CSL, $CSR,
+// $CST, $BWR), for the client's own effect and missile points.
+export const UNIT_MODEL_CACHE_VERSION = 10;
 // Spell art (effect models and spell lookups) changes more often than unit
 // models, so it has its own version and folder, art-v<version>/, and can be
 // rebuilt without rebuilding every unit.
@@ -33,7 +35,11 @@ export const UNIT_MODEL_CACHE_VERSION = 9;
 // 6: map lights carry their objects' lights (torches, braziers).
 // 7: map lights carry the map's fixed time of day, if it has one.
 // 8: map lights carry their interior WMO groups (building ambient, outdoor-lit).
-export const SPELL_ART_CACHE_VERSION = 8;
+// 9: rain models from SpellVisualKitAreaModel (effect/area-<row>.glb), the
+// missile's points and offsets, the missile targeting kit, whether the
+// spell roots (its world effects follow the unit), and whether its visual
+// has a chain effect.
+export const SPELL_ART_CACHE_VERSION = 9;
 const SPELL_ART_KINDS = new Set<UnitModelRequest['kind']>(['effect', 'visual', 'spell', 'icon', 'gameobject', 'light']);
 const EXTENSIONS: Partial<Record<UnitModelRequest['kind'], string>> = { visual: 'json', spell: 'json', icon: 'png', light: 'json' };
 // A look that could not be built is not retried for this long.
@@ -45,7 +51,8 @@ interface PendingBuild {
 }
 
 export interface UnitModelRequest {
-  // 'effect' is a SpellVisualEffectName model; 'visual' a spell's art (JSON);
+  // 'effect' is a SpellVisualEffectName model, or a SpellVisualKitAreaModel
+  // one (the models a lasting area rains); 'visual' a spell's art (JSON);
   // 'spell' a spell's name (JSON); 'icon' a client icon (PNG): a spell's, a
   // side's PvP crest, a raid marker, or a spell chain's texture; 'gameobject'
   // a game object display's model (GLB); 'light' a map's lights (JSON).
@@ -67,6 +74,8 @@ export function parseUnitModelPath(urlPath: string): UnitModelRequest | null {
   }
   const effect = urlPath.match(/^\/assets\/models\/effect\/(\d{1,7})\.glb$/);
   if (effect) return { kind: 'effect', key: effect[1], params: { effectId: Number(effect[1]) } };
+  const areaModel = urlPath.match(/^\/assets\/models\/effect\/area-(\d{1,3})\.glb$/);
+  if (areaModel) return { kind: 'effect', key: `area-${areaModel[1]}`, params: { areaModel: Number(areaModel[1]) } };
   const visual = urlPath.match(/^\/assets\/models\/visual\/(\d{1,7})\.json$/);
   if (visual) return { kind: 'visual', key: visual[1], params: { spellId: Number(visual[1]) } };
   const spell = urlPath.match(/^\/assets\/models\/spell\/(\d{1,7})\.json$/);

@@ -26,6 +26,10 @@ export interface CastGlow {
   release: boolean;
   // A channel, held for its duration, rather than a cast before release.
   channeled: boolean;
+  // Whether WowMin's own glow draws it. The client's cast art plays for
+  // every cast as it fires, a weapon strike's or a proc's too; the glow
+  // only for spells cast on purpose.
+  glow: boolean;
 }
 
 export interface Projectile {
@@ -53,6 +57,8 @@ export interface Beam {
 }
 
 export interface Impact {
+  // Who cast it: on the caster, the client plays the spell's caster impact.
+  source: UnitKey;
   target: UnitKey;
   // 0 for a white hit.
   spellId: number;
@@ -62,6 +68,12 @@ export interface Impact {
   heal: boolean;
   // Periodic ticks flash smaller.
   small: boolean;
+  // Whether the client's impact art plays for it: not for periodic ticks,
+  // nor for a hit whose cast's landing already played it.
+  kit: boolean;
+  // Whether WowMin's own glow draws it: not for a cast's landing (a buff),
+  // only for hits.
+  glow: boolean;
 }
 
 export interface AreaRing {
@@ -88,6 +100,9 @@ export interface AreaEffect {
   startAt: number;
   endAt: number;
   channeled: boolean;
+  // The spell's missile speed (yards a second; 0 for none): an impact area
+  // waits for the missile to reach the ground point.
+  missileSpeed: number;
 }
 
 // One link of a spell's chain: from the caster to its target (index 0), or
@@ -137,6 +152,9 @@ const AURA_MAX_MS = 10 * 60 * 1000;
 const MAX_NUMBERS = 200;
 const MAX_IMPACTS = 200;
 const MAX_PROJECTILES = 150;
+// A hit by a spell this close to its cast's own landing on the same unit is
+// that landing, so it doesn't play the spell's impact again.
+export const IMPACT_MATCH_MS = 600;
 // Hits of a spell this soon after its cast are its chain's jumps; links are
 // kept this long after their chain began, for whoever draws them.
 export const CHAIN_JUMP_MS = 1000;
@@ -343,7 +361,7 @@ export class CombatEffectStore {
         this.endCast(source);
         this.castList.push({
           caster: source, spellId: event.spellId, schoolMask: event.schoolMask, color, startAt: at, endAt: at + event.value + CAST_GRACE_MS,
-          release: false, channeled: false,
+          release: false, channeled: false, glow: true,
         });
         return null;
       case 'castCancel':
@@ -376,9 +394,15 @@ export class CombatEffectStore {
         const heal = event.kind === 'heal';
         const numberColor = heal ? HEAL_COLOR : color;
         this.numberList.push({ target, amount: event.value, color: numberColor, heal, periodic: event.periodic, at });
-        // White hits already show as the swing.
+        // White hits already show as the swing; a hit its cast's landing
+        // already played keeps only the glow.
         if (heal || event.spellId) {
-          this.impactList.push({ target, spellId: event.spellId, schoolMask: event.schoolMask, color: numberColor, at, heal, small: event.periodic });
+          const landed = event.spellId !== 0 && this.impactList.some((impact) => !impact.glow && impact.spellId === event.spellId
+            && impact.target === target && Math.abs(impact.at - at) <= IMPACT_MATCH_MS);
+          this.impactList.push({
+            source, target, spellId: event.spellId, schoolMask: event.schoolMask, color: numberColor, at, heal, small: event.periodic,
+            kit: !event.periodic && !landed, glow: true,
+          });
         }
         if (event.spellId && !event.periodic) this.jumpChain(source, target, event.spellId, at);
         return null;
@@ -399,31 +423,42 @@ export class CombatEffectStore {
     this.endCast(source);
     const physical = isPhysicalOnly(event.schoolMask);
     const atOther = target !== null && target !== source;
-    if (!event.triggered && !physical) {
-      if (event.channeled && event.value > 0) {
-        this.castList.push({
-          caster: source, spellId: event.spellId, schoolMask: event.schoolMask, color, startAt: at, endAt: at + event.value, release: false, channeled: true,
-        });
-        if (atOther) {
-          this.beamList.push({ source, target: target!, spellId: event.spellId, color, startAt: at, endAt: at + event.value });
-        }
-      } else {
-        this.castList.push({
-          caster: source, spellId: event.spellId, schoolMask: event.schoolMask, color, startAt: at, endAt: at + RELEASE_FLASH_MS, release: true, channeled: false,
-        });
+    const glow = !event.triggered && !physical;
+    if (glow && event.channeled && event.value > 0) {
+      this.castList.push({
+        caster: source, spellId: event.spellId, schoolMask: event.schoolMask, color, startAt: at, endAt: at + event.value,
+        release: false, channeled: true, glow,
+      });
+      if (atOther) {
+        this.beamList.push({ source, target: target!, spellId: event.spellId, color, startAt: at, endAt: at + event.value });
       }
+    } else if (!event.channeled) {
+      this.castList.push({
+        caster: source, spellId: event.spellId, schoolMask: event.schoolMask, color, startAt: at, endAt: at + RELEASE_FLASH_MS,
+        release: true, channeled: false, glow,
+      });
     }
     // Triggered spells (procs, a channel's bolts) fly only with a real missile.
     const flies = event.triggered ? event.missileSpeed > 0 : !physical || event.missileSpeed > 0;
+    let travelMs = 0;
     if (atOther && !event.channeled && flies) {
       const yards = distance(source, target!);
       if (yards !== null) {
+        travelMs = getTravelMs(yards, event.missileSpeed);
         this.projectileList.push({
           source, target: target!, spellId: event.spellId, schoolMask: event.schoolMask, color, startAt: at,
-          travelMs: getTravelMs(yards, event.missileSpeed),
-          streak: event.missileSpeed <= 0, physical,
+          travelMs, streak: event.missileSpeed <= 0, physical,
         });
       }
+    }
+    // A helpful spell lands on its target when it arrives, amount or not (a
+    // buff); its heal, if any, then plays no second impact. Harmful ones
+    // wait for their hit, since a miss lands nothing.
+    if (event.helpful && target && !event.channeled && event.spellId) {
+      this.impactList.push({
+        source, target, spellId: event.spellId, schoolMask: event.schoolMask, color: HEAL_COLOR,
+        at: at + (event.missileSpeed > 0 ? travelMs : 0), heal: true, small: false, kit: true, glow: false,
+      });
     }
     // Buffs and heals reach the party; only harmful areas get a ring.
     if (event.area && !event.helpful && event.radius > 0 && event.radius <= MAX_RING_RADIUS) {
@@ -437,7 +472,7 @@ export class CombatEffectStore {
       const lasts = (event.channeled || event.persistentArea) && event.value > 0;
       this.areaList.push({
         caster: source, spellId: event.spellId, point: event.point, radius: event.radius, startAt: at,
-        endAt: at + (lasts ? event.value : 0), channeled: event.channeled,
+        endAt: at + (lasts ? event.value : 0), channeled: event.channeled, missileSpeed: event.missileSpeed,
       });
     }
     // A chain starts at the caster's target; its spell's hits that follow are

@@ -39,6 +39,7 @@ and session recording built on the separate `mod-wowmin-telemetry` module.
 - WoWMin is now a web-only Node.js service; Electron entrypoints, packaging, desktop update checks, and platform installers were removed.
 - The content security policy allows WebAssembly (meshopt decoding of 3D scenes) and `blob:` images and connections (glTF textures).
 - The web service reads its settings files itself, without `--env-file`: `/etc/wowmin.env` (`%ProgramData%\wowmin\wowmin.env` on Windows) takes precedence over the project's `.env`, and variables already set in the environment over both.
+- **Spell art follows the client more closely**: kit effects sit on the client's own attachment points (and show nothing where a model has none), missiles leave and land at their visual's points, lasting areas rain the model their kit names (Blizzard, Rain of Fire, Hurricane, Death and Decay, Volley), ground kits play as the client's do and wait for the missile, and caster impact, aura end, and missile targeting art play; weapon strikes and procs play their cast art, and buffs their impact as they land. Unit models (`v10`) and spell art (`art-v9`) are rebuilt on demand.
 - Instance Watch now orders sidebar cards by session type. Battlegrounds place Battleground before Participants; dungeons and raids hide only Battleground while retaining Participants, Encounters, and Bot Decisions with empty-state guidance. Flat-map mode hides controls that only affect 3D rendering.
 
 ### Fixed

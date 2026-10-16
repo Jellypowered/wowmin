@@ -23,6 +23,9 @@ const SPELL_TARGET_FIELDS = [86, 87, 88, 89, 90, 91];
 const SPELL_RADIUS_FIELDS = [92, 93, 94];
 const SPELL_TRIGGER_FIELDS = [116, 117, 118];
 const SPELL_SCHOOL_MASK_FIELD = 225;
+// A spell that roots its target (SPELL_AURA_MOD_ROOT): its kits' world
+// effect follows the unit rather than staying where it started.
+const AURA_MOD_ROOT = 26;
 // Targets round the caster (TARGET_SRC_CASTER), as a triggered area is.
 const TARGET_AREA_AROUND_CASTER = 22;
 const RADIUS_FIELD = 1;
@@ -35,11 +38,21 @@ export const WAND_VISUALS = { 2: 228, 4: 225, 8: 2797, 16: 229, 32: 226, 64: 279
 // SpellVisual fields naming a kit, by the stage the kit plays at.
 const VISUAL_KITS = {
   precast: 1, cast: 2, impact: 3, state: 4, stateDone: 5, channel: 6,
-  casterImpact: 14, targetImpact: 15, instantArea: 23, impactArea: 24, persistentArea: 25,
+  casterImpact: 14, targetImpact: 15, missileTargeting: 22, instantArea: 23, impactArea: 24, persistentArea: 25,
 };
+// The kits the client looks in for a chain procedure; a visual with one
+// plays no impact area kit.
+const CHAIN_KIT_STAGES = ['cast', 'impact', 'state', 'channel', 'casterImpact', 'targetImpact'];
+// The missile: its model, where it lands and leaves from (an index into the
+// client's effect attachments, or a raw M2 attachment with flag 0x200; -1
+// for none), and offsets from those (model space) as it leaves and lands.
 const VISUAL_MISSILE_MODEL = 8;
 const VISUAL_MISSILE_DESTINATION_ATTACHMENT = 10;
+const VISUAL_FLAGS = 13;
+const VISUAL_FLAG_RAW_ATTACHMENTS = 0x200;
 const VISUAL_MISSILE_ATTACHMENT = 16;
+const VISUAL_MISSILE_CAST_OFFSET = 26;
+const VISUAL_MISSILE_IMPACT_OFFSET = 29;
 // SpellVisualKit: start and loop animation, then an effect per body slot.
 const KIT_START_ANIM = 1;
 const KIT_ANIM = 2;
@@ -50,18 +63,18 @@ const KIT_FIRST_SLOT = 3;
 // (CharParamZero..Three, one array per parameter).
 const KIT_PROCS = 17;
 const KIT_PROC_PARAMS = [21, 25, 29, 33];
-// Procedure 0 draws a chain between units (Chain Heal, Chain Lightning, Drain
-// Life); its first parameter is the SpellChainEffects row.
-const CHAIN_PROCEDURE = 0;
+// Procedures 0 and 12 draw a chain between units (Chain Heal, Chain
+// Lightning, Drain Life); the first parameter is the SpellChainEffects row.
+const CHAIN_PROCEDURES = [0, 12];
 // SpellChainEffects: average segment length, width, noise, texture
 // repeats, how long a segment lasts and the delay to the next (ms), and its
 // texture.
 const CHAIN_FIELDS = { segmentLength: 1, width: 2, noise: 3, textureScale: 4, segmentMs: 5, delayMs: 6, texture: 7 };
-// Procedure 9 (undocumented) rains models over the area: Blizzard's ice,
-// Rain of Fire's fire. The data doesn't say which model falls; these are the
-// models the client has for them (creature Rain of Fire spells name the fire
-// model directly). By SpellVisual ID: Blizzard, Rain of Fire.
-export const FALLING_EFFECTS = { 9490: 398, 10379: 448 };
+// Procedure 9 rains models over a lasting area (Blizzard's ice, Rain of
+// Fire's fire): its first parameter is the row of SpellVisualKitAreaModel,
+// counted from 0, whose model falls, the first row when there is no such
+// row.
+const AREA_MODEL_FILE = 1;
 // GameObjectDisplayInfo: the model file.
 const GAMEOBJECT_MODEL_FIELD = 1;
 // SpellVisualEffectName: name, file, area effect size, scale.
@@ -111,6 +124,16 @@ export class SpellVisuals {
       this.present.set(name, known);
     }
     return known;
+  }
+
+  // The model procedure 9 rains for its first parameter, or null if the
+  // client lacks it.
+  areaModel(index) {
+    const rows = [...this.table('SpellVisualKitAreaModel').values()];
+    const file = (rows[index] ?? rows[0])?.string(AREA_MODEL_FILE);
+    if (!file) return null;
+    const modelName = file.replace(/\.md[xl]$/i, '.m2');
+    return this.hasFile(modelName) ? modelName : null;
   }
 
   effect(effectId) {
@@ -197,16 +220,17 @@ export class SpellVisuals {
         const art = this.forVisual(visualId);
         return art ? [[school, art]] : [];
       }));
-      return Object.keys(bySchool).length ? { spellId, visualId: 0, missile: null, falling: null, kits: {}, bySchool } : null;
+      return Object.keys(bySchool).length ? { spellId, visualId: 0, missile: null, kits: {}, bySchool } : null;
     }
     const art = this.forVisual(spell.uint(SPELL_VISUAL_FIELD));
     if (!art) return null;
     const bearerArea = this.bearerArea(spell);
-    return { spellId, ...art, ...(bearerArea ? { bearerArea } : {}) };
+    const rootsUnit = SPELL_AURA_FIELDS.some((field) => spell.int(field) === AURA_MOD_ROOT);
+    return { spellId, ...art, ...(bearerArea ? { bearerArea } : {}), ...(rootsUnit ? { rootsUnit } : {}) };
   }
 
-  // A SpellVisual's missile, kits, falling model, and chain, or null if it
-  // has none of them.
+  // A SpellVisual's missile, kits, and chain, or null if it has no missile
+  // or kits.
   forVisual(visualId) {
     const visual = this.table('SpellVisual').get(visualId);
     if (!visual) return null;
@@ -217,19 +241,23 @@ export class SpellVisuals {
     }
     const missile = this.effect(visual.uint(VISUAL_MISSILE_MODEL));
     if (!missile && !Object.keys(kits).length) return null;
-    const falling = this.effect(FALLING_EFFECTS[visual.uint(0)] ?? 0);
-    const chainProc = Object.values(kits).flatMap((kit) => kit.procs).find((proc) => proc.code === CHAIN_PROCEDURE);
+    const chainProc = Object.values(kits).flatMap((kit) => kit.procs).find((proc) => CHAIN_PROCEDURES.includes(proc.code));
     const chain = chainProc ? this.chain(chainProc.params[0]) : null;
+    const chainEffect = CHAIN_KIT_STAGES.some((stage) => kits[stage]?.procs.some((proc) => CHAIN_PROCEDURES.includes(proc.code)));
+    const vector = (field) => [0, 1, 2].map((axis) => visual.float(field + axis));
     return {
       visualId: visual.uint(0),
       missile: missile && {
         ...missile,
         attachment: visual.int(VISUAL_MISSILE_ATTACHMENT),
         destinationAttachment: visual.int(VISUAL_MISSILE_DESTINATION_ATTACHMENT),
+        rawAttachments: Boolean(visual.uint(VISUAL_FLAGS) & VISUAL_FLAG_RAW_ATTACHMENTS),
+        castOffset: vector(VISUAL_MISSILE_CAST_OFFSET),
+        impactOffset: vector(VISUAL_MISSILE_IMPACT_OFFSET),
       },
-      falling,
       kits,
       ...(chain ? { chain } : {}),
+      ...(chainEffect ? { chainEffect } : {}),
     };
   }
 }
