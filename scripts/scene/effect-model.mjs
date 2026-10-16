@@ -167,16 +167,30 @@ function sequenceChannels(effect) {
   return paths;
 }
 
-export function buildEffectDocument(effect, { name, textureFor, textureMax = EFFECT_TEXTURE_MAX }) {
+// The GLB's document for an effect, with the models its particles are drawn
+// as (each emitter's particleModel, an index into `particleModels`): each
+// such model a root of its own beside the effect's, its node, texture, and
+// clip names prefixed `p<index>:`.
+export function buildEffectDocument(effect, { name, textureFor, textureMax = EFFECT_TEXTURE_MAX, particleModels = [] }) {
   const document = new Document();
   const buffer = document.createBuffer();
+  const scene = document.createScene(name);
+  scene.addChild(addEffectTree(document, buffer, effect, { name, textureFor, textureMax, prefix: '' }));
+  particleModels.forEach((model, index) => {
+    const root = addEffectTree(document, buffer, model.effect, { name: model.effect.name, textureFor: model.textureFor, textureMax, prefix: `p${index}:` });
+    root.setExtras({ ...root.getExtras(), wowParticleModel: index });
+    scene.addChild(root);
+  });
+  return document;
+}
+
+function addEffectTree(document, buffer, effect, { name, textureFor, textureMax, prefix }) {
   const accessor = (type, array) => document.createAccessor().setType(type).setArray(array).setBuffer(buffer);
-  const root = document.createNode(name);
-  document.createScene(name).addChild(root);
+  const root = document.createNode(`${prefix}${name}`);
 
   const joints = effect.bones.map((bone, index) => {
     const parent = effect.bones[bone.parentIndex];
-    const joint = document.createNode(`bone${index}`)
+    const joint = document.createNode(`${prefix}bone${index}`)
       .setTranslation(bone.pivot.map((value, axis) => value - (parent?.pivot[axis] ?? 0)));
     if (bone.flags & BONE_BILLBOARD_FLAGS) joint.setExtras({ wowBillboard: bone.flags & BONE_BILLBOARD_FLAGS });
     return joint;
@@ -201,7 +215,7 @@ export function buildEffectDocument(effect, { name, textureFor, textureMax = EFF
       images.set(source.name.toLowerCase(), image);
     }
     if (!image) return null;
-    const material = document.createMaterial(`texture${index}`).setBaseColorTexture(image).setAlphaMode('BLEND');
+    const material = document.createMaterial(`${prefix}texture${index}`).setBaseColorTexture(image).setAlphaMode('BLEND');
     return material.getName();
   });
 
@@ -220,12 +234,14 @@ export function buildEffectDocument(effect, { name, textureFor, textureMax = EFF
     const weightsAttribute = accessor('VEC4', weights);
     const mesh = document.createMesh(`${name}-mesh`);
     effect.batches.forEach((batch, index) => {
-      const material = document.createMaterial(`${name}#${index}`)
+      const material = document.createMaterial(`${prefix}${name}#${index}`)
         .setMetallicFactor(0)
         .setRoughnessFactor(1)
         .setDoubleSided(true)
         .setExtras({
           wowBlend: M2_BLEND[batch.blend] ?? 'opaque',
+          // The M2 material's blend number, read by the client's table.
+          wowBlendMode: batch.blend,
           wowTexture: textureMaterials[batch.textureIndex] ?? null,
           wowColor: exportTrack(batch.color, effect.clips),
           wowAlpha: exportTrack(batch.alpha, effect.clips),
@@ -244,12 +260,12 @@ export function buildEffectDocument(effect, { name, textureFor, textureMax = EFF
         .setIndices(accessor('SCALAR', Uint16Array.from(slice)))
         .setMaterial(material));
     });
-    root.addChild(document.createNode(`${name}-mesh`).setMesh(mesh).setSkin(skin));
+    root.addChild(document.createNode(`${prefix}${name}-mesh`).setMesh(mesh).setSkin(skin));
   }
 
   const channels = sequenceChannels(effect);
   const writeClip = (clip, paths) => {
-    const animation = document.createAnimation(clip.name);
+    const animation = document.createAnimation(`${prefix}${clip.name}`);
     paths.forEach((targets, boneIndex) => {
       const bone = effect.bones[boneIndex];
       const parent = effect.bones[bone.parentIndex];
@@ -292,21 +308,48 @@ export function buildEffectDocument(effect, { name, textureFor, textureMax = EFF
         ...exportRibbon(ribbon, effect.clips),
         textureMaterial: textureOf(ribbon.textures[0]),
         blend: effect.materials[ribbon.materials[0]]?.blend ?? 0,
+        // Each texture with its material is a pass of its own.
+        passes: ribbon.textures.map((texture, index) => ({
+          textureMaterial: textureOf(texture),
+          blend: effect.materials[ribbon.materials[index] ?? ribbon.materials[0]]?.blend ?? 0,
+        })),
         bonePivot: effect.bones[ribbon.bone]?.pivot ?? [0, 0, 0],
       })),
     },
   });
-  return document;
+  return root;
 }
 
-// The GLB for an effect model file, or null if the file is missing.
+const texturesOf = (effect, readFile) => (index) => {
+  const texture = effect.textures[index];
+  const blp = texture?.filename ? readFile(texture.filename) : null;
+  return blp ? { name: path.win32.basename(texture.filename), blp } : null;
+};
+
+// The GLB for an effect model file, or null if the file is missing. Emitters
+// whose particles are models, or that have child emitters (a model whose
+// emitters let particles go from each of theirs), get those models
+// alongside (one level deep, as the client has them), and their index as
+// particleModel or childEmitters.
 export async function buildEffectGlb(readFile, modelName) {
   const effect = loadEffectM2(modelName, readFile);
   if (!effect) return null;
-  const textureFor = (index) => {
-    const texture = effect.textures[index];
-    const blp = texture?.filename ? readFile(texture.filename) : null;
-    return blp ? { name: path.win32.basename(texture.filename), blp } : null;
+  const particleModels = [];
+  const indexOf = new Map();
+  const modelIndex = (filename) => {
+    const file = filename.replace(/\.md[lx]$/i, '.m2');
+    const key = file.toLowerCase();
+    if (!indexOf.has(key)) {
+      const model = loadEffectM2(file, readFile);
+      indexOf.set(key, model ? particleModels.push({ effect: model, textureFor: texturesOf(model, readFile) }) - 1 : null);
+    }
+    return indexOf.get(key);
   };
-  return writeGlb(buildEffectDocument(effect, { name: effect.name, textureFor }));
+  for (const emitter of effect.emitters) {
+    const model = emitter.modelFilename ? modelIndex(emitter.modelFilename) : null;
+    if (model !== null) emitter.particleModel = model;
+    const children = emitter.childEmittersFilename ? modelIndex(emitter.childEmittersFilename) : null;
+    if (children !== null) emitter.childEmitters = children;
+  }
+  return writeGlb(buildEffectDocument(effect, { name: effect.name, textureFor: texturesOf(effect, readFile), particleModels }));
 }

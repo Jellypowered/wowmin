@@ -44,7 +44,8 @@ export const UNIT_MODEL_CACHE_VERSION = 10;
 // missile flies (release, motion script, ground following, gravity arc),
 // effects' Fly, Impact, and Birth clips and scale limits, and kits' flags
 // and animation clips (with their fallbacks) and whether the spell is
-// harmful.
+// harmful; effects' ribbons with each texture pass, plain particle gravity,
+// and the models their particles are drawn as or whose emitters they carry.
 export const SPELL_ART_CACHE_VERSION = 9;
 const SPELL_ART_KINDS = new Set<UnitModelRequest['kind']>(['effect', 'visual', 'spell', 'icon', 'gameobject', 'light']);
 const EXTENSIONS: Partial<Record<UnitModelRequest['kind'], string>> = { visual: 'json', spell: 'json', icon: 'png', light: 'json' };

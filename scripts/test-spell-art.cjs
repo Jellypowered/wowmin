@@ -116,15 +116,6 @@ test('reads a particle emitter in the 3.3.5 layout', async () => {
   assert.deepEqual(parseParticleEmitters(buffer), []);
 });
 
-test('decompresses packed gravity', async () => {
-  const { decompressGravity } = await load('m2-effects.mjs');
-  // x = y = 0, z magnitude 100 → straight up, 100 * 0.04238648.
-  const [x, y, z] = decompressGravity(100 << 16);
-  assert.deepEqual([x, y], [0, 0]);
-  near(z, 4.238648, 'up');
-  near(decompressGravity(-100 << 16)[2], -4.238648, 'down');
-});
-
 test('reads a ribbon in the 3.3.5 layout', async () => {
   const { parseRibbons, RIBBON_SIZE } = await load('m2-effects.mjs');
   const file = m2Buffer();
@@ -158,6 +149,27 @@ test('exports tracks for the clips kept, or a loop\'s keys', async () => {
   assert.equal(exportTrack({ ...track, sequences: [] }, [{ name: 'Stand', index: 0 }]), null);
 });
 
+test('builds the models particles are drawn as beside the effect, their names prefixed', async () => {
+  const { buildEffectDocument } = await load('effect-model.mjs');
+  const curve = { times: [], values: [] };
+  const emitter = { texture: 0, bone: 0, particleModel: 0, childEmitters: 0, color: curve, alpha: curve, scale: curve, headCell: curve, tailCell: curve };
+  const effect = (name, emitters) => ({
+    name, loops: [], clips: [{ name: 'Stand', index: 0, duration: 1000, bones: [{}] }], globalClips: [],
+    bones: [{ parentIndex: -1, pivot: [0, 0, 0], flags: 0 }], textures: [], materials: [], geometry: null, batches: [],
+    emitters, ribbons: [],
+  });
+  const document = buildEffectDocument(effect('Base', [emitter]), {
+    name: 'Base', textureFor: () => null, particleModels: [{ effect: effect('Geo', []), textureFor: () => null }],
+  });
+  const roots = document.getRoot().listScenes()[0].listChildren();
+  assert.deepEqual(roots.map((root) => root.getName()), ['Base', 'p0:Geo']);
+  assert.equal(roots[1].getExtras().wowParticleModel, 0);
+  assert.deepEqual(roots[1].listChildren().map((node) => node.getName()), ['p0:bone0']);
+  const exported = roots[0].getExtras().wowEffect.emitters[0];
+  assert.equal(exported.particleModel, 0);
+  assert.equal(exported.childEmitters, 0);
+});
+
 test('evaluates tracks by clip time, and loops by elapsed time', () => {
   const clock = { clip: 'Stand', timeMs: 50, elapsedMs: 1250, loops: [1000] };
   const track = { g: -1, s: false, k: { Stand: [[0, 100], [0, 10, 100, 110]] } };
@@ -179,43 +191,57 @@ test('evaluates life curves and texture cells', () => {
   assert.deepEqual(plain(tracks.evalLifeCurve({ t: [], v: [] }, 1, 0.25, [9])), [9]);
   assert.deepEqual(plain(tracks.cellUv(0, 4, 4)), [0, 0, 0.25, 0.25]);
   assert.deepEqual(plain(tracks.cellUv(5, 4, 4)), [0.25, 0.25, 0.5, 0.5]);
-  // Cells wrap round the sheet.
-  assert.deepEqual(plain(tracks.cellUv(17, 4, 4)), plain(tracks.cellUv(1, 4, 4)));
+  // Rounded to the nearest cell; a sheet that isn't a power of two is one cell.
+  assert.deepEqual(plain(tracks.cellUv(1.6, 4, 4)), [0.5, 0, 0.75, 0.25]);
+  assert.deepEqual(plain(tracks.cellUv(2, 3, 3)), [0, 0, 1, 1]);
   near(tracks.quaternionAngleZ([0, 0, Math.sin(Math.PI / 4), Math.cos(Math.PI / 4)]), Math.PI / 2, 'uv rotation');
 });
 
-test('spawns particles on planes and spheres, and counts emission', () => {
+test('spawns particles as the client\'s emitters do, and counts emission', () => {
   const fixed = (...values) => { let index = 0; return () => values[index++ % values.length]; };
-  // Plane, no spread: straight up at full speed, from the rectangle.
-  const plane = tracks.spawnParticle({ emitterType: 1, areaLength: 2, areaWidth: 4, verticalRange: 0, horizontalRange: 0,
-    speed: 3, speedVariation: 0, zSource: 0 }, fixed(0, 0, 0, 1, -1));
+  // Plane: draws y, x, speed variation, latitude, longitude. x spans the
+  // width (0xC8), y the length (0xDC).
+  const plane = tracks.spawnParticle({ emitterType: 1, areaWidth: 4, areaLength: 2, verticalRange: 0, horizontalRange: 0,
+    speed: 3, speedVariation: 0, zSource: 0 }, fixed(-1, 1, 0, 0, 0));
   assert.deepEqual(plain(plane.velocity), [0, 0, 3]);
-  assert.deepEqual(plain(plane.position), [1, -2, 0]);
-  // Sphere: on the shell between the radii, flying outward.
-  const sphere = tracks.spawnParticle({ emitterType: 2, areaLength: 1, areaWidth: 3, verticalRange: Math.PI / 2,
-    horizontalRange: 0, speed: 2, speedVariation: 0, zSource: 0 }, fixed(0, 1, 0, 1));
+  assert.deepEqual(plain(plane.position), [2, -1, 0]);
+  // Sphere: draws radius (from width to length), latitude, longitude, speed.
+  const sphere = tracks.spawnParticle({ emitterType: 2, areaWidth: 1, areaLength: 3, verticalRange: Math.PI / 2,
+    horizontalRange: 0, speed: 2, speedVariation: 0, zSource: 0 }, fixed(1, 1, 0, 0));
   near(Math.hypot(...sphere.position), 3, 'radius');
-  near(sphere.velocity[0] / 2, sphere.position[0] / 3, 'outward');
-  // A narrow sphere emitter points forward (+X), like a breath; its
-  // horizontal range fans it out sideways, its vertical range up and down.
-  const breath = (vertical, horizontal) => tracks.spawnParticle({ emitterType: 2, areaLength: 0, areaWidth: 0,
-    verticalRange: 0.1, horizontalRange: 1, speed: 10, speedVariation: 0, zSource: 0 }, fixed(0, vertical, horizontal, 0));
-  const ahead = breath(0, 0);
-  near(ahead.velocity[0], 10, 'straight ahead');
-  near(ahead.velocity[2], 0, 'level');
-  const fanned = breath(0, 1);
-  near(Math.atan2(fanned.velocity[1], fanned.velocity[0]), 1, 'fanned sideways');
+  near(sphere.velocity[2], 2, 'outward, straight up at the top');
+  // A narrow sphere points forward (+X), fanned by the longitude.
+  const breath = (latitude, longitude) => tracks.spawnParticle({ emitterType: 2, areaWidth: 0, areaLength: 0,
+    verticalRange: 0.1, horizontalRange: 1, speed: 10, speedVariation: 0, zSource: 0 }, fixed(-1, latitude, longitude, 0));
+  near(breath(0, 0).velocity[0], 10, 'straight ahead');
+  near(Math.atan2(breath(0, 1).velocity[1], breath(0, 1).velocity[0]), 1, 'fanned sideways');
   near(Math.asin(breath(1, 0).velocity[2] / 10), 0.1, 'tilted up');
-  // zSource: away from a point below.
-  const source = tracks.spawnParticle({ emitterType: 1, areaLength: 0, areaWidth: 0, verticalRange: 0, horizontalRange: 0,
+  // Flagged upward, a sphere's particles fly straight up.
+  const upward = tracks.spawnParticle({ emitterType: 2, areaWidth: 1, areaLength: 1, verticalRange: 0, horizontalRange: 1,
+    speed: 4, speedVariation: 0, zSource: 0, upward: true }, fixed(0, 0, 1, 0));
+  assert.deepEqual(plain(upward.velocity), [0, 0, 4]);
+  // zSource: away from a point that far up the axis.
+  const source = tracks.spawnParticle({ emitterType: 1, areaWidth: 0, areaLength: 0, verticalRange: 0, horizontalRange: 0,
     speed: 5, speedVariation: 0, zSource: 2 }, fixed(0));
-  assert.deepEqual(plain(source.velocity), [0, 0, 5]);
+  assert.deepEqual(plain(source.velocity), [0, 0, -5]);
+  // Spline: a point along its stretch, by length, flying up.
+  const spline = tracks.spawnParticle({ emitterType: 3, areaWidth: 0, areaLength: 1, verticalRange: 0, horizontalRange: 0,
+    speed: 2, speedVariation: 0, zSource: 0, splinePoints: [0, 0, 0, 2, 0, 0, 2, 2, 0] }, fixed(-0.5, 0));
+  assert.deepEqual(plain(spline.position), [1, 0, 0]);
+  assert.deepEqual(plain(spline.velocity), [0, 0, 2]);
+  // Emission rounds to the nearest, carrying the rest (which may go below 0).
   const emitted = tracks.emitCount(0.5, 10, 0.12);
-  assert.equal(emitted.count, 1);
-  near(emitted.carry, 0.7, 'carry');
-  assert.equal(tracks.particleBlend(4), 'add');
-  assert.equal(tracks.particleBlend(2), 'alpha');
-  assert.equal(tracks.materialBlend(4), 'add');
+  assert.equal(emitted.count, 2);
+  near(emitted.carry, -0.3, 'carry');
+  // Blends by the client's tables.
+  assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 7].map(tracks.particleBlend),
+    ['opaque', 'alphaKey', 'alpha', 'addColor', 'add', 'mod', 'mod2x', 'opaque']);
+  assert.deepEqual([0, 1, 2, 3, 4, 5, 6].map(tracks.materialBlend), ['opaque', 'alphaKey', 'alpha', 'addColor', 'add', 'mod', 'mod2x']);
+  // Twinkle reads a fixed table of 128 numbers in [0, 1).
+  assert.equal(tracks.TWINKLE_TABLE.length, 128);
+  assert.ok(tracks.TWINKLE_TABLE.every((value) => value >= 0 && value < 1));
+  assert.equal(tracks.twinkleEntry(0, 10, 3), tracks.TWINKLE_TABLE[3]);
+  assert.equal(tracks.twinkleEntry(0.25, 10, 3), tracks.TWINKLE_TABLE[6]);
 });
 
 test('picks the kit a cast plays, its body slots, and the animations it names', () => {
