@@ -205,6 +205,9 @@ export interface StreamFrame {
 
 export type StreamStatus = 'starting' | 'streaming' | 'unavailable';
 
+// Stream unit IDs are opaque and session-local. From v3, non-player IDs
+// include the GUID type; never strip their upper byte or use them as DB IDs.
+// The existing creature flags distinguish these from player low GUIDs.
 // A player's or creature's server-driven movement path: the waypoints still
 // ahead, ending at the destination. No points means it is no longer on a path.
 export interface StreamPath {

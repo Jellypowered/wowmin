@@ -20,7 +20,9 @@ function loadModule(relativePath) {
 
 const {
   TelemetryStream,
-  parseBotDatagram, parseCombatEventDatagram, parseCreatureDatagram, parseDebuffDatagram, parseGameObjectDatagram, parseMarkerDatagram, parsePassengerDatagram, parsePathDatagram, parseStreamDatagram, parseUnitAuraDatagram,
+  parseAppearanceDatagram, parseBotDatagram, parseCombatEventDatagram, parseCreatureDatagram, parseDebuffDatagram,
+  parseGameObjectDatagram, parseMarkerDatagram, parsePassengerDatagram, parsePathDatagram, parseStreamDatagram,
+  parseUnitAuraDatagram,
 } = loadModule('../src/telemetry-stream.ts');
 const {
   LIVE_AURA_STALE_MS, LIVE_BOT_STALE_MS, LIVE_CREATURE_STALE_MS, LIVE_PATH_STALE_MS, LIVE_RENDER_DELAY_MS, LiveAuraStore, LiveBotStore,
@@ -627,6 +629,92 @@ test('parses raid markers, and an empty list clears them', () => {
   assert.equal(store.get('c900', 2500), null);
   store.push(parsed, 3000);
   assert.equal(store.get('c900', 3000 + LIVE_MARKER_STALE_MS + 1), null);
+});
+
+function withVersion(packet, version) {
+  const copy = Buffer.from(packet);
+  copy.writeUInt8(version, 4);
+  return copy;
+}
+
+test('accepts stream v1-v3 for every family and rejects unknown versions', () => {
+  const parsers = [
+    ['WMP1', parsePathDatagram], ['WMC1', parseCreatureDatagram], ['WMB1', parseBotDatagram],
+    ['WMA1', parseAppearanceDatagram], ['WME1', parseCombatEventDatagram], ['WMU1', parseUnitAuraDatagram],
+    ['WMV1', parsePassengerDatagram], ['WMG1', parseGameObjectDatagram], ['WMD1', parseDebuffDatagram],
+    ['WMR1', parseMarkerDatagram],
+  ];
+  for (const version of [1, 2, 3]) {
+    const frame = parseStreamDatagram(datagram({ version, players: [tankard] }));
+    assert.equal(frame.players[0].guid, tankard.guid);
+    assert.equal(frame.players[0].roleMask, version >= 2 ? tankard.roleMask : undefined);
+    for (const [magic, parse] of parsers) {
+      assert.ok(parse(withVersion(entriesDatagram(magic, []), version)), `${magic} v${version}`);
+    }
+  }
+  assert.equal(parseStreamDatagram(datagram({ version: 4, players: [] })), null);
+  for (const [magic, parse] of parsers) {
+    assert.equal(parse(withVersion(entriesDatagram(magic, []), 4)), null, magic);
+  }
+});
+
+test('v3 keeps equal creature, pet, and vehicle counters distinct across unit references', () => {
+  const ids = [0x30000001, 0x40000001, 0x50000001];
+  const creatures = ids.map((guid, index) => ({ guid, entry: index + 100, x: index * 10, y: 0, z: 0,
+    orientation: 0, healthPct: 100, flags: 1, targetGuid: ids[(index + 1) % ids.length], wmoGroupId: -1 }));
+  const parsed = parseCreatureDatagram(withVersion(creatureDatagram({ creatures }), 3));
+  const buffer = new LiveCreatureBuffer();
+  buffer.push(parsed, 1000);
+  assert.equal(buffer.samples(1000).length, 3);
+  for (const [index, guid] of ids.entries()) {
+    assert.equal(buffer.latest(guid).entry, index + 100);
+    assert.equal(buffer.latest(guid).targetGuid, ids[(index + 1) % ids.length]);
+  }
+
+  const pathStore = new LivePathStore();
+  pathStore.push(parsePathDatagram(withVersion(pathDatagram({ paths: ids.map((guid) => ({ guid,
+    splineId: 1, creature: true, points: [[guid, 0, 0]] })) }), 3)), 1000);
+  for (const guid of ids) assert.equal(pathStore.get(creaturePathKey(guid), 1000).guid, guid);
+
+  const auraStore = new LiveAuraStore();
+  auraStore.push(parseUnitAuraDatagram(withVersion(unitAuraDatagram(ids.map((guid) => ({ guid,
+    creature: true, spellIds: [17] }))), 3)), 1000);
+  assert.equal(auraStore.all(1000).size, 3);
+  const appearanceEntries = ids.map((guid) => {
+    const entry = Buffer.alloc(108);
+    entry.writeUInt32LE(guid, 0); entry.writeUInt8(1, 4);
+    return entry;
+  });
+  const appearances = parseAppearanceDatagram(withVersion(entriesDatagram('WMA1', appearanceEntries), 3));
+  assert.deepEqual(Array.from(appearances.units, (unit) => unit.guid), ids);
+  const debuffEntries = ids.map((guid) => {
+    const entry = Buffer.alloc(8);
+    entry.writeUInt32LE(guid, 0); entry.writeUInt8(1, 4);
+    return entry;
+  });
+  const debuffs = parseDebuffDatagram(withVersion(entriesDatagram('WMD1', debuffEntries), 3));
+  assert.deepEqual(Array.from(debuffs.units, (unit) => unit.guid), ids);
+
+  const event = parseCombatEventDatagram(withVersion(combatDatagram({ events: [
+    { kind: 7, flags: 1 | 2, sourceGuid: ids[1], targetGuid: ids[0], value: 10 },
+  ] }), 3)).events[0];
+  assert.equal(event.sourceGuid, ids[1]);
+  assert.equal(event.targetGuid, ids[0]);
+  const passenger = parsePassengerDatagram(withVersion(passengerDatagram([
+    { guid: tankard.guid, vehicle: ids[2], flags: 1, seat: 0 },
+  ]), 3)).passengers[0];
+  assert.equal(passenger.guid, tankard.guid);
+  assert.equal(passenger.vehicleGuid, ids[2]);
+
+  const marker = Buffer.alloc(8);
+  marker.writeUInt8(7, 0); marker.writeUInt8(1, 1); marker.writeUInt32LE(ids[1], 4);
+  assert.equal(parseMarkerDatagram(withVersion(entriesDatagram('WMR1', [marker]), 3)).markers[0].guid, ids[1]);
+  const bot = parseBotDatagram(withVersion(botDatagram({ bots: [{ ...healerBot, flags: 1,
+    motionTargetGuid: ids[1], targetGuid: ids[2] }] }), 3)).bots[0];
+  assert.equal(bot.motionTargetGuid, ids[1]);
+  assert.equal(bot.targetGuid, ids[2]);
+  assert.equal(bot.motionTargetIsPlayer, false);
+  assert.equal(bot.targetIsPlayer, false);
 });
 
 test('passes a watched session\'s datagrams to its listeners, naming paths from the latest frame', async () => {
