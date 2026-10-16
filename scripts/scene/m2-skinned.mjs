@@ -100,6 +100,25 @@ export const UNIT_ANIMATIONS = {
   UseStandingLoop: 123,
   ChannelCastDirected: 124,
   ChannelCastOmni: 125,
+  // More that kits name: strikes, shouts and roars, falls, spins, and
+  // creatures' own casts.
+  Special2H: 58,
+  EmoteEat: 61,
+  EmoteCheer: 68,
+  EmoteRoar: 74,
+  EmoteShout: 81,
+  HoldThrown: 111,
+  KneelLoop: 115,
+  Knockdown: 121,
+  Whirlwind: 126,
+  UseStandingStart: 128,
+  UseStandingEnd: 129,
+  CreatureSpecial: 130,
+  CustomSpell01: 213,
+  CustomSpell02: 214,
+  CustomSpell03: 215,
+  CustomSpell04: 216,
+  Cower: 225,
   // A rider's seated pose.
   Mount: 91,
   // A flying mount in the air: moving, and staying in place.

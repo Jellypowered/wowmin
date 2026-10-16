@@ -81,6 +81,20 @@ const VISUAL_MISSILE_IMPACT_OFFSET = 29;
 // SpellVisualKit: start and loop animation, then an effect per body slot.
 const KIT_START_ANIM = 1;
 const KIT_ANIM = 2;
+// The kit's flags: 0x1 waits for its chain's bolt to reach the unit; 0x4
+// and 0x8 play the animation itself, without falling back.
+const KIT_FLAGS = 37;
+const KIT_RAW_ANIMATION = 0x4 | 0x8;
+// AnimationData: a clip's name, and the clip a model without it plays
+// instead (0 for none; falling back to Stand is left to the unit).
+const ANIMATION_NAME = 1;
+const ANIMATION_FALLBACK = 5;
+// Spell.dbc's target flags and implicit targets, for telling a harmful
+// spell (the client skips some of its colours on some creatures).
+const SPELL_TARGET_FLAGS = 16;
+const TARGET_FLAG_HELPFUL = 0x100;
+const TARGET_FLAG_HARMFUL = 0x80;
+const HARMFUL_TARGETS = new Set([2, 6, 15, 16, 24, 28, 53, 54, 93]);
 const KIT_SLOTS = ['head', 'chest', 'base', 'leftHand', 'rightHand', 'breath', 'leftWeapon', 'rightWeapon',
   'special1', 'special2', 'special3', 'world'];
 const KIT_FIRST_SLOT = 3;
@@ -202,7 +216,38 @@ export class SpellVisuals {
       return code >= 0 ? [{ code, params: KIT_PROC_PARAMS.map((field) => kit.float(field + index)) }] : [];
     });
     if (!effects.length && !procs.length && anim < 0 && startAnim < 0) return null;
-    return { id: kitId, startAnim, anim, effects, procs };
+    const flags = kit.uint(KIT_FLAGS);
+    const raw = Boolean(flags & KIT_RAW_ANIMATION);
+    const animClips = this.animationClips(anim, raw);
+    const startClips = this.animationClips(startAnim, raw);
+    return {
+      id: kitId, startAnim, anim, effects, procs, flags,
+      ...(animClips.length ? { animClips } : {}), ...(startClips.length ? { startClips } : {}),
+    };
+  }
+
+  // The clips an animation plays, by name: its own, then (unless `raw`)
+  // each it falls back to on a model without it, short of Stand.
+  animationClips(animId, raw = false) {
+    const clips = [];
+    const seen = new Set();
+    for (let id = animId; id > 0 && !seen.has(id); id = raw ? 0 : this.table('AnimationData').get(id)?.int(ANIMATION_FALLBACK) ?? 0) {
+      seen.add(id);
+      const name = this.table('AnimationData').get(id)?.string(ANIMATION_NAME);
+      if (name) clips.push(name);
+    }
+    return clips;
+  }
+
+  // Whether the client counts a spell as harmful: by its target flags, else
+  // by any implicit target at an enemy.
+  harmful(spell) {
+    const flags = spell.uint(SPELL_TARGET_FLAGS);
+    if (flags & TARGET_FLAG_HELPFUL) return false;
+    if (flags & TARGET_FLAG_HARMFUL) return true;
+    const targets = SPELL_TARGET_FIELDS.map((field) => spell.int(field));
+    if (targets.some((target) => HARMFUL_TARGETS.has(target))) return true;
+    return false;
   }
 
   // A chain effect (SpellChainEffects): every field the client draws it
@@ -286,7 +331,10 @@ export class SpellVisuals {
     if (trajectory) art.missile.trajectory = trajectory;
     const bearerArea = this.bearerArea(spell);
     const rootsUnit = SPELL_AURA_FIELDS.some((field) => spell.int(field) === AURA_MOD_ROOT);
-    return { spellId, ...art, ...(bearerArea ? { bearerArea } : {}), ...(rootsUnit ? { rootsUnit } : {}) };
+    const harmful = this.harmful(spell);
+    return {
+      spellId, ...art, ...(bearerArea ? { bearerArea } : {}), ...(rootsUnit ? { rootsUnit } : {}), ...(harmful ? { harmful } : {}),
+    };
   }
 
   // A SpellVisual's missile, kits, and chain, or null if it has no missile

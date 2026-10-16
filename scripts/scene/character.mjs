@@ -402,11 +402,16 @@ export function resolveAttachments(characterData, modelName, placements) {
     const point = skeletonAttachments.find((candidate) => candidate.id === placement.attachment);
     const itemModel = point ? loadM2(placement.model, characterData.readFile) : null;
     if (!itemModel) return [];
+    // A weapon's blade, bottom and top, which a swing's trail sweeps.
+    const blade = readM2Events(characterData.readFile(placement.model), ['$WTB', '$WTT']);
+    const bottom = blade.find((event) => event.name === '$WTB');
+    const top = blade.find((event) => event.name === '$WTT');
     return [{
       ...placement,
       bone: point.bone,
       position: point.position,
       mesh: itemModel,
+      ...(bottom && top ? { trail: { bottom: bottom.position, top: top.position } } : {}),
       textureFor: (batch) => {
         const name = batch.textureType === TEXTURE_HARDCODED ? batch.texture : batch.textureType === TEXTURE_ITEM ? placement.texture : null;
         const blp = name ? characterData.readFile(name) : null;

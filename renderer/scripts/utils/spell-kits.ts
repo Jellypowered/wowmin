@@ -24,7 +24,17 @@ export interface VisualKit {
   effects: VisualEffect[];
   // Procedures the client runs for the kit: a code and four parameters.
   procs?: Array<{ code: number; params: number[] }>;
+  // The kit's flags (0x1: waits for its chain's bolt to reach the unit).
+  flags?: number;
+  // The clips its animation plays, by name, the first a unit's model has
+  // winning (its own, then those it falls back to); and the clips it plays
+  // once first, as a cast begins.
+  animClips?: string[];
+  startClips?: string[];
 }
+
+// A kit with this flag plays on a chain's target when the bolt reaches it.
+export const KIT_WAITS_FOR_BOLT = 0x1;
 
 export type KitStage = 'precast' | 'cast' | 'channel' | 'impact' | 'casterImpact' | 'targetImpact' | 'state' | 'stateDone'
   | 'missileTargeting' | 'instantArea' | 'impactArea' | 'persistentArea';
@@ -88,6 +98,9 @@ export interface SpellVisual {
   // Whether the spell roots its target: its kits' world effects follow the
   // unit instead of staying where they started.
   rootsUnit?: boolean;
+  // Whether the client counts it harmful: its colours then skip creatures
+  // flagged so (CREATURE_TYPE_FLAG_SPELL_ATTACKABLE).
+  harmful?: boolean;
   // Art by school bit, for spells whose art depends on the cast's school
   // (a wand's Shoot); the spell's own fields are then empty.
   bySchool?: Record<string, SpellVisual>;
@@ -101,17 +114,9 @@ export function artForSchool(visual: SpellVisual, schoolMask: number): SpellVisu
   return school === undefined ? null : visual.bySchool[school];
 }
 
-// AnimationData IDs kits name, by the clip names unit models export
-// (UNIT_ANIMATIONS in scripts/scene/m2-skinned.mjs).
-const KIT_ANIMATIONS: Record<number, string> = {
-  9: 'CombatWound', 10: 'CombatCritical', 14: 'Stun', 16: 'AttackUnarmed', 17: 'Attack1H', 32: 'SpellCast',
-  51: 'ReadySpellDirected', 52: 'ReadySpellOmni', 53: 'SpellCastDirected', 54: 'SpellCastOmni', 55: 'BattleRoar',
-  57: 'Special1H', 107: 'AttackThrown', 108: 'ReadyThrown', 118: 'SpecialUnarmed', 123: 'UseStandingLoop',
-  124: 'ChannelCastDirected', 125: 'ChannelCastOmni',
-};
-
-export function kitAnimationName(anim: number | undefined): string | null {
-  return anim === undefined ? null : KIT_ANIMATIONS[anim] ?? null;
+// The clips a kit's animation plays (see VisualKit.animClips), or null.
+export function kitClips(kit: VisualKit | undefined): string[] | null {
+  return kit?.animClips?.length ? kit.animClips : null;
 }
 
 // The M2 attachment each kit slot's effect sits on in the client. A model
@@ -175,11 +180,13 @@ export function castKit(visual: SpellVisual, cast: Pick<CastGlow, 'release' | 'c
 // colour. Their other parameters are unused. 14 makes the unit see-through:
 // its first parameter (0 to 1) times the model's own opacity, reached over
 // its third parameter (seconds; a second when 0), the newest such kit
-// winning (Shadowform).
+// winning (Shadowform). A harmful spell's colours skip creatures flagged
+// SPELL_ATTACKABLE (CREATURE_TYPE_FLAG_SPELL_ATTACKABLE).
 const COLOR_PROCEDURE = 1;
 const COLOR_FLASH_PROCEDURE = 13;
 const ALPHA_PROCEDURE = 14;
 export const DEFAULT_ALPHA_FADE_MS = 1000;
+export const CREATURE_SPELL_ATTACKABLE = 0x40;
 
 export interface ColorFlash {
   color: number;
@@ -197,7 +204,7 @@ export function kitColor(kit: VisualKit): number | null {
 // fades to that, or null.
 export function kitAlpha(kit: VisualKit): { alpha: number; fadeMs: number } | null {
   const proc = kit.procs?.find((candidate) => candidate.code === ALPHA_PROCEDURE);
-  if (!proc || !(proc.params[0] > 0 && proc.params[0] <= 1)) return null;
+  if (!proc || !(proc.params[0] >= 0 && proc.params[0] <= 1)) return null;
   return { alpha: proc.params[0], fadeMs: proc.params[2] > 0 ? proc.params[2] * 1000 : DEFAULT_ALPHA_FADE_MS };
 }
 
@@ -206,6 +213,63 @@ export function kitColorFlash(kit: VisualKit): ColorFlash | null {
   const proc = kit.procs?.find((candidate) => candidate.code === COLOR_FLASH_PROCEDURE);
   if (!proc) return null;
   return { color: Math.round(proc.params[0]) & 0xffffff, holdMs: proc.params[1] * 1000, fadeMs: proc.params[2] * 1000 };
+}
+
+// Procedure 8 trails a unit's drawn weapons through its next swing: its
+// first parameter the colour (0xRRGGBB), its third how long the blade
+// leaves a trail (ms), its fourth the trail's opacity (0 to 255).
+const WEAPON_TRAIL_PROCEDURE = 8;
+
+export interface WeaponTrail {
+  color: number;
+  alpha: number;
+  durationMs: number;
+}
+
+export function kitWeaponTrail(kit: VisualKit): WeaponTrail | null {
+  const proc = kit.procs?.find((candidate) => candidate.code === WEAPON_TRAIL_PROCEDURE);
+  if (!proc || !(proc.params[2] > 0)) return null;
+  return { color: Math.round(proc.params[0]) & 0xffffff, alpha: Math.min(255, Math.max(0, proc.params[3])) / 255, durationMs: proc.params[2] };
+}
+
+// Procedure 11 freezes the unit's animation while the kit plays (Freezing
+// Trap, Hungering Cold): at its first parameter's time into it (seconds),
+// or where it is when 0.
+const FREEZE_PROCEDURE = 11;
+
+export function kitFreeze(kit: VisualKit): { atSeconds: number | null } | null {
+  const proc = kit.procs?.find((candidate) => candidate.code === FREEZE_PROCEDURE);
+  return proc ? { atSeconds: proc.params[0] > 0 ? proc.params[0] : null } : null;
+}
+
+// Procedure 15 fades the unit for a moment: to its first parameter times
+// its opacity over half a second, held for its fourth parameter (ms), then
+// back over its third (ms). Its second parameter, a fade type, must be
+// under 12.
+const FADE_PROCEDURE = 15;
+export const PROCEDURAL_FADE_MS = 500;
+const MAX_FADE_TYPE = 12;
+
+export interface ProceduralFade {
+  alpha: number;
+  holdMs: number;
+  backMs: number;
+}
+
+export function kitFade(kit: VisualKit): ProceduralFade | null {
+  const proc = kit.procs?.find((candidate) => candidate.code === FADE_PROCEDURE);
+  if (!proc || !(proc.params[1] < MAX_FADE_TYPE)) return null;
+  return { alpha: Math.min(1, Math.max(0, proc.params[0])), holdMs: Math.max(0, proc.params[3]), backMs: Math.max(0, proc.params[2]) };
+}
+
+// A procedural fade's opacity `elapsedMs` after it began, or null once over.
+export function fadeAlpha(fade: ProceduralFade, elapsedMs: number): number | null {
+  if (elapsedMs < 0) return null;
+  if (elapsedMs < PROCEDURAL_FADE_MS) return 1 - (1 - fade.alpha) * (elapsedMs / PROCEDURAL_FADE_MS);
+  const back = elapsedMs - PROCEDURAL_FADE_MS - fade.holdMs;
+  if (back < 0) return fade.alpha;
+  if (back >= fade.backMs) return null;
+  return fade.alpha + (1 - fade.alpha) * (back / fade.backMs);
 }
 
 // A flash's colour `elapsedMs` after it began: its own while it holds, then

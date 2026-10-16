@@ -197,10 +197,17 @@ export function buildUnitDocument(model, { name, textureFor, scale = 1, alpha = 
         .setIndices(accessor('SCALAR', Uint16Array.from(slice)))
         .setMaterial(material));
     }
-    joint.addChild(document.createNode(`${name}-${attachment.role}-${attachment.sheath ?? 'worn'}`)
+    const item = document.createNode(`${name}-${attachment.role}-${attachment.sheath ?? 'worn'}`)
       .setTranslation(attachment.position.map((value, axis) => value - pivot[axis]))
       .setMesh(itemMesh)
-      .setExtras({ wowItem: attachment.role, wowSheath: attachment.sheath ?? null }));
+      .setExtras({ wowItem: attachment.role, wowSheath: attachment.sheath ?? null });
+    // A drawn weapon's blade, bottom and top, for a swing's trail.
+    if (attachment.trail && attachment.sheath === 'drawn') {
+      for (const end of ['bottom', 'top']) {
+        item.addChild(document.createNode(`${name}-${attachment.role}-${end}`).setTranslation(attachment.trail[end]).setExtras({ wowTrail: end }));
+      }
+    }
+    joint.addChild(item);
   });
 
   // Empty nodes where spell effects go, moving with their bone.

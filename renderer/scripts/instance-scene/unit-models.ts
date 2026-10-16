@@ -59,6 +59,9 @@ export interface UnitLook {
   color: number | null;
   alpha: number;
   indoor?: IndoorLook;
+  // Its animation held still (a kit's freeze): at this time into its loop
+  // (seconds), or where it is when null.
+  freeze?: { atSeconds: number | null } | null;
 }
 
 // A unit's light indoors, and how far its light's direction leans from the
@@ -142,10 +145,10 @@ export interface UnitModelPose {
   // Recent attacks came from real events, so no made-up timed strikes.
   eventDriven?: boolean;
   // Animations the spell's kits name: a loop while casting or channelling,
-  // and a one-off as a spell fires or lands (clip names; skipped if the
-  // model lacks them).
-  kitLoop?: string | null;
-  kitOnce?: string | null;
+  // and a one-off as a spell fires or lands or a cast begins (clip names,
+  // the first the model has winning; skipped if it has none).
+  kitLoop?: string[] | null;
+  kitOnce?: string[] | null;
   // A mounted player's mount model: the mount moves and wears the ring, and
   // the rider sits on its saddle. On foot until the mount's model is ready.
   mountUrl?: string | null;
@@ -278,6 +281,10 @@ interface UnitInstance {
   // and spell release events by name ('$CSL').
   effectAttachments: Map<number, Object3D>;
   effectEvents: Map<string, Object3D>;
+  // Its drawn weapons' blades (bottom and top), for swing trails.
+  blades: Array<{ item: Object3D; bottom: Object3D; top: Object3D }>;
+  // Whether a kit holds its animation still.
+  frozen: boolean;
   // How its spells change its model (UnitLook), as a key, and the shared
   // materials swapped out for changed copies, by mesh.
   look: string;
@@ -750,16 +757,24 @@ export class UnitModelLayer {
       model,
       effectAttachments: new Map(),
       effectEvents: new Map(),
+      blades: [],
+      frozen: false,
       look: '',
       changed: new Map(),
       sitting: null,
     };
     model.traverse((object) => {
       if (object.userData.wowSheath) unit.sheathItems.push(object);
+      // Weapons ride on the model's top node, so their blades are found here.
+      if (object.userData.wowTrail === 'bottom') {
+        const top = object.parent?.children.find((sibling) => sibling.userData.wowTrail === 'top');
+        if (object.parent && top) unit.blades.push({ item: object.parent, bottom: object, top });
+      }
     });
     skeleton.traverse((object) => {
       if (typeof object.userData.wowAttachment === 'number') unit.effectAttachments.set(object.userData.wowAttachment, object);
       if (typeof object.userData.wowEvent === 'string') unit.effectEvents.set(object.userData.wowEvent, object);
+
     });
     this.pose(unit);
     // The clone gives each skinned part its own copy of the skeleton; parts
@@ -833,7 +848,7 @@ export class UnitModelLayer {
         : flight ? { loop: flight, strike: null } : getStanceClips(stance, pose.weapons, unit.template.clipNames!);
     // Standing or fighting, a cast or channel holds the pose its kit names.
     const still = stance !== 'walk' && stance !== 'run' && stance !== 'dead';
-    const kitLoop = still && !seated && pose.kitLoop && clips.has(pose.kitLoop) ? pose.kitLoop : null;
+    const kitLoop = still && !seated ? pose.kitLoop?.find((name) => clips.has(name)) ?? null : null;
     if (kitLoop) chosen.loop = kitLoop;
     if (stance !== unit.stance || chosen.loop !== unit.loopName) {
       unit.stance = stance;
@@ -852,8 +867,8 @@ export class UnitModelLayer {
     const fighting = stance === 'melee' || stance === 'ranged' || stance === 'cast';
     if (seated) {
       // No swings or casting poses in the saddle or on the ground.
-    } else if (still && pose.kitOnce && clips.has(pose.kitOnce)) {
-      this.playStrike(unit, pose.kitOnce);
+    } else if (still && pose.kitOnce?.some((name) => clips.has(name))) {
+      this.playStrike(unit, pose.kitOnce.find((name) => clips.has(name))!);
     } else if (pose.strike && (fighting || stance === 'stand')) {
       // A real attack: the clip for what was done, whatever the stance.
       const strike = getStanceClips(pose.strike, pose.weapons, unit.template.clipNames!).strike;
@@ -917,7 +932,33 @@ export class UnitModelLayer {
   // Changes units' models as their spells' kits ask (by unit ID); units
   // left out go back to their models' own look.
   setLooks(looks: ReadonlyMap<string, UnitLook>): void {
-    for (const [id, unit] of this.units) this.setLook(unit, looks.get(id) ?? null);
+    for (const [id, unit] of this.units) {
+      const look = looks.get(id) ?? null;
+      this.setFreeze(unit, look?.freeze ?? null);
+      this.setLook(unit, look);
+    }
+  }
+
+  // Holds a unit's animation still while a kit freezes it, at the kit's
+  // time into its loop where it names one.
+  private setFreeze(unit: UnitInstance, freeze: { atSeconds: number | null } | null): void {
+    if (Boolean(freeze) === unit.frozen) return;
+    unit.frozen = Boolean(freeze);
+    if (freeze?.atSeconds !== null && freeze?.atSeconds !== undefined && unit.loop) {
+      unit.loop.time = Math.min(freeze.atSeconds, unit.loop.getClip().duration);
+    }
+    unit.mixer.timeScale = unit.frozen ? 0 : 1;
+  }
+
+  // A drawn unit's blades (bottom and top, server coordinates) of the
+  // weapons it holds drawn.
+  bladesOf(id: string): Array<[Point3, Point3]> {
+    const unit = this.units.get(id);
+    if (!unit) return [];
+    return unit.blades.filter(({ item }) => item.visible).map(({ item, bottom, top }) => {
+      item.updateWorldMatrix(true, true);
+      return [threeToServer(scratchVector.setFromMatrixPosition(bottom.matrixWorld)), threeToServer(scratchVector.setFromMatrixPosition(top.matrixWorld))];
+    });
   }
 
   // Multiplies the unit's materials by a colour and an opacity, on copies

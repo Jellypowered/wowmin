@@ -140,7 +140,10 @@ test('builds a skinned GLB document: joints at pivots, every animated channel in
     name: 'test',
     textureFor: () => null,
     scale: 1.5,
-    attachments: [{ bone: 1, position: [0.2, 0, 1.5], mesh: sword, textureFor: () => null, role: 'mainHand', sheath: 'drawn' }],
+    attachments: [{
+      bone: 1, position: [0.2, 0, 1.5], mesh: sword, textureFor: () => null, role: 'mainHand', sheath: 'drawn',
+      trail: { bottom: [0, 0, 0.1], top: [0, 0, 1.2] },
+    }],
     points: [{ attachment: 22, bone: 1, position: [0.1, -0.4, 1.2] }, { attachment: 18, bone: 9, position: [0, 0, 2] }],
   });
   const root = document.getRoot();
@@ -160,6 +163,9 @@ test('builds a skinned GLB document: joints at pivots, every animated channel in
   const item = skin.listJoints()[1].listChildren()[0];
   assert.deepEqual(item.getTranslation(), [0.2, 0, 0]);
   assert.deepEqual(item.getExtras(), { wowItem: 'mainHand', wowSheath: 'drawn' });
+  // A drawn weapon carries its blade's bottom and top for swing trails.
+  assert.deepEqual(item.listChildren().map((child) => [child.getExtras().wowTrail, child.getTranslation()]),
+    [['bottom', [0, 0, 0.1]], ['top', [0, 0, 1.2]]]);
   // Effect points ride on their bone too; one on a missing bone is skipped.
   const hand = skin.listJoints()[1].listChildren()[1];
   assert.deepEqual(hand.getExtras(), { wowAttachment: 22 });

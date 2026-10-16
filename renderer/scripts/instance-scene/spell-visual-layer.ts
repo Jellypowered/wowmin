@@ -8,11 +8,13 @@ import { type ChainDraw, ChainLightning } from './chain-ribbons';
 import { useServerAxes } from './iso-camera';
 import { EffectInstance, type EffectPlacement, type EffectTemplate, EffectTemplateCache, type EffectView, getEffectView, type MissileClips } from './m2-effect';
 import { type FlightFrame, MissileFlight } from '../utils/missile-flight';
+import { WeaponTrails } from './weapon-trails';
 import type { UnitAnchor } from './spell-effects';
 import type { UnitLook } from './unit-models';
 import {
   AREA_ART_SCALE, areaRain, artForSchool, castKit, type ColorFlash, DEFAULT_ALPHA_FADE_MS, DIRECTED_HAND_ATTACHMENT, flashColor, groundSlot,
-  kitAlpha, kitAnimationName, kitColor, kitColorFlash, MISSILE_HEIGHT_SHARE, missileAttachment, missileOffset, RAIN_MAX_DELAY_MS, rainPoint,
+  CREATURE_SPELL_ATTACKABLE, fadeAlpha, kitAlpha, kitClips, kitColor, kitColorFlash, kitFade, kitFreeze, kitWeaponTrail, KIT_WAITS_FOR_BOLT,
+  MISSILE_HEIGHT_SHARE, missileAttachment, missileOffset, type ProceduralFade, RAIN_MAX_DELAY_MS, rainPoint,
   slotAttachment, type SpellVisual, type UnitAnchorRole, type VisualKit, type VisualMissile, type VisualPoints,
 } from '../utils/spell-kits';
 
@@ -44,6 +46,10 @@ export interface UnitInfo {
   // Where a segment first meets the ground or a building, as a share of its
   // length, or null.
   intersect: (from: Point3, to: Point3) => number | null;
+  // A drawn unit's blades (bottom, top) of the weapons it holds drawn.
+  blades: (unit: UnitKey) => Array<[Point3, Point3]>;
+  // A creature's creature_template type_flags (0 for players).
+  creatureTypeFlags: (unit: UnitKey) => number;
 }
 
 // A missile waits at most this long for its caster's animation to let it go.
@@ -90,10 +96,11 @@ function offsetFrom(origin: Point3, offset: Point3, yaw: number, up = 0): Point3
 }
 
 // Animations a unit should play for its spells: a loop while casting or
-// channelling, and a one-off as a spell fires or lands.
+// channelling, and a one-off as a spell fires or lands or a cast begins;
+// each the clips to try, in order.
 export interface KitAnimation {
-  loop: string | null;
-  once: string | null;
+  loop: string[] | null;
+  once: string[] | null;
 }
 
 interface PlayingEffect {
@@ -126,7 +133,7 @@ export class SpellVisualLayer {
   private readonly templates: EffectTemplateCache;
   private readonly playing: PlayingEffect[] = [];
   private readonly missiles = new Map<Projectile, PlayingMissile>();
-  private readonly casts = new Map<CastGlow, { kit: VisualKit; effects: PlayingEffect[]; startedAt: number }>();
+  private readonly casts = new Map<CastGlow, { kit: VisualKit; effects: PlayingEffect[]; startedAt: number; harmful: boolean }>();
   private readonly seenImpacts = new WeakSet<Impact>();
   // Areas being played: their lasting effects, and what they rain.
   // An impact area kit waits for the missile to reach the ground point.
@@ -140,21 +147,24 @@ export class SpellVisualLayer {
   private lastUpdateAt = 0;
   // Aura art on units, by unit and state kit: its effects, and the pose it
   // names (an aura's pose wins over a cast's: a stunned unit isn't casting).
-  private readonly states = new Map<string, { unit: UnitKey; kit: VisualKit; effects: PlayingEffect[]; startedAt: number }>();
+  private readonly states = new Map<string, { unit: UnitKey; kit: VisualKit; effects: PlayingEffect[]; startedAt: number; harmful: boolean }>();
   // Colour flashes kits have started on units (kit procedure 13).
   private readonly flashes = new Map<UnitKey, { flash: ColorFlash; startAt: number }>();
   // Units' see-through amounts as they fade (kit procedure 14), and when
   // each was last stepped.
   private readonly alphas = new Map<UnitKey, { alpha: number; fadeMs: number; at: number }>();
-  private readonly onceAnimations = new Map<UnitKey, string>();
+  private readonly onceAnimations = new Map<UnitKey, string[]>();
   private particleCount = 0;
   // This frame's units. Effects that follow a unit read it every frame, so
   // they keep up with it (each frame brings new positions).
   private units: UnitInfo = {
     anchor: () => null, attachment: () => null, isDrawn: () => false, scale: () => 1, height: () => 2, facing: () => 0, ground: (center) => center,
-    releaseMs: () => null, intersect: () => null,
+    releaseMs: () => null, intersect: () => null, blades: () => [], creatureTypeFlags: () => 0,
   };
   private readonly chains: ChainLightning;
+  private readonly trails = new WeaponTrails();
+  // Units' procedural fades (kit procedure 15), from when each began.
+  private readonly fades = new Map<UnitKey, { fade: ProceduralFade; startAt: number }>();
   // Spells that auras with a bearer area cast (Starfall's 30 yard search),
   // whose own rings the steady area replaces.
   private readonly bearerTriggers = new Set<number>();
@@ -162,12 +172,12 @@ export class SpellVisualLayer {
   constructor(private readonly onLoaded: () => void) {
     this.templates = new EffectTemplateCache(onLoaded, 'spell effect');
     this.chains = new ChainLightning(onLoaded);
-    this.group.add(this.chains.group);
+    this.group.add(this.chains.group, this.trails.group);
     useServerAxes(this.group);
   }
 
   get count(): number {
-    return this.playing.length + this.chains.count;
+    return this.playing.length + this.chains.count + this.trails.count;
   }
 
   get particles(): number {
@@ -212,21 +222,26 @@ export class SpellVisualLayer {
   }
 
   // How each unit's model looks now, as the client changes it: its colour
-  // a flash while one lasts, else the newest playing kit's that has one;
-  // its see-through amount the newest playing kit's, faded to over that
-  // kit's time (and back to opaque over the default). Units left out look
-  // as their models do.
+  // a flash while one lasts, else the newest playing kit's that has one (a
+  // harmful spell's skipping creatures flagged so); its see-through amount
+  // the newest playing kit's, faded to over that kit's time (and back to
+  // opaque over the default), times any procedural fade; and its animation
+  // held still while a kit freezes it. Units left out look as their models
+  // do.
   unitLooks(now: number): Map<UnitKey, UnitLook> {
     const colors = new Map<UnitKey, { color: number; since: number }>();
     const targets = new Map<UnitKey, { alpha: number; fadeMs: number; since: number }>();
-    const consider = (unit: UnitKey, kit: VisualKit, since: number) => {
+    const freezes = new Map<UnitKey, { atSeconds: number | null; since: number }>();
+    const consider = (unit: UnitKey, kit: VisualKit, since: number, harmful: boolean) => {
       const color = kitColor(kit);
-      if (color !== null && since >= (colors.get(unit)?.since ?? -Infinity)) colors.set(unit, { color, since });
+      if (color !== null && !this.colorSkips(unit, harmful) && since >= (colors.get(unit)?.since ?? -Infinity)) colors.set(unit, { color, since });
       const alpha = kitAlpha(kit);
       if (alpha && since >= (targets.get(unit)?.since ?? -Infinity)) targets.set(unit, { ...alpha, since });
+      const freeze = kitFreeze(kit);
+      if (freeze && since >= (freezes.get(unit)?.since ?? -Infinity)) freezes.set(unit, { ...freeze, since });
     };
-    for (const { unit, kit, startedAt } of this.states.values()) consider(unit, kit, startedAt);
-    for (const [cast, { kit, startedAt }] of this.casts) if (!cast.release) consider(cast.caster, kit, startedAt);
+    for (const { unit, kit, startedAt, harmful } of this.states.values()) consider(unit, kit, startedAt, harmful);
+    for (const [cast, { kit, startedAt, harmful }] of this.casts) if (!cast.release) consider(cast.caster, kit, startedAt, harmful);
     const looks = new Map<UnitKey, UnitLook>();
     const look = (unit: UnitKey): UnitLook => {
       let entry = looks.get(unit);
@@ -253,7 +268,19 @@ export class SpellVisualLayer {
       this.alphas.set(unit, { alpha, fadeMs, at: now });
       look(unit).alpha = alpha;
     }
+    for (const [unit, { fade, startAt }] of this.fades) {
+      const alpha = fadeAlpha(fade, now - startAt);
+      if (alpha === null) this.fades.delete(unit);
+      else look(unit).alpha *= alpha;
+    }
+    for (const [unit, { atSeconds }] of freezes) look(unit).freeze = { atSeconds };
     return looks;
+  }
+
+  // Whether the client leaves a spell's colours off a unit: a harmful
+  // spell's, on a creature flagged so.
+  private colorSkips(unit: UnitKey, harmful: boolean): boolean {
+    return harmful && Boolean(this.units.creatureTypeFlags(unit) & CREATURE_SPELL_ATTACKABLE);
   }
 
   // The animations kits ask of each unit now; one-offs are handed out once.
@@ -261,11 +288,11 @@ export class SpellVisualLayer {
     const animations = new Map<UnitKey, KitAnimation>();
     for (const [cast, { kit }] of this.casts) {
       if (cast.release) continue;
-      const loop = kitAnimationName(kit.anim);
+      const loop = kitClips(kit);
       if (loop) animations.set(cast.caster, { loop, once: null });
     }
     for (const { unit, kit } of this.states.values()) {
-      const loop = kitAnimationName(kit.anim);
+      const loop = kitClips(kit);
       if (loop) animations.set(unit, { loop, once: null });
     }
     for (const [unit, once] of this.onceAnimations) {
@@ -287,7 +314,7 @@ export class SpellVisualLayer {
       for (const area of store.areas) this.startArea(area, now, units);
       for (const cast of store.casts) this.startCast(cast, now);
       for (const projectile of store.projectiles) this.startMissile(projectile, now);
-      for (const impact of store.impacts) this.startImpact(impact, now);
+      for (const impact of store.impacts) this.startImpact(impact, now, store.chains);
     }
     this.syncStates(store ? auras : new Map(), now, units);
     // Casts the store has ended: held effects stop; release flashes play out.
@@ -345,6 +372,7 @@ export class SpellVisualLayer {
     this.group.updateWorldMatrix(true, false);
     const view = getEffectView(camera, this.group);
     this.updateChains(store?.chains ?? [], now, view, seconds);
+    this.trails.update(now, this.units.blades);
     const budget = { left: PARTICLE_BUDGET };
     for (let index = this.playing.length - 1; index >= 0; index -= 1) {
       const effect = this.playing[index];
@@ -461,10 +489,17 @@ export class SpellVisualLayer {
   // any colour flash it starts there. A slot the unit's model lacks shows
   // nothing, as in the client; a unit not drawn as a model shows each at
   // WowMin's estimate. The world effect stands at the unit's feet, and
-  // follows it only for a spell that roots it (`follows`).
-  private playKit(kit: VisualKit, templates: Array<EffectTemplate | null>, unit: UnitKey, now: number, loop: boolean, follows = false): PlayingEffect[] {
+  // follows it only for a spell that roots it. A kit's procedures start
+  // here too: a colour flash, a weapon trail, a procedural fade.
+  private playKit(kit: VisualKit, templates: Array<EffectTemplate | null>, unit: UnitKey, now: number, loop: boolean,
+    art: SpellVisual | null = null): PlayingEffect[] {
+    const follows = Boolean(art?.rootsUnit);
     const flash = kitColorFlash(kit);
-    if (flash) this.flashes.set(unit, { flash, startAt: now });
+    if (flash && !this.colorSkips(unit, Boolean(art?.harmful))) this.flashes.set(unit, { flash, startAt: now });
+    const trail = kitWeaponTrail(kit);
+    if (trail) this.trails.start(unit, trail, now);
+    const fade = kitFade(kit);
+    if (fade) this.fades.set(unit, { fade, startAt: now });
     const drawn = this.units.isDrawn(unit);
     return kit.effects.flatMap((effect, index) => {
       const template = templates[index];
@@ -509,11 +544,13 @@ export class SpellVisualLayer {
     if (!kit) return;
     const templates = this.kitTemplates(kit);
     if (!templates) return;
-    this.casts.set(cast, { kit, effects: this.playKit(kit, templates, cast.caster, now, !cast.release, art?.rootsUnit), startedAt: now });
-    if (cast.release) {
-      const once = kitAnimationName(kit.anim);
-      if (once) this.onceAnimations.set(cast.caster, once);
-    }
+    this.casts.set(cast, {
+      kit, effects: this.playKit(kit, templates, cast.caster, now, !cast.release, art), startedAt: now, harmful: Boolean(art?.harmful),
+    });
+    // A cast plays its kit's animation once as it fires; a cast beginning
+    // plays its start animation once before holding its loop.
+    const once = cast.release ? kitClips(kit) : !cast.channeled && kit.startClips?.length ? kit.startClips : null;
+    if (once) this.onceAnimations.set(cast.caster, once);
   }
 
   // Plays each shown unit's aura art and colour (its spells' state kits,
@@ -521,15 +558,15 @@ export class SpellVisualLayer {
   // playing a gone aura's state done kit once. A unit whose list went
   // (stale, or no longer shown) ends its art without one.
   private syncStates(auras: ReadonlyMap<UnitKey, readonly number[]>, now: number, units: UnitInfo): void {
-    const wanted = new Map<string, { unit: UnitKey; kit: VisualKit; follows: boolean }>();
+    const wanted = new Map<string, { unit: UnitKey; kit: VisualKit; visual: SpellVisual }>();
     for (const [unit, spellIds] of auras) {
       if (!units.anchor(unit, 'feet')) continue;
       for (const spellId of spellIds) {
         const visual = this.visual(spellId);
         const kit = visual?.kits.state;
-        if (!kit || (!kit.effects.length && kit.anim < 0 && kitColor(kit) === null && !kitAlpha(kit))) continue;
+        if (!kit || (!kit.effects.length && kit.anim < 0 && !kit.procs?.length)) continue;
         const key = `${unit}|${kit.id}`;
-        if (!wanted.has(key)) wanted.set(key, { unit, kit, follows: Boolean(visual.rootsUnit) });
+        if (!wanted.has(key)) wanted.set(key, { unit, kit, visual });
       }
     }
     for (const [key, state] of this.states) {
@@ -537,11 +574,13 @@ export class SpellVisualLayer {
       for (const effect of state.effects) effect.instance.stop(now);
       this.states.delete(key);
     }
-    for (const [key, { unit, kit, follows }] of wanted) {
+    for (const [key, { unit, kit, visual }] of wanted) {
       if (this.states.has(key)) continue;
       const templates = this.kitTemplates(kit);
       if (!templates) continue;
-      this.states.set(key, { unit, kit, effects: this.playKit(kit, templates, unit, now, true, follows), startedAt: now });
+      this.states.set(key, {
+        unit, kit, effects: this.playKit(kit, templates, unit, now, true, visual), startedAt: now, harmful: Boolean(visual.harmful),
+      });
     }
     const seen = new Map<UnitKey, ReadonlySet<number>>();
     for (const [unit, spellIds] of auras) {
@@ -551,9 +590,10 @@ export class SpellVisualLayer {
       if (!before || !units.anchor(unit, 'feet')) continue;
       for (const spellId of before) {
         if (current.has(spellId)) continue;
-        const kit = this.visual(spellId)?.kits.stateDone;
+        const visual = this.visual(spellId);
+        const kit = visual?.kits.stateDone;
         const templates = kit && this.kitTemplates(kit);
-        if (kit && templates) this.playKit(kit, templates, unit, now, false);
+        if (kit && templates) this.playKit(kit, templates, unit, now, false, visual);
       }
     }
     this.lastAuras = seen;
@@ -660,8 +700,8 @@ export class SpellVisualLayer {
     const missile = art?.missile;
     if (!missile || !this.template(missile.id)) return;
     let releaseAt = projectile.startAt;
-    const clip = missile.waitsForRelease ? kitAnimationName(art.kits.cast?.anim) : null;
-    const releaseMs = clip ? this.units.releaseMs(projectile.source, clip) : null;
+    const clips = missile.waitsForRelease ? kitClips(art.kits.cast) ?? [] : [];
+    const releaseMs = clips.map((clip) => this.units.releaseMs(projectile.source, clip)).find((ms) => ms !== null) ?? null;
     if (releaseMs !== null) releaseAt += Math.min(MAX_RELEASE_WAIT_MS, releaseMs);
     this.missiles.set(projectile, { releaseAt, copies: null, targeting: [] });
   }
@@ -709,7 +749,7 @@ export class SpellVisualLayer {
     });
     const targetingKit = art.kits.missileTargeting;
     const targetingTemplates = targetingKit ? this.kitTemplates(targetingKit) : null;
-    if (targetingKit && targetingTemplates) playing.targeting = this.playKit(targetingKit, targetingTemplates, projectile.target, now, true);
+    if (targetingKit && targetingTemplates) playing.targeting = this.playKit(targetingKit, targetingTemplates, projectile.target, now, true, art);
   }
 
   // Where a missile aims on its target this frame; one following the
@@ -723,18 +763,24 @@ export class SpellVisualLayer {
   }
 
   // A spell landing on a unit: on its caster the caster impact kit, on
-  // anyone else the target impact kit, else the impact kit.
-  private startImpact(impact: Impact, now: number): void {
+  // anyone else the target impact kit, else the impact kit. A kit that
+  // waits for its chain's bolt plays when the bolt to the unit appears.
+  private startImpact(impact: Impact, now: number, links: readonly ChainLink[]): void {
     if (this.seenImpacts.has(impact) || now < impact.at || !impact.kit) return;
     const art = this.art(impact.spellId, impact.schoolMask);
     const own = impact.target === impact.source ? art?.kits.casterImpact : art?.kits.targetImpact;
     const kit = own ?? art?.kits.impact;
     if (!kit) return;
+    if (kit.flags && kit.flags & KIT_WAITS_FOR_BOLT && art?.chain) {
+      const effect = art.chain.effects[0];
+      const link = links.find((candidate) => candidate.spellId === impact.spellId && candidate.to === impact.target);
+      if (effect && link && now < link.startAt + effect.delayMs + link.index * effect.linkDelayMs) return;
+    }
     const templates = this.kitTemplates(kit);
     if (!templates) return;
     this.seenImpacts.add(impact);
-    this.playKit(kit, templates, impact.target, now, false, art?.rootsUnit);
-    const once = kitAnimationName(kit.anim);
+    this.playKit(kit, templates, impact.target, now, false, art);
+    const once = kitClips(kit);
     if (once) this.onceAnimations.set(impact.target, once);
   }
 }

@@ -241,9 +241,8 @@ test('picks the kit a cast plays, its body slots, and the animations it names', 
   assert.equal(kits.groundSlot('base'), 'ground');
   assert.equal(kits.groundSlot('head'), 'caster');
   assert.equal(kits.groundSlot('chest'), null);
-  assert.equal(kits.kitAnimationName(125), 'ChannelCastOmni');
-  assert.equal(kits.kitAnimationName(9), 'CombatWound');
-  assert.equal(kits.kitAnimationName(-1), null);
+  assert.deepEqual(plain(kits.kitClips({ ...kit(124), animClips: ['ChannelCastDirected', 'ReadySpellOmni'] })), ['ChannelCastDirected', 'ReadySpellOmni']);
+  assert.equal(kits.kitClips(undefined), null);
 });
 
 test('rains the area model procedure 9 names in a lasting area, at its rate, more near the middle', () => {
@@ -421,6 +420,36 @@ test('exports a missile\'s points and offsets, the missile targeting kit, roots,
   assert.equal(visuals.areaModel(9), 'Spells\\Blizzard_Impact_Base.m2');
 });
 
+test('exports a kit\'s flags and animation clips with their fallbacks, and whether a spell is harmful', async () => {
+  const { SpellVisuals } = await load('spell-visuals.mjs');
+  const files = {
+    'DBFilesClient\\Spell.dbc': dbc(234, [{ 0: 116, 131: 13, 86: 6 }, { 0: 139, 131: 14, 16: 0x100, 86: 6 }]),
+    'DBFilesClient\\SpellVisual.dbc': dbc(32, [{ 0: 13, 1: 800, 2: 801 }, { 0: 14, 2: 802 }]),
+    'DBFilesClient\\SpellVisualKit.dbc': dbc(38, [
+      kitRecord(800, { 1: 51, 2: 53, 37: 0x1 }),
+      kitRecord(801, { 2: 53, 37: 0x4 }),
+      kitRecord(802, { 2: 124 }),
+    ]),
+    'DBFilesClient\\AnimationData.dbc': dbc(8, [
+      { 0: 51, 1: 'ReadySpellDirected', 5: 52 }, { 0: 52, 1: 'ReadySpellOmni', 5: 0 },
+      { 0: 53, 1: 'SpellCastDirected', 5: 54 }, { 0: 54, 1: 'SpellCastOmni', 5: 33 }, { 0: 33, 1: 'Stop', 5: 0 },
+      { 0: 124, 1: 'ChannelCastDirected', 5: 124 },
+    ]),
+  };
+  const visuals = new SpellVisuals((name) => files[name] ?? null);
+  const frostbolt = visuals.forSpell(116);
+  assert.equal(frostbolt.kits.precast.flags, 0x1);
+  assert.deepEqual(plain(frostbolt.kits.precast.animClips), ['SpellCastDirected', 'SpellCastOmni', 'Stop']);
+  assert.deepEqual(plain(frostbolt.kits.precast.startClips), ['ReadySpellDirected', 'ReadySpellOmni']);
+  // Raw (flag 0x4): no fallback.
+  assert.deepEqual(plain(frostbolt.kits.cast.animClips), ['SpellCastDirected']);
+  assert.equal(frostbolt.harmful, true);
+  // Its own fallback ends the chain; a helpful target flag wins over an enemy target.
+  const renew = visuals.forSpell(139);
+  assert.deepEqual(plain(renew.kits.cast.animClips), ['ChannelCastDirected']);
+  assert.equal(renew.harmful, undefined);
+});
+
 test('exports how a missile flies: its release, ground following, motion script, and gravity arc', async () => {
   const { SpellVisuals } = await load('spell-visuals.mjs');
   const files = {
@@ -547,7 +576,29 @@ test('kits colour their unit as the client does: procedure 1 while they play, 13
   assert.equal(kitColor(shadowform), 0x270042);
   assert.deepEqual(plain(kitAlpha(shadowform)), { alpha: 0.65, fadeMs: 2000 });
   assert.equal(kitAlpha(kit([{ code: 14, params: [0.5, 0, 0, 0] }])).fadeMs, DEFAULT_ALPHA_FADE_MS);
-  assert.equal(kitAlpha(kit([{ code: 14, params: [0, 0, 1, 0] }])), null);
+  // Fully see-through, as the client allows; past 1 is ignored.
+  assert.deepEqual(plain(kitAlpha(kit([{ code: 14, params: [0, 0, 1, 0] }]))), { alpha: 0, fadeMs: 1000 });
+  assert.equal(kitAlpha(kit([{ code: 14, params: [1.5, 0, 1, 0] }])), null);
+});
+
+test('kits trail weapons, freeze a unit, and fade it for a moment', () => {
+  const { fadeAlpha, kitClips, kitFade, kitFreeze, kitWeaponTrail } = loadModule('../renderer/scripts/utils/spell-kits.ts');
+  const kit = (procs, extra = {}) => ({ id: 1, anim: -1, effects: [], procs, ...extra });
+  // Heroic Strike's trail: colour, 1000 ms, opacity 100 of 255.
+  assert.deepEqual(plain(kitWeaponTrail(kit([{ code: 8, params: [14355216, 20, 1000, 100] }]))),
+    { color: 14355216, alpha: 100 / 255, durationMs: 1000 });
+  assert.equal(kitWeaponTrail(kit([{ code: 8, params: [14355216, 20, 0, 100] }])), null);
+  assert.deepEqual(plain(kitFreeze(kit([{ code: 11, params: [0.5, 0, 0, 0] }]))), { atSeconds: 0.5 });
+  assert.deepEqual(plain(kitFreeze(kit([{ code: 11, params: [0, 0, 0, 0] }]))), { atSeconds: null });
+  const fade = kitFade(kit([{ code: 15, params: [0.6, 2, 500, 1000] }]));
+  assert.deepEqual(plain(fade), { alpha: 0.6, holdMs: 1000, backMs: 500 });
+  near(fadeAlpha(fade, 250), 0.8, 'fading out');
+  near(fadeAlpha(fade, 1000), 0.6, 'held');
+  near(fadeAlpha(fade, 1750), 0.8, 'fading back');
+  assert.equal(fadeAlpha(fade, 2000), null);
+  assert.equal(kitFade(kit([{ code: 15, params: [0.6, 12, 500, 1000] }])), null);
+  assert.deepEqual(plain(kitClips(kit([], { animClips: ['SpellCastDirected', 'SpellCastOmni'] }))), ['SpellCastDirected', 'SpellCastOmni']);
+  assert.equal(kitClips(kit([])), null);
 });
 
 // A chain with nothing set but these, for the bolt tests.

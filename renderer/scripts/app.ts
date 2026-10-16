@@ -8338,12 +8338,19 @@ function drawInstanceCanvas(followPass: boolean): void {
   // Where the units shown stand, for combat effects: effects on units that
   // aren't shown (the mobs selector, other floors) are skipped.
   const combatPositions = new Map<UnitKey, Point3>();
+  // Creatures' type_flags, for the spell colours the client skips on some.
+  const creatureTypeFlags = new Map<UnitKey, number>();
   if (live) {
     for (const player of visiblePlayers) {
       const guid = instanceLivePositions.guidOf(player.name);
       if (guid !== null) combatPositions.set(unitKey(guid, false), [player.position_x, player.position_y, player.position_z]);
     }
-    for (const creature of creatures) combatPositions.set(unitKey(creature.guid, true), [creature.x, creature.y, creature.z]);
+    for (const creature of creatures) {
+      const key = unitKey(creature.guid, true);
+      combatPositions.set(key, [creature.x, creature.y, creature.z]);
+      const typeFlags = instanceCreatureInfo.get(creature.entry)?.typeFlags;
+      if (typeFlags) creatureTypeFlags.set(key, typeFlags);
+    }
   }
   const strikes = new Map(live ? instanceCombatEffects.advance(liveNow, (from, to) => {
     const start = combatPositions.get(from);
@@ -8360,7 +8367,7 @@ function drawInstanceCanvas(followPass: boolean): void {
     : new Set<string>();
   const effectsDrawn = sceneView?.setEffects(live && instanceView3d ? instanceCombatEffects : null, combatPositions, liveNow,
     live ? instanceLiveAuras.all(liveNow) : undefined, (spellId) => instanceSpellNames.isTaunt(spellId),
-    { glows: instanceShowGlows, circles: instanceShowCircles }) ?? 0;
+    { glows: instanceShowGlows, circles: instanceShowCircles }, (unit) => creatureTypeFlags.get(unit) ?? 0) ?? 0;
   sceneView?.setGameObjects(live && instanceView3d ? getInstanceGameObjectPoses(liveNow) : [], liveNow);
   const bossPositions = creatures
     .filter((creature) => isBossCreature(creature, instanceCreatureInfo.get(creature.entry)))

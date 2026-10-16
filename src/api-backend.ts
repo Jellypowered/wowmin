@@ -1183,8 +1183,9 @@ apiRouter.handle('map:getCreatureInfo', async (_event, entries: unknown): Promis
     flags_extra: number;
     npcflag: number;
     type: number;
+    type_flags: number;
   }>(
-    `SELECT entry, name, subname, minlevel, maxlevel, \`rank\`, unit_flags, flags_extra, npcflag, \`type\`
+    `SELECT entry, name, subname, minlevel, maxlevel, \`rank\`, unit_flags, flags_extra, npcflag, \`type\`, type_flags
        FROM ${escapeIdentifier(worldDb)}.\`creature_template\`
       WHERE entry IN (${ids.map(() => '?').join(', ')})`,
     ids,
@@ -1200,6 +1201,7 @@ apiRouter.handle('map:getCreatureInfo', async (_event, entries: unknown): Promis
     flagsExtra: Number(row.flags_extra) || 0,
     npcFlags: Number(row.npcflag) || 0,
     creatureType: Number(row.type) || 0,
+    typeFlags: Number(row.type_flags) || 0,
   }));
 });
 

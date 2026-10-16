@@ -808,10 +808,12 @@ export class InstanceSceneView {
   // Places the store's live effects for the next render; call after
   // setUnits, so hand points follow this frame's animation. Area taunts
   // (`isTaunt`) keep their floor area even when the client's art plays too.
-  // `aids` says which of WowMin's own aids to draw beside the client's art.
+  // `aids` says which of WowMin's own aids to draw beside the client's art;
+  // `creatureTypeFlags` gives a creature's type_flags (some colours skip
+  // some creatures).
   setEffects(store: CombatEffectStore | null, positions: ReadonlyMap<UnitKey, Point3>, now: number,
     auras?: ReadonlyMap<UnitKey, readonly number[]>, isTaunt: (spellId: number) => boolean = () => false,
-    aids: SpellAids = ALL_SPELL_AIDS): number {
+    aids: SpellAids = ALL_SPELL_AIDS, creatureTypeFlags: (unit: UnitKey) => number = () => 0): number {
     if (this.lost) return 0;
     const before = this.effects.count + this.spellVisuals.count;
     const anchor = (unit: UnitKey, role: UnitAnchorRole) => this.anchor(positions, unit, role);
@@ -825,6 +827,8 @@ export class InstanceSceneView {
       ground: (center, target) => this.groundUnder(center, target),
       releaseMs: (unit, clip) => this.units.releaseMsOf(unit, clip),
       intersect: (from, to) => this.intersect(from, to),
+      blades: (unit) => this.units.bladesOf(unit),
+      creatureTypeFlags,
     };
     this.spellVisuals.update(store, now, units, this.camera, auras);
     const looks = this.spellVisuals.unitLooks(now);

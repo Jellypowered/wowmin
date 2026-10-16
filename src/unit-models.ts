@@ -20,8 +20,9 @@ const BUILD_TIMEOUT_MS = 60000;
 // 8: creature displays' model opacity (a Shadowfiend's see-through look).
 // 9: sitting on the ground (SitGroundDown, SitGround, SitGroundUp).
 // 10: every attachment by M2 ID, and the spell release events ($CSL, $CSR,
-// $CST, $BWR), for the client's own effect and missile points, and when
-// each clip releases a missile.
+// $CST, $BWR), for the client's own effect and missile points, when each
+// clip releases a missile, more of the clips kits name, and drawn weapons'
+// blades for swing trails.
 export const UNIT_MODEL_CACHE_VERSION = 10;
 // Spell art (effect models and spell lookups) changes more often than unit
 // models, so it has its own version and folder, art-v<version>/, and can be
@@ -41,7 +42,8 @@ export const UNIT_MODEL_CACHE_VERSION = 10;
 // spell roots (its world effects follow the unit), whether its visual has a
 // chain effect, its chain's full SpellChainEffects record and combo, how its
 // missile flies (release, motion script, ground following, gravity arc),
-// and effects' Fly and Impact clips.
+// effects' Fly and Impact clips, and kits' flags and animation clips (with
+// their fallbacks) and whether the spell is harmful.
 export const SPELL_ART_CACHE_VERSION = 9;
 const SPELL_ART_KINDS = new Set<UnitModelRequest['kind']>(['effect', 'visual', 'spell', 'icon', 'gameobject', 'light']);
 const EXTENSIONS: Partial<Record<UnitModelRequest['kind'], string>> = { visual: 'json', spell: 'json', icon: 'png', light: 'json' };
