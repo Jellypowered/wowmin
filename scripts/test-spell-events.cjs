@@ -334,3 +334,17 @@ test('an area carries its missile speed, for its impact art to wait on', () => {
   store.advance(LIVE_RENDER_DELAY_MS, tenYards);
   assert.equal(store.areas[0].missileSpeed, 25);
 });
+
+test('a channel at a target holds a chain link until it ends or is cancelled', () => {
+  const store = new CombatEffectStore();
+  store.push(update([event({ spellId: 47857, schoolMask: 32, channeled: true, value: 5000 })]), 0);
+  store.advance(LIVE_RENDER_DELAY_MS, tenYards);
+  assert.deepEqual(plain(store.chains.map(({ caster, from, to, index, endAt }) => ({ caster, from, to, index, endAt }))),
+    [{ caster: 'p1', from: 'p1', to: 'c900', index: 0, endAt: LIVE_RENDER_DELAY_MS + 5000 }]);
+  // Past the usual link time, it holds.
+  store.advance(LIVE_RENDER_DELAY_MS + 4000, tenYards);
+  assert.equal(store.chains.length, 1);
+  store.push(update([event({ kind: 'castCancel', spellId: 47857, schoolMask: 32 })]), 4000);
+  store.advance(4000 + LIVE_RENDER_DELAY_MS, tenYards);
+  assert.equal(store.chains.length, 0);
+});

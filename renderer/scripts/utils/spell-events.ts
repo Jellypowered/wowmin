@@ -106,13 +106,17 @@ export interface AreaEffect {
 }
 
 // One link of a spell's chain: from the caster to its target (index 0), or
-// from one target on to the next it jumped to (Chain Heal, Chain Lightning).
+// from one target on to the next it jumped to (Chain Heal, Chain Lightning),
+// or a channel's, held from the caster to its target until it ends (`endAt`:
+// Drain Life).
 export interface ChainLink {
   spellId: number;
+  caster: UnitKey;
   from: UnitKey;
   to: UnitKey;
   index: number;
   startAt: number;
+  endAt?: number;
 }
 
 export interface CombatNumber {
@@ -370,6 +374,7 @@ export class CombatEffectStore {
         // A cancelled channel's area ends with it; a lasting area stays.
         this.areaList = this.areaList.filter((area) => !area.channeled || area.caster !== source || area.spellId !== event.spellId);
         this.ringList = this.ringList.filter((ring) => !ring.channeled || ring.caster !== source || ring.spellId !== event.spellId);
+        this.chainList = this.chainList.filter((link) => link.endAt === undefined || link.caster !== source || link.spellId !== event.spellId);
         return null;
       case 'castGo':
         return this.applyCastGo(event, source, target, color, at, distance);
@@ -480,7 +485,9 @@ export class CombatEffectStore {
     if (atOther && !event.channeled) {
       this.openChains = this.openChains.filter((chain) => chain.source !== source || chain.spellId !== event.spellId);
       this.openChains.push({ source, spellId: event.spellId, last: target!, visited: new Set([target!]), at });
-      this.chainList.push({ spellId: event.spellId, from: source, to: target!, index: 0, startAt: at });
+      this.chainList.push({ spellId: event.spellId, caster: source, from: source, to: target!, index: 0, startAt: at });
+    } else if (atOther && event.value > 0) {
+      this.chainList.push({ spellId: event.spellId, caster: source, from: source, to: target!, index: 0, startAt: at, endAt: at + event.value });
     }
     const kind = getCastStrikeKind(event);
     if (!kind) return null;
@@ -493,7 +500,7 @@ export class CombatEffectStore {
     const chain = this.openChains.find((open) => open.source === source && open.spellId === spellId);
     if (!chain || at - chain.at > CHAIN_JUMP_MS || chain.visited.has(target)) return;
     chain.visited.add(target);
-    this.chainList.push({ spellId, from: chain.last, to: target, index: chain.visited.size - 1, startAt: chain.at });
+    this.chainList.push({ spellId, caster: source, from: chain.last, to: target, index: chain.visited.size - 1, startAt: chain.at });
     chain.last = target;
   }
 
@@ -511,7 +518,7 @@ export class CombatEffectStore {
     // Instant areas stay a moment, so the layer sees them.
     this.areaList = this.areaList.filter((area) => Math.max(area.endAt, area.startAt + AREA_FLASH_MS) > now);
     this.numberList = this.numberList.filter((number) => number.at + NUMBER_LIFETIME_MS > now).slice(-MAX_NUMBERS);
-    this.chainList = this.chainList.filter((link) => link.startAt + CHAIN_LINK_MS > now).slice(-MAX_CHAIN_LINKS);
+    this.chainList = this.chainList.filter((link) => (link.endAt ?? link.startAt + CHAIN_LINK_MS) > now).slice(-MAX_CHAIN_LINKS);
     this.openChains = this.openChains.filter((chain) => now - chain.at <= CHAIN_JUMP_MS);
     for (const [key, aura] of this.auras) if (aura.endAt <= now) this.auras.delete(key);
     for (const [unit, at] of this.lastStrikeAt) if (now - at >= EVENT_DRIVEN_MS) this.lastStrikeAt.delete(unit);

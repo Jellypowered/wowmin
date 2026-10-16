@@ -1,3 +1,4 @@
+import type { SpellChain } from './lightning';
 import type { CastGlow, Point3 } from './spell-events';
 
 // The client's spell art as wowmin plays it: a spell's kits by stage, which
@@ -27,15 +28,19 @@ export type KitStage = 'precast' | 'cast' | 'channel' | 'impact' | 'casterImpact
   | 'missileTargeting' | 'instantArea' | 'impactArea' | 'persistentArea';
 
 // A chain drawn from the caster to its target and on to each target it
-// jumps to (SpellChainEffects): its texture (served as
-// /assets/models/icon/chain-<id>.png), width and texture length in yards,
-// and how long each link shows and the delay between links (ms).
-export interface SpellChain {
-  id: number;
-  width: number;
-  textureScale: number;
-  segmentMs: number;
-  delayMs: number;
+// jumps to (Chain Heal, Chain Lightning), or held to its target while a
+// channel lasts (`persist`: Drain Life). `stage` is the kit that runs it;
+// `reverse` runs each link from the caster rather than on from the last
+// target. Each link draws a bolt of each of `effects`, the chain and the
+// chains its combo adds, whose textures are served as
+// /assets/models/icon/chain-<id>.png. `points` says where links leave and
+// land, as a missile's do.
+export interface VisualChain {
+  stage: KitStage;
+  persist: boolean;
+  reverse: boolean;
+  effects: SpellChain[];
+  points: VisualPoints;
 }
 
 // An aura that keeps casting an area spell round its bearer (Starfall):
@@ -46,13 +51,11 @@ export interface BearerArea {
   schoolMask: number;
 }
 
-// A spell's missile: its model, and where it leaves and lands. Each point
-// is an index into the client's effect attachments (EFFECT_ATTACHMENTS), or
-// with `rawAttachments` an M2 attachment ID; -1 for none. The offsets are in
+// Where a spell's missile or chain link leaves and lands. Each point is an
+// index into the client's effect attachments (EFFECT_ATTACHMENTS), or with
+// `rawAttachments` an M2 attachment ID; -1 for none. The offsets are in
 // model space from those points.
-export interface VisualMissile {
-  id: number;
-  scale: number;
+export interface VisualPoints {
   attachment?: number;
   destinationAttachment?: number;
   rawAttachments?: boolean;
@@ -60,10 +63,16 @@ export interface VisualMissile {
   impactOffset?: Point3;
 }
 
+// A spell's missile: its model, and where it leaves and lands.
+export interface VisualMissile extends VisualPoints {
+  id: number;
+  scale: number;
+}
+
 export interface SpellVisual {
   missile: VisualMissile | null;
   kits: Partial<Record<KitStage, VisualKit>>;
-  chain?: SpellChain;
+  chain?: VisualChain;
   // Whether a kit the client looks in has a chain procedure; such spells
   // play no impact area kit.
   chainEffect?: boolean;

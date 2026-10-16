@@ -340,18 +340,38 @@ test('exports a spell\'s chain, the area its aura keeps casting round its bearer
       { 0: 4477, 2: 'Spells\\Starfall_Caster.mdx', 4: float(1) },
       { 0: 3493, 2: 'Spells\\Shadowbolt_Missile.mdx', 4: float(1) },
     ]),
-    'DBFilesClient\\SpellChainEffects.dbc': dbc(48, [
-      { 0: 736, 1: float(0.3), 2: float(0.2), 3: float(0.001), 4: float(1.66), 5: 999, 6: 200, 7: 'Textures\\SpellChainEffects\\HealBeam.blp' },
-    ]),
+    // Bytes 156-159 are its alpha, red, green, blue (written as one field);
+    // the combo string (field 47 here) is moved to its byte offset, 161.
+    'DBFilesClient\\SpellChainEffects.dbc': (() => {
+      const table = dbc(48, [
+        {
+          0: 736, 1: float(0.3), 2: float(0.2), 3: float(0.001), 4: float(1.66), 5: 999, 6: 200, 7: 'Textures\\SpellChainEffects\\HealBeam.blp',
+          8: 0x20, 31: float(50), 36: float(100), 39: 0x40ff8020, 47: '\x61\x03\x01\x13',
+        },
+        { 0: 737, 2: float(0.5), 7: 'Textures\\SpellChainEffects\\Beam_WaterGreen.blp' },
+      ]);
+      table.writeUInt32LE(table.readUInt32LE(20 + 47 * 4), 20 + 161);
+      table.writeUInt8(3, 20 + 160);
+      return table;
+    })(),
   };
-  const present = new Set(['spells\\starfall_caster.m2', 'spells\\shadowbolt_missile.m2', 'textures\\spellchaineffects\\healbeam.blp']);
+  const present = new Set(['spells\\starfall_caster.m2', 'spells\\shadowbolt_missile.m2', 'textures\\spellchaineffects\\healbeam.blp',
+    'textures\\spellchaineffects\\beam_watergreen.blp']);
   const visuals = new SpellVisuals((name) => files[name] ?? (present.has(name.toLowerCase()) ? Buffer.alloc(1) : null));
 
   const chainHeal = visuals.forSpell(55459);
   assert.deepEqual(plain(chainHeal.kits.cast.procs), [{ code: 0, params: [736, 1, 0, 0] }]);
-  assert.equal(chainHeal.chain.id, 736);
-  near(chainHeal.chain.width, 0.2, 'width');
-  assert.deepEqual([chainHeal.chain.segmentMs, chainHeal.chain.delayMs], [999, 200]);
+  const { stage, persist, reverse, effects } = chainHeal.chain;
+  assert.deepEqual([stage, persist, reverse], ['cast', false, false]);
+  // The chain, then the one its combo adds.
+  assert.deepEqual(effects.map((effect) => effect.id), [736, 737]);
+  const [heal] = effects;
+  near(heal.width, 0.2, 'width');
+  near(heal.scrollSpeed, 1.66, 'scroll');
+  assert.deepEqual([heal.segmentMs, heal.delayMs, heal.linkDelayMs, heal.flags, heal.pulseSpeed], [999, 200, 50, 0x20, 100]);
+  // Little-endian: alpha 0x20, red 0x80, green 0xff, blue 0x40.
+  assert.deepEqual([heal.color, heal.alpha, heal.blendMode, heal.combo], [0x80ff40, 0x20 / 255, 3, [737]]);
+  assert.deepEqual(plain(chainHeal.chain.points.castOffset), [0, 0, 0]);
   assert.equal(visuals.chainTexture(736), 'Textures\\SpellChainEffects\\HealBeam.blp');
 
   assert.deepEqual(plain(visuals.forSpell(48505).bearerArea), { radius: 30, triggers: [50286], schoolMask: 64 });
@@ -401,6 +421,14 @@ test('exports a missile\'s points and offsets, the missile targeting kit, roots,
   assert.equal(visuals.areaModel(9), 'Spells\\Blizzard_Impact_Base.m2');
 });
 
+test('decodes the chain IDs a combo packs', async () => {
+  const { decodeChainId } = await load('spell-visuals.mjs');
+  // Drain Life's and Chain Heal's combos, as the client data packs them.
+  assert.equal(decodeChainId(0x03010351), 720);
+  assert.equal(decodeChainId(0x1301035b), 731);
+  assert.equal(decodeChainId(0x13010361), 737);
+});
+
 test('kits colour their unit as the client does: procedure 1 while they play, 13 as a flash fading to white', () => {
   const { DEFAULT_ALPHA_FADE_MS, flashColor, kitAlpha, kitColor, kitColorFlash } = loadModule('../renderer/scripts/utils/spell-kits.ts');
   const kit = (procs) => ({ id: 1, anim: -1, effects: [], procs });
@@ -419,4 +447,93 @@ test('kits colour their unit as the client does: procedure 1 while they play, 13
   assert.deepEqual(plain(kitAlpha(shadowform)), { alpha: 0.65, fadeMs: 2000 });
   assert.equal(kitAlpha(kit([{ code: 14, params: [0.5, 0, 0, 0] }])).fadeMs, DEFAULT_ALPHA_FADE_MS);
   assert.equal(kitAlpha(kit([{ code: 14, params: [0, 0, 1, 0] }])), null);
+});
+
+// A chain with nothing set but these, for the bolt tests.
+function chainOf(fields) {
+  return {
+    id: 1, segmentLength: 1, width: 0.5, noise: 0, scrollSpeed: 0, segmentMs: 1000, delayMs: 0, linkDelayMs: 0, flags: 0,
+    jointCount: 0, jointOffsetRadius: 0, jointsPerMinorJoint: 0, minorJointsPerMajorJoint: 0, minorJointScale: 0, majorJointScale: 0,
+    jointMoveSpeed: 0, jointSmoothness: 0, minJointJump: 0, maxJointJump: 0, waveHeight: 0, waveFrequency: 0, waveSpeed: 0,
+    minWaveAngle: 0, maxWaveAngle: 0, minWaveSpin: 0, maxWaveSpin: 0, wavePhase: 0, arcHeight: 0, minArcAngle: 0, maxArcAngle: 0,
+    minArcSpin: 0, maxArcSpin: 0, minFlickerOn: 0, maxFlickerOn: 0, minFlickerOff: 0, maxFlickerOff: 0, pulseSpeed: 0,
+    pulseOnLength: 0, pulseFadeLength: 0, color: 0xffffff, alpha: 1, blendMode: 3, renderLayer: 0, textureLength: 1, ...fields,
+  };
+}
+const half = () => 0.5;
+// Looking down the Z axis, so the strip lies across Y.
+const DOWN_VIEW = [0, 0, -1];
+
+test('builds a straight bolt pinched at its ends, as wide as twice its width', () => {
+  const { LightningBolt } = loadModule('../renderer/scripts/utils/lightning.ts');
+  const bolt = new LightningBolt(chainOf({}), half);
+  bolt.update(0.016, [0, 0, 0], [10, 0, 0]);
+  // A joint each segment length, two more, and one for the end.
+  assert.equal(bolt.jointCount, 13);
+  const strip = bolt.build(DOWN_VIEW);
+  const vertex = (index) => [...strip.positions.slice(index * 3, index * 3 + 3)];
+  assert.deepEqual(vertex(0), [0, 0, 0]);
+  assert.deepEqual(vertex(1), [0, 0, 0]);
+  assert.deepEqual(vertex(25), [10, 0, 0]);
+  // A middle joint's pair straddles the line, a width each side.
+  near(vertex(12)[0], 5, 'along');
+  near(Math.abs(vertex(12)[1] - vertex(13)[1]), 1, 'across');
+  assert.deepEqual([strip.start, strip.count], [0, 26]);
+  // Texture: 0 to 1 along it, the ends at its middle row.
+  assert.deepEqual([...strip.uvs.slice(0, 2)], [-0.5, 0.5]);
+  near(strip.uvs[24 * 2], 1 - 0.5, 'end u');
+
+  const fixed = new LightningBolt(chainOf({ flags: 0x1, jointCount: 27 }), half);
+  fixed.update(0.016, [0, 0, 0], [10, 0, 0]);
+  assert.equal(fixed.jointCount, 28);
+});
+
+test('jitters joints off the line, bends with an arc, and stretches the texture by length', () => {
+  const { LightningBolt } = loadModule('../renderer/scripts/utils/lightning.ts');
+  const jittered = new LightningBolt(chainOf({ jointOffsetRadius: 0.5 }), () => 1);
+  jittered.update(0.016, [0, 0, 0], [10, 0, 0]);
+  const strip = jittered.build(DOWN_VIEW);
+  // Every joint pushed the full radius across (y) and up (z).
+  near(strip.positions[12 * 3 + 2], 0.5, 'up');
+  const arced = new LightningBolt(chainOf({ arcHeight: 2 }), half);
+  arced.update(0.016, [0, 0, 0], [10, 0, 0]);
+  // At the middle the arc's whole height, straight up with angle 0.
+  near(arced.build(DOWN_VIEW).positions[12 * 3 + 2], 2, 'arc');
+  const long = new LightningBolt(chainOf({ flags: 0x100, textureLength: 2.5 }), half);
+  long.update(0.016, [0, 0, 0], [10, 0, 0]);
+  near(long.build(DOWN_VIEW).uvs[24 * 2], 4 - 0.5, 'four texture lengths');
+});
+
+test('a pulse lights only the stretch it has reached, and a flicker turns the bolt off', () => {
+  const { LightningBolt } = loadModule('../renderer/scripts/utils/lightning.ts');
+  const pulse = new LightningBolt(chainOf({ flags: 0x20, pulseSpeed: 10, pulseOnLength: 2, pulseFadeLength: 1 }), half);
+  pulse.update(0.55, [0, 0, 0], [10, 0, 0]);
+  // The pulse's head is 5.5 yards along: fading in from 1.5 to 2.5 yards,
+  // lit to 4.5, fading out to 5.5, and nothing ahead. Joints are 10/12
+  // yards apart.
+  const strip = pulse.build(DOWN_VIEW);
+  near(strip.alphas[2 * 2], 2 * 10 / 12 - 1.5, 'fading in');
+  assert.equal(strip.alphas[4 * 2], 1);
+  near(strip.alphas[6 * 2], 5.5 - 5, 'fading out');
+  // Drawing stops at the joint past the head, 5.8 yards along.
+  assert.equal(strip.alphas[7 * 2], 0);
+  assert.equal(strip.start + strip.count, 7 * 2 + 1);
+  const flicker = new LightningBolt(chainOf({ flags: 0x10, minFlickerOn: 0.1, maxFlickerOn: 0.1, minFlickerOff: 1, maxFlickerOff: 1 }), half);
+  flicker.update(0.2, [0, 0, 0], [10, 0, 0]);
+  assert.equal(flicker.build(DOWN_VIEW), null);
+  flicker.update(1.1, [0, 0, 0], [10, 0, 0]);
+  assert.ok(flicker.build(DOWN_VIEW));
+});
+
+test('places joints in a hierarchy of major and minor joints', () => {
+  const { LightningBolt } = loadModule('../renderer/scripts/utils/lightning.ts');
+  const bolt = new LightningBolt(chainOf({
+    flags: 0x2, jointOffsetRadius: 0.1, jointsPerMinorJoint: 3, minorJointsPerMajorJoint: 4, minorJointScale: 3.7, majorJointScale: 8.45,
+  }), () => 1);
+  bolt.update(0.016, [0, 0, 0], [30, 0, 0]);
+  const strip = bolt.build(DOWN_VIEW);
+  assert.ok([...strip.positions].every(Number.isFinite));
+  // Major joints (every 12th) sit their scale times the radius up off the line.
+  near(strip.positions[12 * 2 * 3 + 2], 0.845, 'major joint up');
+  near(strip.positions[24 * 2 * 3 + 2], 0.845, 'second major joint up');
 });

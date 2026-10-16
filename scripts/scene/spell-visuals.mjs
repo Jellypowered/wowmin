@@ -64,12 +64,33 @@ const KIT_FIRST_SLOT = 3;
 const KIT_PROCS = 17;
 const KIT_PROC_PARAMS = [21, 25, 29, 33];
 // Procedures 0 and 12 draw a chain between units (Chain Heal, Chain
-// Lightning, Drain Life); the first parameter is the SpellChainEffects row.
+// Lightning, Drain Life): the first parameter is the SpellChainEffects row,
+// the third whether it lasts until its kit ends (a channel's), the fourth
+// whether each link runs from the caster rather than on from the last
+// target.
 const CHAIN_PROCEDURES = [0, 12];
-// SpellChainEffects: average segment length, width, noise, texture
-// repeats, how long a segment lasts and the delay to the next (ms), and its
-// texture.
-const CHAIN_FIELDS = { segmentLength: 1, width: 2, noise: 3, textureScale: 4, segmentMs: 5, delayMs: 6, texture: 7 };
+// SpellChainEffects, by field. Its colour and blend mode are single bytes,
+// so the fields after them are read by byte offset (CHAIN_BYTES).
+const CHAIN_FIELDS = {
+  segmentLength: 1, width: 2, noise: 3, scrollSpeed: 4, segmentMs: 5, delayMs: 6, texture: 7, flags: 8,
+  jointCount: 9, jointOffsetRadius: 10, jointsPerMinorJoint: 11, minorJointsPerMajorJoint: 12, minorJointScale: 13,
+  majorJointScale: 14, jointMoveSpeed: 15, jointSmoothness: 16, minJointJump: 17, maxJointJump: 18,
+  waveHeight: 19, waveFrequency: 20, waveSpeed: 21, minWaveAngle: 22, maxWaveAngle: 23, minWaveSpin: 24, maxWaveSpin: 25,
+  arcHeight: 26, minArcAngle: 27, maxArcAngle: 28, minArcSpin: 29, maxArcSpin: 30, linkDelayMs: 31,
+  minFlickerOn: 32, maxFlickerOn: 33, minFlickerOff: 34, maxFlickerOff: 35, pulseSpeed: 36, pulseOnLength: 37, pulseFadeLength: 38,
+};
+const CHAIN_INT_FIELDS = new Set(['segmentMs', 'delayMs', 'flags', 'jointCount', 'jointsPerMinorJoint', 'minorJointsPerMajorJoint']);
+const CHAIN_BYTES = { alpha: 156, red: 157, green: 158, blue: 159, blendMode: 160, combo: 161, renderLayer: 165, textureLength: 169, wavePhase: 173 };
+// A chain's combo names up to twelve more chains drawn with it, each a
+// 4-byte ID packed so it holds no zero byte.
+const MAX_CHAIN_COMBO = 12;
+export function decodeChainId(packed) {
+  const bits = (packed & 0xFEFEFEFE) >>> 0;
+  let high = (bits >>> 7) & 0x200000;
+  high = (((high | (bits & 0x20000000)) >>> 3) | (bits & 0x2000000)) >>> 0;
+  high = ((((high >>> 4) | (bits & 0x40000000)) >>> 3) | (bits & 0x4000000)) >>> 0;
+  return ((high >>> 11) | ((((bits >>> 4) & 0xFF800000) | bits) & 0xFFFFFF)) >>> 0;
+}
 // Procedure 9 rains models over a lasting area (Blizzard's ice, Rain of
 // Fire's fire): its first parameter is the row of SpellVisualKitAreaModel,
 // counted from 0, whose model falls, the first row when there is no such
@@ -159,19 +180,31 @@ export class SpellVisuals {
     return { id: kitId, startAnim, anim, effects, procs };
   }
 
-  // A chain effect (SpellChainEffects) and its texture, or null.
+  // A chain effect (SpellChainEffects): every field the client draws it
+  // by, and the chains its combo adds; null if its texture is missing.
   chain(chainId) {
     const chain = this.table('SpellChainEffects').get(chainId);
     const texture = chain?.string(CHAIN_FIELDS.texture);
     if (!texture || !this.hasFile(texture)) return null;
+    const fields = Object.fromEntries(Object.entries(CHAIN_FIELDS).filter(([name]) => name !== 'texture')
+      .map(([name, field]) => [name, CHAIN_INT_FIELDS.has(name) ? chain.int(field) : chain.float(field)]));
+    const combo = chain.bytesAt(CHAIN_BYTES.combo);
+    const comboIds = [];
+    for (let offset = 0; offset + 4 <= combo.length && comboIds.length < MAX_CHAIN_COMBO; offset += 4) {
+      const id = decodeChainId(combo.readUInt32LE(offset));
+      if (!id || !this.table('SpellChainEffects').has(id)) break;
+      comboIds.push(id);
+    }
     return {
       id: chainId,
-      segmentLength: chain.float(CHAIN_FIELDS.segmentLength),
-      width: chain.float(CHAIN_FIELDS.width),
-      noise: chain.float(CHAIN_FIELDS.noise),
-      textureScale: chain.float(CHAIN_FIELDS.textureScale),
-      segmentMs: chain.int(CHAIN_FIELDS.segmentMs),
-      delayMs: chain.int(CHAIN_FIELDS.delayMs),
+      ...fields,
+      color: (chain.byteAt(CHAIN_BYTES.red) << 16) | (chain.byteAt(CHAIN_BYTES.green) << 8) | chain.byteAt(CHAIN_BYTES.blue),
+      alpha: chain.byteAt(CHAIN_BYTES.alpha) / 255,
+      blendMode: chain.byteAt(CHAIN_BYTES.blendMode),
+      renderLayer: chain.intAt(CHAIN_BYTES.renderLayer),
+      textureLength: chain.floatAt(CHAIN_BYTES.textureLength),
+      wavePhase: chain.floatAt(CHAIN_BYTES.wavePhase),
+      combo: comboIds,
     };
   }
 
@@ -241,23 +274,39 @@ export class SpellVisuals {
     }
     const missile = this.effect(visual.uint(VISUAL_MISSILE_MODEL));
     if (!missile && !Object.keys(kits).length) return null;
-    const chainProc = Object.values(kits).flatMap((kit) => kit.procs).find((proc) => CHAIN_PROCEDURES.includes(proc.code));
-    const chain = chainProc ? this.chain(chainProc.params[0]) : null;
-    const chainEffect = CHAIN_KIT_STAGES.some((stage) => kits[stage]?.procs.some((proc) => CHAIN_PROCEDURES.includes(proc.code)));
     const vector = (field) => [0, 1, 2].map((axis) => visual.float(field + axis));
+    // Where its missiles, and its chains' links, leave and land.
+    const points = {
+      attachment: visual.int(VISUAL_MISSILE_ATTACHMENT),
+      destinationAttachment: visual.int(VISUAL_MISSILE_DESTINATION_ATTACHMENT),
+      rawAttachments: Boolean(visual.uint(VISUAL_FLAGS) & VISUAL_FLAG_RAW_ATTACHMENTS),
+      castOffset: vector(VISUAL_MISSILE_CAST_OFFSET),
+      impactOffset: vector(VISUAL_MISSILE_IMPACT_OFFSET),
+    };
+    const chain = this.visualChain(kits, points);
+    const chainEffect = CHAIN_KIT_STAGES.some((stage) => kits[stage]?.procs.some((proc) => CHAIN_PROCEDURES.includes(proc.code)));
     return {
       visualId: visual.uint(0),
-      missile: missile && {
-        ...missile,
-        attachment: visual.int(VISUAL_MISSILE_ATTACHMENT),
-        destinationAttachment: visual.int(VISUAL_MISSILE_DESTINATION_ATTACHMENT),
-        rawAttachments: Boolean(visual.uint(VISUAL_FLAGS) & VISUAL_FLAG_RAW_ATTACHMENTS),
-        castOffset: vector(VISUAL_MISSILE_CAST_OFFSET),
-        impactOffset: vector(VISUAL_MISSILE_IMPACT_OFFSET),
-      },
+      missile: missile && { ...missile, ...points },
       kits,
       ...(chain ? { chain } : {}),
       ...(chainEffect ? { chainEffect } : {}),
     };
+  }
+
+  // The chain a visual's kits draw: the stage whose kit runs the chain
+  // procedure, whether it lasts and runs from the caster, its chain and the
+  // chains its combo adds (each drawn with it), and where its links leave
+  // and land; or null.
+  visualChain(kits, points) {
+    for (const [stage, kit] of Object.entries(kits)) {
+      const proc = kit.procs.find((candidate) => CHAIN_PROCEDURES.includes(candidate.code));
+      if (!proc) continue;
+      const root = this.chain(proc.params[0]);
+      if (!root) return null;
+      const effects = [root, ...root.combo.map((id) => this.chain(id)).filter(Boolean)];
+      return { stage, persist: proc.params[2] !== 0, reverse: proc.params[3] !== 0, effects, points };
+    }
+    return null;
   }
 }

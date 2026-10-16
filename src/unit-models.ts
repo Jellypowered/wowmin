@@ -37,8 +37,8 @@ export const UNIT_MODEL_CACHE_VERSION = 10;
 // 8: map lights carry their interior WMO groups (building ambient, outdoor-lit).
 // 9: rain models from SpellVisualKitAreaModel (effect/area-<row>.glb), the
 // missile's points and offsets, the missile targeting kit, whether the
-// spell roots (its world effects follow the unit), and whether its visual
-// has a chain effect.
+// spell roots (its world effects follow the unit), whether its visual has a
+// chain effect, and its chain's full SpellChainEffects record and combo.
 export const SPELL_ART_CACHE_VERSION = 9;
 const SPELL_ART_KINDS = new Set<UnitModelRequest['kind']>(['effect', 'visual', 'spell', 'icon', 'gameobject', 'light']);
 const EXTENSIONS: Partial<Record<UnitModelRequest['kind'], string>> = { visual: 'json', spell: 'json', icon: 'png', light: 'json' };

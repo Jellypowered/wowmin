@@ -4,7 +4,7 @@ import {
   type AreaEffect, type AreaRing, type Beam, type CastGlow, type ChainLink, type CombatEffectStore, type Impact, type Point3, type Projectile,
   schoolColor, type UnitKey,
 } from '../utils/spell-events';
-import { ChainRibbons, type ChainDraw } from './chain-ribbons';
+import { type ChainDraw, ChainLightning } from './chain-ribbons';
 import { useServerAxes } from './iso-camera';
 import { EffectInstance, type EffectPlacement, type EffectTemplate, EffectTemplateCache, type EffectView, getEffectView } from './m2-effect';
 import type { UnitAnchor } from './spell-effects';
@@ -12,7 +12,7 @@ import type { UnitLook } from './unit-models';
 import {
   AREA_ART_SCALE, areaRain, artForSchool, castKit, type ColorFlash, DEFAULT_ALPHA_FADE_MS, DIRECTED_HAND_ATTACHMENT, flashColor, groundSlot,
   kitAlpha, kitAnimationName, kitColor, kitColorFlash, MISSILE_HEIGHT_SHARE, missileAttachment, missileOffset, RAIN_MAX_DELAY_MS, rainPoint,
-  slotAttachment, type SpellVisual, type UnitAnchorRole, type VisualKit, type VisualMissile,
+  slotAttachment, type SpellVisual, type UnitAnchorRole, type VisualKit, type VisualMissile, type VisualPoints,
 } from '../utils/spell-kits';
 
 // Plays the client's own spell art (level 2) for the combat effect store's
@@ -89,9 +89,9 @@ export interface BearerAreaCircle {
 
 // Global particle budget: past it, emitters stop spawning until room frees.
 const PARTICLE_BUDGET = 4000;
-// A chain link fades in and out over these.
-const CHAIN_FADE_IN_MS = 80;
-const CHAIN_FADE_OUT_MS = 250;
+// The release event a chain leaves its caster from when its visual names no
+// point.
+const CHAIN_RELEASE_EVENT = '$CSL';
 
 export class SpellVisualLayer {
   readonly group = new Group();
@@ -126,14 +126,14 @@ export class SpellVisualLayer {
   private units: UnitInfo = {
     anchor: () => null, attachment: () => null, isDrawn: () => false, scale: () => 1, height: () => 2, facing: () => 0, ground: (center) => center,
   };
-  private readonly chains: ChainRibbons;
+  private readonly chains: ChainLightning;
   // Spells that auras with a bearer area cast (Starfall's 30 yard search),
   // whose own rings the steady area replaces.
   private readonly bearerTriggers = new Set<number>();
 
   constructor(private readonly onLoaded: () => void) {
     this.templates = new EffectTemplateCache(onLoaded, 'spell effect');
-    this.chains = new ChainRibbons(onLoaded);
+    this.chains = new ChainLightning(onLoaded);
     this.group.add(this.chains.group);
     useServerAxes(this.group);
   }
@@ -313,7 +313,7 @@ export class SpellVisualLayer {
     // Effects bring their own nodes up to date; the scene view does the rest.
     this.group.updateWorldMatrix(true, false);
     const view = getEffectView(camera, this.group);
-    this.updateChains(store?.chains ?? [], now, units, view);
+    this.updateChains(store?.chains ?? [], now, view, seconds);
     const budget = { left: PARTICLE_BUDGET };
     for (let index = this.playing.length - 1; index >= 0; index -= 1) {
       const effect = this.playing[index];
@@ -361,23 +361,45 @@ export class SpellVisualLayer {
     return visual ? artForSchool(visual, schoolMask) : visual;
   }
 
-  // Each chain link from its turn (the chain's delay per link) for the
-  // chain's segment time, from the caster's hand or the last target's chest.
-  private updateChains(links: readonly ChainLink[], now: number, units: UnitInfo, view: EffectView): void {
+  // Each chain link as the client times it: a bolt of each of its chain's
+  // effects, the first link after the effect's delay and each later one
+  // its link delay after the one before, for the effect's segment time; a
+  // lasting chain (a channel's) from the start until its link ends. The
+  // first link, or with `reverse` every link, leaves the caster; the rest
+  // leave the last target.
+  private updateChains(links: readonly ChainLink[], now: number, view: EffectView, seconds: number): void {
     const draws: ChainDraw[] = [];
     for (const link of links) {
       const chain = this.visual(link.spellId)?.chain;
       if (!chain) continue;
-      const showAt = link.startAt + link.index * chain.delayMs;
-      const endAt = showAt + chain.segmentMs;
-      if (now < showAt || now >= endAt) continue;
-      const from = units.anchor(link.from, link.index === 0 ? 'handRight' : 'chest');
-      const to = units.anchor(link.to, 'chest');
-      if (!from || !to) continue;
-      const opacity = Math.min(1, (now - showAt) / CHAIN_FADE_IN_MS, (endAt - now) / CHAIN_FADE_OUT_MS);
-      draws.push({ chain, from, to, opacity, age: (now - showAt) / 1000 });
+      const fromCaster = link.index === 0 || chain.reverse;
+      chain.effects.forEach((effect, index) => {
+        const lasting = chain.persist && link.endAt !== undefined;
+        const showAt = lasting ? link.startAt : link.startAt + effect.delayMs + link.index * effect.linkDelayMs;
+        const endAt = lasting ? link.endAt! : showAt + effect.segmentMs;
+        if (now < showAt || now >= endAt) return;
+        const from = fromCaster ? this.boltSource(chain.points, link.caster) : this.landingPoint(chain.points, link.from);
+        const to = this.landingPoint(chain.points, link.to);
+        if (from && to) draws.push({ key: link, index, chain: effect, from, to });
+      });
     }
-    this.chains.update(draws, view);
+    this.chains.update(draws, view, seconds);
+  }
+
+  // Where a chain leaves its caster, as the client picks it: the visual's
+  // point and offset when the model has that point, else the offset from
+  // where the cast animation throws from with the left hand, else the
+  // offset from three quarters up the caster.
+  private boltSource(points: VisualPoints, caster: UnitKey): Point3 | null {
+    const feet = this.units.anchor(caster, 'feet');
+    if (!feet) return null;
+    const offset = missileOffset(points.castOffset);
+    const height = this.units.height(caster) * MISSILE_HEIGHT_SHARE;
+    if (!this.units.isDrawn(caster)) return [feet[0], feet[1], feet[2] + height];
+    const point = missileAttachment(points.attachment, points.rawAttachments);
+    return (point !== null && this.units.attachment(caster, point, offset))
+      || this.units.attachment(caster, CHAIN_RELEASE_EVENT, offset)
+      || offsetFrom(feet, offset, this.units.facing(caster), height);
   }
 
   private template(effectId: number): EffectTemplate | null | undefined {
@@ -582,11 +604,12 @@ export class SpellVisualLayer {
     return [feet[0], feet[1], feet[2] + this.units.height(caster) * MISSILE_HEIGHT_SHARE];
   }
 
-  // Where a missile lands on its target: the visual's point and offset when
-  // the model has that point, else the offset from three quarters up it.
-  private landingPoint(missile: VisualMissile, target: UnitKey): Point3 | null {
-    const offset = missileOffset(missile.impactOffset);
-    const point = missileAttachment(missile.destinationAttachment, missile.rawAttachments);
+  // Where a missile or chain lands on its target: the visual's point and
+  // offset when the model has that point, else the offset from three
+  // quarters up it.
+  private landingPoint(points: VisualPoints, target: UnitKey): Point3 | null {
+    const offset = missileOffset(points.impactOffset);
+    const point = missileAttachment(points.destinationAttachment, points.rawAttachments);
     if (point !== null && this.units.isDrawn(target)) {
       const at = this.units.attachment(target, point, offset);
       if (at) return at;
