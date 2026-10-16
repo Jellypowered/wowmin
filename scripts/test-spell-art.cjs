@@ -450,6 +450,32 @@ test('exports a kit\'s flags and animation clips with their fallbacks, and wheth
   assert.equal(renew.harmful, undefined);
 });
 
+test('exports a kit\'s model attachments as effects, and reads their offset and turn as the client does', async () => {
+  const { SpellVisuals } = await load('spell-visuals.mjs');
+  const files = {
+    'DBFilesClient\\Spell.dbc': dbc(234, [{ 0: 120, 131: 13 }]),
+    'DBFilesClient\\SpellVisual.dbc': dbc(32, [{ 0: 13, 2: 900 }]),
+    'DBFilesClient\\SpellVisualKit.dbc': dbc(38, [kitRecord(900)]),
+    'DBFilesClient\\SpellVisualEffectName.dbc': dbc(8, [{ 0: 1345, 2: 'Spells\\ConeOfCold_Hand.mdx', 4: float(1) }]),
+    'DBFilesClient\\SpellVisualKitModelAttach.dbc': dbc(10, [
+      { 0: 141, 1: 900, 2: 1345, 3: 17, 4: float(1), 5: float(2), 6: float(3), 7: float(0.5) },
+      { 0: 142, 1: 900, 2: 1345, 3: -1 },
+      { 0: 143, 1: 901, 2: 1345, 3: 22 },
+    ]),
+  };
+  const visuals = new SpellVisuals((name) => files[name] ?? (name.toLowerCase() === 'spells\\coneofcold_hand.m2' ? Buffer.alloc(1) : null));
+  const effects = visuals.forSpell(120).kits.cast.effects;
+  assert.deepEqual(effects.map(({ slot, attachment }) => [slot, attachment]), [['attach', 17], ['attach', -1]]);
+  assert.deepEqual(plain(effects[0].offset), [1, 2, 3]);
+  near(effects[0].yaw, 0.5, 'yaw');
+
+  const { attachOffset, attachTurn, groundSlot } = loadModule('../renderer/scripts/utils/spell-kits.ts');
+  assert.deepEqual(plain(attachOffset(effects[0])), [1, -2, 3]);
+  assert.deepEqual(plain(attachTurn({ yaw: 0.5, pitch: 0, roll: 0 })), { yaw: -0.5, pitch: 0, roll: 0 });
+  assert.equal(attachTurn({}), null);
+  assert.equal(groundSlot('attach'), 'ground');
+});
+
 test('exports how a missile flies: its release, ground following, motion script, and gravity arc', async () => {
   const { SpellVisuals } = await load('spell-visuals.mjs');
   const files = {

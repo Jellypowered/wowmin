@@ -1,4 +1,4 @@
-import { type Camera, Group } from 'three';
+import { type Camera, Group, Quaternion } from 'three';
 
 import {
   type AreaEffect, type AreaRing, type Beam, type CastGlow, type ChainLink, type CombatEffectStore, type Impact, type Point3, type Projectile,
@@ -13,7 +13,7 @@ import type { UnitAnchor } from './spell-effects';
 import type { UnitLook } from './unit-models';
 import {
   AREA_ART_SCALE, areaRain, artForSchool, castKit, type ColorFlash, DEFAULT_ALPHA_FADE_MS, DIRECTED_HAND_ATTACHMENT, flashColor, groundSlot,
-  CREATURE_SPELL_ATTACKABLE, fadeAlpha, kitAlpha, kitClips, kitColor, kitColorFlash, kitFade, kitFreeze, kitWeaponTrail, KIT_WAITS_FOR_BOLT,
+  attachOffset, attachTurn, CREATURE_SPELL_ATTACKABLE, fadeAlpha, kitAlpha, kitClips, kitColor, kitColorFlash, kitFade, kitFreeze, kitWeaponTrail, KIT_WAITS_FOR_BOLT,
   MISSILE_HEIGHT_SHARE, missileAttachment, missileOffset, type ProceduralFade, RAIN_MAX_DELAY_MS, rainPoint,
   slotAttachment, type SpellVisual, type UnitAnchorRole, type VisualKit, type VisualMissile, type VisualPoints,
 } from '../utils/spell-kits';
@@ -50,6 +50,9 @@ export interface UnitInfo {
   blades: (unit: UnitKey) => Array<[Point3, Point3]>;
   // A creature's creature_template type_flags (0 for players).
   creatureTypeFlags: (unit: UnitKey) => number;
+  // Which way a drawn unit's attachment is turned (world, three.js axes),
+  // or null.
+  attachmentTurn: (unit: UnitKey, attachment: number) => Quaternion | null;
 }
 
 // A missile waits at most this long for its caster's animation to let it go.
@@ -123,6 +126,7 @@ export interface BearerAreaCircle {
 // Global particle budget: past it, emitters stop spawning until room frees.
 const PARTICLE_BUDGET = 4000;
 const DEGREES = Math.PI / 180;
+const layerQuaternion = new Quaternion();
 // The release event a chain leaves its caster from when its visual names no
 // point.
 const CHAIN_RELEASE_EVENT = '$CSL';
@@ -159,7 +163,7 @@ export class SpellVisualLayer {
   // they keep up with it (each frame brings new positions).
   private units: UnitInfo = {
     anchor: () => null, attachment: () => null, isDrawn: () => false, scale: () => 1, height: () => 2, facing: () => 0, ground: (center) => center,
-    releaseMs: () => null, intersect: () => null, blades: () => [], creatureTypeFlags: () => 0,
+    releaseMs: () => null, intersect: () => null, blades: () => [], creatureTypeFlags: () => 0, attachmentTurn: () => null,
   };
   private readonly chains: ChainLightning;
   private readonly trails = new WeaponTrails();
@@ -504,18 +508,37 @@ export class SpellVisualLayer {
     return kit.effects.flatMap((effect, index) => {
       const template = templates[index];
       if (!template) return [];
-      const attachment = slotAttachment(effect.slot);
-      if (drawn && attachment !== null && !this.units.attachment(unit, attachment)) return [];
+      // A model attachment sits on its raw M2 attachment, offset in its
+      // frame, or (-1) stands at the feet, offset the way the unit faces.
+      const attached = effect.slot === 'attach';
+      const attachment = attached ? (effect.attachment !== undefined && effect.attachment >= 0 ? effect.attachment : null) : slotAttachment(effect.slot);
+      const offset: Point3 = attached ? attachOffset(effect) : [0, 0, 0];
+      const turn = attached ? attachTurn(effect) : null;
+      if (drawn && attachment !== null && !this.units.attachment(unit, attachment, offset)) return [];
+      const atFeet = () => {
+        const feet = this.units.anchor(unit, 'feet');
+        return feet && offsetFrom(feet, offset, this.units.facing(unit));
+      };
       let fixed: Point3 | null = null;
-      if (attachment === null && !follows) fixed = this.units.anchor(unit, 'feet');
+      if (attachment === null && !follows) fixed = atFeet();
       const playing = this.play(template, now, loop, () => {
-        const point = fixed ?? (attachment !== null && this.units.isDrawn(unit)
-          ? this.units.attachment(unit, attachment) : this.units.anchor(unit, slotRole(effect.slot)));
-        return point ? { position: point, yaw: this.units.facing(unit), scale: effect.scale * this.units.scale(unit) } : null;
+        const onModel = attachment !== null && this.units.isDrawn(unit);
+        const point = fixed ?? (attachment === null ? atFeet() : onModel
+          ? this.units.attachment(unit, attachment, offset) : this.units.anchor(unit, slotRole(effect.slot)));
+        // Riding on an attachment, it turns with it, as the client's does.
+        const quaternion = onModel ? this.layerTurn(this.units.attachmentTurn(unit, attachment!)) : null;
+        return point ? { position: point, yaw: this.units.facing(unit), quaternion, turn, scale: effect.scale * this.units.scale(unit) } : null;
       });
       if (!loop) playing.stopAt = now + playing.instance.duration;
       return [playing];
     });
+  }
+
+  // A world turn (three.js axes) as a turn in this layer, or null.
+  private layerTurn(world: Quaternion | null): [number, number, number, number] | null {
+    if (!world) return null;
+    const turn = this.group.getWorldQuaternion(layerQuaternion).invert().multiply(world);
+    return [turn.x, turn.y, turn.z, turn.w];
   }
 
   // An area kit at its ground point, as the client plays one there: its
@@ -531,7 +554,10 @@ export class SpellVisualLayer {
       const where = groundSlot(effect.slot);
       if (!template || !where) return [];
       if (where === 'caster') return this.playKit({ ...kit, effects: [effect], procs: [] }, [template], area.caster, now, loop);
-      const playing = this.play(template, now, loop, () => ({ position: center, yaw, scale: effect.scale * AREA_ART_SCALE }));
+      const attached = effect.slot === 'attach';
+      const position = attached ? offsetFrom(center, attachOffset(effect), yaw) : center;
+      const turn = attached ? attachTurn(effect) : null;
+      const playing = this.play(template, now, loop, () => ({ position, yaw, turn, scale: effect.scale * AREA_ART_SCALE }));
       if (!loop) playing.stopAt = now + playing.instance.duration;
       return [playing];
     });

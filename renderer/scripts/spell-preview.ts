@@ -230,6 +230,7 @@ function frame(): void {
     releaseMs: (unit, clip) => units.releaseMsOf(unit, clip),
     intersect: (from, to) => (from[2] >= 0 && to[2] < 0 ? from[2] / (from[2] - to[2]) : null),
     blades: (unit) => units.bladesOf(unit),
+    attachmentTurn: (unit, attachment) => units.attachmentTurnOf(unit, attachment),
     creatureTypeFlags: () => 0,
   }, camera, currentAuras(virtualNow));
   glows.update(field('glows').checked ? store : null, virtualNow, anchor, (entry) => visuals.handles(entry));

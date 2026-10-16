@@ -828,6 +828,7 @@ export class InstanceSceneView {
       releaseMs: (unit, clip) => this.units.releaseMsOf(unit, clip),
       intersect: (from, to) => this.intersect(from, to),
       blades: (unit) => this.units.bladesOf(unit),
+      attachmentTurn: (unit, attachment) => (positions.has(unit) ? this.units.attachmentTurnOf(unit, attachment) : null),
       creatureTypeFlags,
     };
     this.spellVisuals.update(store, now, units, this.camera, auras);

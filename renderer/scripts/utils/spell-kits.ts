@@ -16,6 +16,26 @@ export interface VisualEffect {
   slot: string;
   id: number;
   scale: number;
+  // A model attachment's (the 'attach' slot, SpellVisualKitModelAttach):
+  // its M2 attachment (-1: at the unit's feet), offset from it, and turn
+  // in the effect's own frame (radians).
+  attachment?: number;
+  offset?: Point3;
+  yaw?: number;
+  pitch?: number;
+  roll?: number;
+}
+
+// A model attachment's offset as the client reads it (Y flipped), and its
+// turn: about Z by minus its yaw, then Y by its pitch, then X by its roll.
+export function attachOffset(effect: VisualEffect): Point3 {
+  const offset = effect.offset ?? [0, 0, 0];
+  return [offset[0], -offset[1], offset[2]];
+}
+
+export function attachTurn(effect: VisualEffect): { yaw: number; pitch: number; roll: number } | null {
+  if (!effect.yaw && !effect.pitch && !effect.roll) return null;
+  return { yaw: -(effect.yaw ?? 0), pitch: effect.pitch ?? 0, roll: effect.roll ?? 0 };
 }
 
 export interface VisualKit {
@@ -132,10 +152,10 @@ export function slotAttachment(slot: string): number | null {
 }
 
 // Placed at an area's ground point, a kit draws only its world and base
-// effects there and its head effect on the caster (the client's ground
-// mode); the rest of its slots are skipped.
+// effects and its model attachments there and its head effect on the caster
+// (the client's ground mode); the rest of its slots are skipped.
 export function groundSlot(slot: string): 'ground' | 'caster' | null {
-  if (slot === 'world' || slot === 'base') return 'ground';
+  if (slot === 'world' || slot === 'base' || slot === 'attach') return 'ground';
   return slot === 'head' ? 'caster' : null;
 }
 

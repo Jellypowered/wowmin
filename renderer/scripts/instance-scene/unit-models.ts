@@ -16,6 +16,7 @@ import {
   type Frustum,
   type Material,
   Matrix4,
+  Quaternion,
   Mesh,
   MeshBasicMaterial,
   MeshLambertMaterial,
@@ -377,6 +378,10 @@ function mergeSkinnedParts(scene: Object3D): void {
 }
 
 const scratchVector = new Vector3();
+const scratchMatrix = new Matrix4();
+const scratchPosition = new Vector3();
+const scratchScale = new Vector3();
+const scratchTurn = new Quaternion();
 const ZERO_OFFSET: Point3 = [0, 0, 0];
 
 // The first of a role's attachments a unit's model has.
@@ -540,6 +545,18 @@ export class UnitModelLayer {
     const point = typeof attachment === 'number' ? unit?.effectAttachments.get(attachment) : unit?.effectEvents.get(attachment);
     if (!unit || !point) return null;
     return threeToServer(this.pointWorld(unit, point, scratchVector.set(offset[0], offset[1], offset[2])));
+  }
+
+  // Which way a drawn unit's attachment (M2 ID) is turned, in world space
+  // (three.js axes), as an effect riding on it turns; null if the unit
+  // isn't drawn or its model lacks it.
+  attachmentTurnOf(id: string, attachment: number): Quaternion | null {
+    const unit = this.units.get(id);
+    const point = unit?.effectAttachments.get(attachment);
+    if (!unit || !point) return null;
+    scratchMatrix.multiplyMatrices(unit.top.matrixWorld, unit.skeletonToTop).multiply(point.matrixWorld);
+    scratchMatrix.decompose(scratchPosition, scratchTurn, scratchScale);
+    return scratchTurn.clone();
   }
 
   // A point in a unit's skeleton, in world space: `local` is in the point's

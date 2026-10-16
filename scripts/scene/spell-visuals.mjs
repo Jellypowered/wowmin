@@ -98,6 +98,10 @@ const HARMFUL_TARGETS = new Set([2, 6, 15, 16, 24, 28, 53, 54, 93]);
 const KIT_SLOTS = ['head', 'chest', 'base', 'leftHand', 'rightHand', 'breath', 'leftWeapon', 'rightWeapon',
   'special1', 'special2', 'special3', 'world'];
 const KIT_FIRST_SLOT = 3;
+// SpellVisualKitModelAttach: further effects a kit plays (parent kit,
+// effect, M2 attachment or -1 to stand at the unit's feet, offset, yaw,
+// pitch, roll), in table order.
+const MODEL_ATTACH = { kit: 1, effect: 2, attachment: 3, offset: 4, yaw: 7, pitch: 8, roll: 9 };
 // Up to four procedures a kit runs (CharProc), each with four parameters
 // (CharParamZero..Three, one array per parameter).
 const KIT_PROCS = 17;
@@ -205,10 +209,10 @@ export class SpellVisuals {
   kit(kitId) {
     const kit = this.table('SpellVisualKit').get(kitId);
     if (!kit) return null;
-    const effects = KIT_SLOTS.flatMap((slot, index) => {
+    const effects = [...KIT_SLOTS.flatMap((slot, index) => {
       const effect = this.effect(kit.int(KIT_FIRST_SLOT + index));
       return effect ? [{ slot, ...effect }] : [];
-    });
+    }), ...this.modelAttachments(kitId)];
     const startAnim = kit.int(KIT_START_ANIM);
     const anim = kit.int(KIT_ANIM);
     const procs = [0, 1, 2, 3].flatMap((index) => {
@@ -224,6 +228,29 @@ export class SpellVisuals {
       id: kitId, startAnim, anim, effects, procs, flags,
       ...(animClips.length ? { animClips } : {}), ...(startClips.length ? { startClips } : {}),
     };
+  }
+
+  // A kit's model attachments, as effects in the 'attach' slot: the M2
+  // attachment they sit on (-1: at the unit's feet), their offset from it,
+  // and their turn (radians).
+  modelAttachments(kitId) {
+    if (!this.attachRows) {
+      this.attachRows = new Map();
+      for (const row of this.table('SpellVisualKitModelAttach').values()) {
+        const parent = row.int(MODEL_ATTACH.kit);
+        this.attachRows.set(parent, [...(this.attachRows.get(parent) ?? []), row]);
+      }
+    }
+    return (this.attachRows.get(kitId) ?? []).flatMap((row) => {
+      const effect = this.effect(row.int(MODEL_ATTACH.effect));
+      if (!effect) return [];
+      return [{
+        slot: 'attach', ...effect,
+        attachment: row.int(MODEL_ATTACH.attachment),
+        offset: [0, 1, 2].map((axis) => row.float(MODEL_ATTACH.offset + axis)),
+        yaw: row.float(MODEL_ATTACH.yaw), pitch: row.float(MODEL_ATTACH.pitch), roll: row.float(MODEL_ATTACH.roll),
+      }];
+    });
   }
 
   // The clips an animation plays, by name: its own, then (unless `raw`)

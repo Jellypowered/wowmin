@@ -365,6 +365,9 @@ export interface EffectPlacement {
   position: Vec3;
   yaw: number;
   pitch?: number;
+  // Its whole turn in the layer (x, y, z, w), for an effect riding on an
+  // attachment, in place of yaw and pitch.
+  quaternion?: [number, number, number, number] | null;
   // A further turn in the model's own frame (radians), as a missile's
   // motion script gives it.
   turn?: { yaw: number; pitch: number; roll: number } | null;
@@ -582,7 +585,8 @@ export class EffectInstance {
     };
     this.scale = placement.scale;
     this.root.position.set(...placement.position);
-    this.root.rotation.set(0, -(placement.pitch ?? 0), placement.yaw, 'ZYX');
+    if (placement.quaternion) this.root.quaternion.set(...placement.quaternion);
+    else this.root.rotation.set(0, -(placement.pitch ?? 0), placement.yaw, 'ZYX');
     if (placement.turn) {
       scriptEuler.set(placement.turn.roll, placement.turn.pitch, placement.turn.yaw, 'ZYX');
       this.root.quaternion.multiply(scriptTurn.setFromEuler(scriptEuler));
