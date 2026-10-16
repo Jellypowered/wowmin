@@ -407,7 +407,7 @@ test('exports a missile\'s points and offsets, the missile targeting kit, roots,
 
   const frostbolt = visuals.forSpell(116);
   assert.deepEqual(plain(frostbolt.missile), {
-    id: 3493, scale: 1, areaSize: 0, attachment: 18, destinationAttachment: 1, rawAttachments: true,
+    id: 3493, scale: 1, areaSize: 0, minScale: 0, maxScale: 0, attachment: 18, destinationAttachment: 1, rawAttachments: true,
     castOffset: [0.5, 1, -2], impactOffset: [0, 3, 0], waitsForRelease: false,
   });
   assert.equal(frostbolt.kits.missileTargeting.id, 500);
@@ -474,6 +474,25 @@ test('exports a kit\'s model attachments as effects, and reads their offset and 
   assert.deepEqual(plain(attachTurn({ yaw: 0.5, pitch: 0, roll: 0 })), { yaw: -0.5, pitch: 0, roll: 0 });
   assert.equal(attachTurn({}), null);
   assert.equal(groundSlot('attach'), 'ground');
+});
+
+test('sizes effects as the client does: world effects by the model\'s footprint, attached ones by its scale, within limits', () => {
+  const { limitScale, unitEffectScale } = loadModule('../renderer/scripts/utils/spell-kits.ts');
+  const effect = { slot: 'chest', id: 1, scale: 2, minScale: 0.1, maxScale: 10 };
+  assert.equal(limitScale(20, effect), 10);
+  assert.equal(limitScale(0.01, effect), 0.1);
+  assert.equal(limitScale(3, effect), 3);
+  // A zero maximum leaves nothing, so 1; older art without limits is left alone.
+  assert.equal(limitScale(3, { minScale: 0, maxScale: 0 }), 1);
+  assert.equal(limitScale(3, {}), 3);
+  const scales = { world: 0.5, attached: 1.5, footprint: 4 };
+  // World: unit 1.2 x world 0.5 x footprint 4 x effect 2.
+  near(unitEffectScale(effect, 1.2, scales, true), 4.8, 'world');
+  // Attached: unit 1.2 x attached 1.5 x effect 2.
+  near(unitEffectScale(effect, 1.2, scales, false), 3.6, 'attached');
+  // A small footprint counts as 1.
+  near(unitEffectScale(effect, 1, { ...scales, footprint: 0.4 }, true), 1, 'small footprint');
+  near(unitEffectScale(effect, 1.2, null, false), 2.4, 'no model scales');
 });
 
 test('exports how a missile flies: its release, ground following, motion script, and gravity arc', async () => {

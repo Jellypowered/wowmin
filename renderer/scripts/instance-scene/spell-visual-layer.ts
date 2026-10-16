@@ -13,7 +13,7 @@ import type { UnitAnchor } from './spell-effects';
 import type { UnitLook } from './unit-models';
 import {
   AREA_ART_SCALE, areaRain, artForSchool, castKit, type ColorFlash, DEFAULT_ALPHA_FADE_MS, DIRECTED_HAND_ATTACHMENT, flashColor, groundSlot,
-  attachOffset, attachTurn, CREATURE_SPELL_ATTACKABLE, fadeAlpha, kitAlpha, kitClips, kitColor, kitColorFlash, kitFade, kitFreeze, kitWeaponTrail, KIT_WAITS_FOR_BOLT,
+  attachOffset, attachTurn, CREATURE_SPELL_ATTACKABLE, type EffectScales, fadeAlpha, limitScale, unitEffectScale, kitAlpha, kitClips, kitColor, kitColorFlash, kitFade, kitFreeze, kitWeaponTrail, KIT_WAITS_FOR_BOLT,
   MISSILE_HEIGHT_SHARE, missileAttachment, missileOffset, type ProceduralFade, RAIN_MAX_DELAY_MS, rainPoint,
   slotAttachment, type SpellVisual, type UnitAnchorRole, type VisualKit, type VisualMissile, type VisualPoints,
 } from '../utils/spell-kits';
@@ -53,6 +53,8 @@ export interface UnitInfo {
   // Which way a drawn unit's attachment is turned (world, three.js axes),
   // or null.
   attachmentTurn: (unit: UnitKey, attachment: number) => Quaternion | null;
+  // How the client sizes spell effects on a drawn unit's model, or null.
+  effectScales: (unit: UnitKey) => EffectScales | null;
 }
 
 // A missile waits at most this long for its caster's animation to let it go.
@@ -164,6 +166,7 @@ export class SpellVisualLayer {
   private units: UnitInfo = {
     anchor: () => null, attachment: () => null, isDrawn: () => false, scale: () => 1, height: () => 2, facing: () => 0, ground: (center) => center,
     releaseMs: () => null, intersect: () => null, blades: () => [], creatureTypeFlags: () => 0, attachmentTurn: () => null,
+    effectScales: () => null,
   };
   private readonly chains: ChainLightning;
   private readonly trails = new WeaponTrails();
@@ -481,8 +484,9 @@ export class SpellVisualLayer {
     return templates.some((template) => template === undefined) ? undefined : templates as Array<EffectTemplate | null>;
   }
 
-  private play(template: EffectTemplate, now: number, loop: boolean, place: PlayingEffect['place'], missile: MissileClips | null = null): PlayingEffect {
-    const instance = new EffectInstance(template, now, loop, missile);
+  private play(template: EffectTemplate, now: number, loop: boolean, place: PlayingEffect['place'], missile: MissileClips | null = null,
+    birth = false): PlayingEffect {
+    const instance = new EffectInstance(template, now, loop, missile, birth);
     this.group.add(instance.root, instance.particles);
     const effect: PlayingEffect = { instance, place, stopAt: null, last: null };
     this.playing.push(effect);
@@ -527,7 +531,8 @@ export class SpellVisualLayer {
           ? this.units.attachment(unit, attachment, offset) : this.units.anchor(unit, slotRole(effect.slot)));
         // Riding on an attachment, it turns with it, as the client's does.
         const quaternion = onModel ? this.layerTurn(this.units.attachmentTurn(unit, attachment!)) : null;
-        return point ? { position: point, yaw: this.units.facing(unit), quaternion, turn, scale: effect.scale * this.units.scale(unit) } : null;
+        const scale = unitEffectScale(effect, this.units.scale(unit), this.units.effectScales(unit), attachment === null);
+        return point ? { position: point, yaw: this.units.facing(unit), quaternion, turn, scale } : null;
       });
       if (!loop) playing.stopAt = now + playing.instance.duration;
       return [playing];
@@ -557,7 +562,7 @@ export class SpellVisualLayer {
       const attached = effect.slot === 'attach';
       const position = attached ? offsetFrom(center, attachOffset(effect), yaw) : center;
       const turn = attached ? attachTurn(effect) : null;
-      const playing = this.play(template, now, loop, () => ({ position, yaw, turn, scale: effect.scale * AREA_ART_SCALE }));
+      const playing = this.play(template, now, loop, () => ({ position, yaw, turn, scale: limitScale(effect.scale, effect) }));
       if (!loop) playing.stopAt = now + playing.instance.duration;
       return [playing];
     });
@@ -663,7 +668,8 @@ export class SpellVisualLayer {
       const template = effect ? this.kitTemplates(lasting)![lasting.effects.indexOf(effect)] : null;
       if (effect && template) {
         const yaw = units.facing(area.caster);
-        const playing = this.play(template, now, lasts, () => ({ position: center, yaw, scale: effect.scale * AREA_ART_SCALE }));
+        // It plays its Birth first, as the client's lasting area does.
+        const playing = this.play(template, now, lasts, () => ({ position: center, yaw, scale: effect.scale * AREA_ART_SCALE }), null, true);
         if (lasts) lastingEffects = [playing];
         else playing.stopAt = now + playing.instance.duration;
       }

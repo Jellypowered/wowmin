@@ -380,7 +380,7 @@ export interface MissileClips {
   rate: number;
 }
 
-type Phase = 'Stand' | 'Hold' | 'Decay' | 'Fly' | 'Impact';
+type Phase = 'Birth' | 'Stand' | 'Hold' | 'Decay' | 'Fly' | 'Impact';
 const scriptTurn = new Quaternion();
 const scriptEuler = new Euler();
 
@@ -452,7 +452,8 @@ export class EffectInstance {
   private lastAt: number;
   // Stand is the start; a lasting effect then loops Hold (or Stand, if it
   // has no Hold) and ends with Decay; a one-off plays Stand once. A missile
-  // loops Fly instead, where it has one, and ends with Impact.
+  // loops Fly instead, where it has one, and ends with Impact. A lasting
+  // area's model plays Birth first, where it has one, then holds.
   private phase: Phase = 'Stand';
   private phaseAt: number;
   private emitting = true;
@@ -460,7 +461,7 @@ export class EffectInstance {
   private scale = 1;
 
   constructor(private readonly template: EffectTemplate, now: number, private readonly loop: boolean,
-    private readonly missile: MissileClips | null = null) {
+    private readonly missile: MissileClips | null = null, birth = false) {
     this.model = cloneSkinned(template.scene);
     // The scene carries the model's name (the loader renames its node).
     const turn = MODEL_TURNS[template.scene.name.toLowerCase()];
@@ -481,7 +482,7 @@ export class EffectInstance {
         this.actions.set(clip.name, action);
       }
     }
-    this.enterPhase(missile && this.clips.Fly ? 'Fly' : 'Stand', now);
+    this.enterPhase(missile && this.clips.Fly ? 'Fly' : birth && loop && this.clips.Birth ? 'Birth' : 'Stand', now);
     const joints = new Map<number, Object3D>();
     this.model.traverse((object) => {
       const match = /^bone(\d+)$/.exec(object.name);
@@ -574,6 +575,7 @@ export class EffectInstance {
     const elapsed = now - this.startAt;
     const phaseLength = this.clips[this.phase] ?? this.duration;
     if (this.phase === 'Stand' && this.loop && this.clips.Hold && now - this.phaseAt >= phaseLength) this.enterPhase('Hold', now);
+    if (this.phase === 'Birth' && now - this.phaseAt >= phaseLength) this.enterPhase(this.clips.Hold ? 'Hold' : 'Stand', now);
     if ((this.phase === 'Decay' || this.phase === 'Impact') && this.emitting && now - this.phaseAt >= phaseLength) this.finish();
     const inPhase = (now - this.phaseAt) * this.rate(this.phase);
     const length = Math.max(1, this.clips[this.phase] ?? this.duration);

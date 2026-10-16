@@ -16,6 +16,9 @@ export interface VisualEffect {
   slot: string;
   id: number;
   scale: number;
+  // The scales the client keeps it between in the world.
+  minScale?: number;
+  maxScale?: number;
   // A model attachment's (the 'attach' slot, SpellVisualKitModelAttach):
   // its M2 attachment (-1: at the unit's feet), offset from it, and turn
   // in the effect's own frame (radians).
@@ -312,10 +315,39 @@ const RAIN_PROCEDURE = 9;
 const DEFAULT_RAIN_RATE = 5;
 // Each model starts up to this long after it is spawned.
 export const RAIN_MAX_DELAY_MS = 510;
-// Ground art drawn at the models' own size looked a little too large next to
-// the client (the user's eye on Consecration, Flamestrike, Death and Decay,
-// and Blizzard), so area-kit models are scaled by this.
+// A lasting area's model drawn at its own size looked a little too large
+// next to the client (the user's eye on Consecration, Flamestrike, Death and
+// Decay, and Blizzard), so it is scaled by this. The client may instead
+// scale it to the area's radius over the model's bounding sphere (about 0.5
+// for those), which a client screenshot is to settle.
 export const AREA_ART_SCALE = 0.75;
+
+// How the client sizes a model's spell effects (CreatureModelData): world
+// effects at its feet by `world` and its footprint (past 1), attached ones
+// by `attached`.
+export interface EffectScales {
+  world: number;
+  attached: number;
+  footprint: number;
+}
+
+// An effect's scale kept between its limits, as the client keeps it: its
+// maximum when over, its minimum when under, 1 if that leaves nothing.
+export function limitScale(scale: number, effect: Pick<VisualEffect, 'minScale' | 'maxScale'>): number {
+  if (effect.minScale === undefined || effect.maxScale === undefined) return scale;
+  const limited = scale < effect.minScale ? effect.minScale : scale < effect.maxScale ? scale : effect.maxScale;
+  return limited > 0 ? limited : 1;
+}
+
+// An effect's scale on a unit (its overall scale `unitScale`): a world
+// effect at its feet by the model's world scale and footprint; an attached
+// one by its attached scale; each then kept between the effect's limits.
+// Without the model's scales, the unit's own scale.
+export function unitEffectScale(effect: VisualEffect, unitScale: number, scales: EffectScales | null, world: boolean): number {
+  if (!scales) return effect.scale * unitScale;
+  const model = world ? scales.world * Math.max(1, scales.footprint) : scales.attached;
+  return limitScale(unitScale * model * effect.scale, effect);
+}
 
 export interface AreaRain {
   model: number;

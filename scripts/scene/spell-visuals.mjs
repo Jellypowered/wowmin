@@ -145,6 +145,9 @@ const GAMEOBJECT_MODEL_FIELD = 1;
 const EFFECT_FILE = 2;
 const EFFECT_AREA_SIZE = 3;
 const EFFECT_SCALE = 4;
+// The scales the client keeps an effect between, in the world.
+const EFFECT_MIN_SCALE = 5;
+const EFFECT_MAX_SCALE = 6;
 
 export class SpellVisuals {
   constructor(readFile) {
@@ -203,7 +206,10 @@ export class SpellVisuals {
   effect(effectId) {
     const effect = this.table('SpellVisualEffectName').get(effectId);
     if (!effect || !this.effectModel(effectId)) return null;
-    return { id: effectId, scale: effect.float(EFFECT_SCALE) || 1, areaSize: effect.float(EFFECT_AREA_SIZE) };
+    return {
+      id: effectId, scale: effect.float(EFFECT_SCALE) || 1, areaSize: effect.float(EFFECT_AREA_SIZE),
+      minScale: effect.float(EFFECT_MIN_SCALE), maxScale: effect.float(EFFECT_MAX_SCALE),
+    };
   }
 
   kit(kitId) {

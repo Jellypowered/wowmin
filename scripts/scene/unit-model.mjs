@@ -15,6 +15,11 @@ import { encodeTexture } from './textures.mjs';
 import { readDbc } from './dbc.mjs';
 
 const TEXTURE_TYPE_HARDCODED = 0;
+// The M2 header's bounding box (min x, y, z, max x, y, z), and
+// CreatureModelData's spell effect scales.
+const M2_BOUNDING_BOX = 160;
+const MODEL_WORLD_EFFECT_SCALE = 23;
+const MODEL_ATTACHED_EFFECT_SCALE = 24;
 const TEXTURE_TYPE_MONSTER_1 = 11;
 // Points spell effects are drawn at: every attachment the skeleton has, by
 // M2 attachment ID (the renderer picks the client's for each kit slot and
@@ -63,7 +68,9 @@ function animatedChannels(clips, boneCount) {
 
 // `alpha` (0 to 1) is how opaque the display draws the model (a
 // Shadowfiend is half see-through); it goes on the root for the renderer.
-export function buildUnitDocument(model, { name, textureFor, scale = 1, alpha = 1, textureMax = 256, attachments = [], points = [] }) {
+export function buildUnitDocument(model, {
+  name, textureFor, scale = 1, alpha = 1, textureMax = 256, attachments = [], points = [], effectScales = null,
+}) {
   const document = new Document();
   const buffer = document.createBuffer();
   const accessor = (type, array, normalized = false) =>
@@ -256,8 +263,10 @@ export function buildUnitDocument(model, { name, textureFor, scale = 1, alpha = 
   // Durations restore each clip's full length (the last key can come early);
   // speeds are the yards per second a movement clip was made for; releases
   // are when (seconds in) a cast clip lets a spell's missile go.
+  // Effect scales size spell effects on it as the client does.
   root.setExtras({
     wowClipDurations: durations, wowClipSpeeds: speeds, wowClipReleases: releases, ...(alpha < 1 ? { wowModelAlpha: alpha } : {}),
+    ...(effectScales ? { wowEffectScales: effectScales } : {}),
   });
   return document;
 }
@@ -279,6 +288,26 @@ export class UnitData {
       this.tables.set(name, buffer ? readDbc(buffer).byId() : new Map());
     }
     return this.tables.get(name);
+  }
+
+  // How the client sizes spell effects on a model (CreatureModelData's
+  // world and attached effect scales, by model file; 1 without a row), and
+  // its footprint: 0.3 times the smaller of its bounding box's width and
+  // depth (model units), a world effect growing with it past 1.
+  modelEffectScales(modelName, buffer) {
+    if (!this.modelDataByFile) {
+      this.modelDataByFile = new Map();
+      for (const row of this.table('CreatureModelData').values()) {
+        this.modelDataByFile.set(row.string(2).replace(/\.md[xl]$/i, '.m2').toLowerCase(), row);
+      }
+    }
+    const row = this.modelDataByFile.get(modelName.toLowerCase());
+    let footprint = 0;
+    if (buffer && buffer.length >= M2_BOUNDING_BOX + 24) {
+      const box = [0, 1, 2, 3, 4, 5].map((index) => buffer.readFloatLE(M2_BOUNDING_BOX + index * 4));
+      footprint = 0.3 * Math.min(box[3] - box[0], box[4] - box[1]);
+    }
+    return { world: row?.float(MODEL_WORLD_EFFECT_SCALE) || 1, attached: row?.float(MODEL_ATTACHED_EFFECT_SCALE) || 1, footprint };
   }
 
   // CreatureDisplayInfo → model, texture variations, scale, and opacity
@@ -323,9 +352,11 @@ async function buildCreatureGlb(unitData, displayId, { weapons = {} } = {}) {
   };
   unitData.characters ??= new CharacterData(unitData);
   const attachments = creatureWeaponAttachments(unitData.characters, display.modelName, weapons);
-  const points = modelEffectPoints(unitData.readFile(display.modelName));
+  const modelBuffer = unitData.readFile(display.modelName);
+  const points = modelEffectPoints(modelBuffer);
   const document = buildUnitDocument(model, {
     name: `creature-${displayId}`, textureFor, scale: display.scale, alpha: display.alpha, attachments, points,
+    effectScales: unitData.modelEffectScales(display.modelName, modelBuffer),
   });
   return writeGlb(document);
 }
@@ -363,9 +394,10 @@ async function buildCharacterGlb(unitData, look) {
   unitData.characters ??= new CharacterData(unitData);
   const character = loadCharacter(unitData.characters, look);
   if (!character) return null;
+  const modelBuffer = unitData.characters.readFile(character.modelName);
   const document = buildUnitDocument(character.model, {
     name: 'character', textureFor: character.textureFor, textureMax: 256, attachments: character.attachments,
-    points: modelEffectPoints(unitData.characters.readFile(character.modelName)),
+    points: modelEffectPoints(modelBuffer), effectScales: unitData.modelEffectScales(character.modelName, modelBuffer),
   });
   return writeGlb(document);
 }

@@ -38,6 +38,7 @@ import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js
 
 import type { LightColors } from '../utils/map-light';
 import type { Point3, StrikeKind } from '../utils/spell-events';
+import type { EffectScales } from '../utils/spell-kits';
 import {
   chooseUnitStance,
   getMoveTimeScale,
@@ -208,6 +209,8 @@ interface ModelTemplate {
   speeds?: Record<string, number>;
   // When (seconds in) each cast clip lets a spell's missile go.
   releases?: Record<string, number>;
+  // How the client sizes spell effects on the model.
+  effectScales?: EffectScales;
   // Floor ring radius in model units, from the model's footprint.
   radius?: number;
   // Standing height in model units (times the display scale).
@@ -532,6 +535,11 @@ export class UnitModelLayer {
     return seconds === undefined ? null : seconds * 1000;
   }
 
+  // How the client sizes spell effects on a drawn unit's model, or null.
+  effectScalesOf(id: string): EffectScales | null {
+    return this.units.get(id)?.template.effectScales ?? null;
+  }
+
   // Whether a unit is drawn as its model, so its attachments are known.
   isDrawn(id: string): boolean {
     return this.units.has(id);
@@ -720,6 +728,7 @@ export class UnitModelLayer {
       loading.clipNames = new Set(loading.clips.keys());
       loading.speeds = (root?.userData.wowClipSpeeds ?? {}) as Record<string, number>;
       loading.releases = (root?.userData.wowClipReleases ?? {}) as Record<string, number>;
+      loading.effectScales = root?.userData.wowEffectScales as EffectScales | undefined;
       loading.scene = gltf.scene;
       loading.state = 'ready';
       this.onLoaded();

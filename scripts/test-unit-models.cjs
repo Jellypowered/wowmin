@@ -526,3 +526,25 @@ test('reads when a sequence first releases a spell, from the model or its .anim 
   anim.writeUInt32LE(90, 700);
   assert.equal(releaseTimeMs(bytes, new Uint8Array(anim.buffer, anim.byteOffset, anim.byteLength), 1), 90);
 });
+
+test('reads how the client sizes a model\'s spell effects: its world and attached scales, and footprint', async () => {
+  const { UnitData } = await load('unit-model.mjs');
+  const fields = 30;
+  const header = Buffer.alloc(20);
+  header.write('WDBC');
+  header.writeUInt32LE(1, 4); header.writeUInt32LE(fields, 8); header.writeUInt32LE(fields * 4, 12);
+  const record = Buffer.alloc(fields * 4);
+  record.writeUInt32LE(7, 0); record.writeUInt32LE(1, 8);
+  record.writeFloatLE(0.5, 23 * 4); record.writeFloatLE(1.5, 24 * 4);
+  const strings = Buffer.from('\0Creature\\Ogre\\Ogre.mdx\0', 'latin1');
+  header.writeUInt32LE(strings.length, 16);
+  const files = { 'DBFilesClient\\CreatureModelData.dbc': Buffer.concat([header, record, strings]) };
+  const data = new UnitData((name) => files[name] ?? null);
+  const model = Buffer.alloc(200);
+  [-2, -5, 0, 2, 5, 6].forEach((value, index) => model.writeFloatLE(value, 160 + index * 4));
+  const scales = data.modelEffectScales('Creature\\Ogre\\Ogre.m2', model);
+  assert.equal(scales.world, 0.5);
+  assert.equal(scales.attached, 1.5);
+  near(scales.footprint, 1.2, 'footprint');
+  assert.deepEqual(data.modelEffectScales('Creature\\Other\\Other.m2', null), { world: 1, attached: 1, footprint: 0 });
+});
