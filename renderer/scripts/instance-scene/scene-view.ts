@@ -45,7 +45,7 @@ import {
 } from '../utils/map-light';
 import type { CombatEffectStore, Point3, UnitKey } from '../utils/spell-events';
 import { applyIsoCamera, serverToThree, threeToServer } from './iso-camera';
-import { SpellEffectLayer, type UnitAnchorRole } from './spell-effects';
+import { ALL_SPELL_AIDS, type SpellAids, SpellEffectLayer, type UnitAnchorRole } from './spell-effects';
 import { buildLayerArray, BYTE_SHADING_SCALE, createTerrainMaterial, prepareAlphaAtlas } from './terrain-material';
 import { GameObjectLayer, type GameObjectPose } from './game-objects';
 import { type BearerAreaCircle, SpellVisualLayer, type UnitInfo } from './spell-visual-layer';
@@ -808,8 +808,10 @@ export class InstanceSceneView {
   // Places the store's live effects for the next render; call after
   // setUnits, so hand points follow this frame's animation. Area taunts
   // (`isTaunt`) keep their floor area even when the client's art plays too.
+  // `aids` says which of WowMin's own aids to draw beside the client's art.
   setEffects(store: CombatEffectStore | null, positions: ReadonlyMap<UnitKey, Point3>, now: number,
-    auras?: ReadonlyMap<UnitKey, readonly number[]>, isTaunt: (spellId: number) => boolean = () => false): number {
+    auras?: ReadonlyMap<UnitKey, readonly number[]>, isTaunt: (spellId: number) => boolean = () => false,
+    aids: SpellAids = ALL_SPELL_AIDS): number {
     if (this.lost) return 0;
     const before = this.effects.count + this.spellVisuals.count;
     const anchor = (unit: UnitKey, role: UnitAnchorRole) => this.anchor(positions, unit, role);
@@ -834,8 +836,8 @@ export class InstanceSceneView {
     }
     this.units.setLooks(looks);
     this.effects.update(store, now, anchor,
-      (entry) => this.spellVisuals.handles(entry) && !('radius' in entry && isTaunt(entry.spellId)));
-    const areas = this.setFloorAreas(store && auras ? this.spellVisuals.bearerAreas(auras) : [], anchor);
+      (entry) => this.spellVisuals.handles(entry) && !('radius' in entry && isTaunt(entry.spellId)), aids);
+    const areas = this.setFloorAreas(store && auras && aids.circles ? this.spellVisuals.bearerAreas(auras) : [], anchor);
     const count = this.effects.count + this.spellVisuals.count + areas;
     // One more frame after the last effect ends, to clear it.
     this.effectsShown = count > 0 || before > 0;
