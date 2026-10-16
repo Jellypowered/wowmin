@@ -7,6 +7,7 @@ import {
   type Camera,
   CustomBlending,
   DoubleSide,
+  Euler,
   DynamicDrawUsage,
   AdditiveBlending,
   Group,
@@ -364,8 +365,21 @@ export interface EffectPlacement {
   position: Vec3;
   yaw: number;
   pitch?: number;
+  // A further turn in the model's own frame (radians), as a missile's
+  // motion script gives it.
+  turn?: { yaw: number; pitch: number; roll: number } | null;
   scale: number;
 }
+
+// A missile's clips: Fly loops in flight at `rate` (its speed against the
+// clip's own), and Impact plays as it lands.
+export interface MissileClips {
+  rate: number;
+}
+
+type Phase = 'Stand' | 'Hold' | 'Decay' | 'Fly' | 'Impact';
+const scriptTurn = new Quaternion();
+const scriptEuler = new Euler();
 
 const tempMatrix = new Matrix4();
 const tempVector = new Vector3();
@@ -434,14 +448,16 @@ export class EffectInstance {
   private readonly startAt: number;
   private lastAt: number;
   // Stand is the start; a lasting effect then loops Hold (or Stand, if it
-  // has no Hold) and ends with Decay; a one-off plays Stand once.
-  private phase: 'Stand' | 'Hold' | 'Decay' = 'Stand';
+  // has no Hold) and ends with Decay; a one-off plays Stand once. A missile
+  // loops Fly instead, where it has one, and ends with Impact.
+  private phase: Phase = 'Stand';
   private phaseAt: number;
   private emitting = true;
   private stopRequested = false;
   private scale = 1;
 
-  constructor(private readonly template: EffectTemplate, now: number, private readonly loop: boolean) {
+  constructor(private readonly template: EffectTemplate, now: number, private readonly loop: boolean,
+    private readonly missile: MissileClips | null = null) {
     this.model = cloneSkinned(template.scene);
     // The scene carries the model's name (the loader renames its node).
     const turn = MODEL_TURNS[template.scene.name.toLowerCase()];
@@ -462,7 +478,7 @@ export class EffectInstance {
         this.actions.set(clip.name, action);
       }
     }
-    this.enterPhase('Stand', now);
+    this.enterPhase(missile && this.clips.Fly ? 'Fly' : 'Stand', now);
     const joints = new Map<number, Object3D>();
     this.model.traverse((object) => {
       const match = /^bone(\d+)$/.exec(object.name);
@@ -494,11 +510,16 @@ export class EffectInstance {
 
   // Whether the phase repeats: Hold always; Stand when a lasting effect has
   // no Hold to settle into.
-  private repeats(phase: 'Stand' | 'Hold' | 'Decay'): boolean {
-    return phase === 'Hold' || (phase === 'Stand' && this.loop && !this.clips.Hold);
+  private repeats(phase: Phase): boolean {
+    return phase === 'Hold' || phase === 'Fly' || (phase === 'Stand' && this.loop && !this.clips.Hold);
   }
 
-  private enterPhase(phase: 'Stand' | 'Hold' | 'Decay', now: number): void {
+  // How fast the phase plays: Fly at the missile's rate.
+  private rate(phase: Phase): number {
+    return phase === 'Fly' && this.missile ? this.missile.rate : 1;
+  }
+
+  private enterPhase(phase: Phase, now: number): void {
     this.actions.get(this.phase)?.stop();
     this.phase = phase;
     this.phaseAt = now;
@@ -507,15 +528,21 @@ export class EffectInstance {
     const repeat = this.repeats(phase);
     action.reset();
     action.setLoop(repeat ? LoopRepeat : LoopOnce, repeat ? Infinity : 1);
+    action.timeScale = this.rate(phase);
     action.clampWhenFinished = true;
     action.play();
   }
 
-  // Ends the effect: a lasting one plays its Decay first; then it stops
-  // emitting and hides the model, and particles and ribbons live out.
+  // Ends the effect: a lasting one plays its Decay first, a missile its
+  // Impact; then it stops emitting and hides the model, and particles and
+  // ribbons live out.
   stop(now = this.lastAt): void {
     if (this.stopRequested) return;
     this.stopRequested = true;
+    if (this.missile && this.clips.Impact && this.emitting) {
+      this.enterPhase('Impact', now);
+      return;
+    }
     if (this.loop && this.clips.Decay && this.emitting) {
       this.enterPhase('Decay', now);
       return;
@@ -544,8 +571,8 @@ export class EffectInstance {
     const elapsed = now - this.startAt;
     const phaseLength = this.clips[this.phase] ?? this.duration;
     if (this.phase === 'Stand' && this.loop && this.clips.Hold && now - this.phaseAt >= phaseLength) this.enterPhase('Hold', now);
-    if (this.phase === 'Decay' && this.emitting && now - this.phaseAt >= phaseLength) this.finish();
-    const inPhase = now - this.phaseAt;
+    if ((this.phase === 'Decay' || this.phase === 'Impact') && this.emitting && now - this.phaseAt >= phaseLength) this.finish();
+    const inPhase = (now - this.phaseAt) * this.rate(this.phase);
     const length = Math.max(1, this.clips[this.phase] ?? this.duration);
     const clock: TrackClock = {
       clip: this.phase,
@@ -556,6 +583,10 @@ export class EffectInstance {
     this.scale = placement.scale;
     this.root.position.set(...placement.position);
     this.root.rotation.set(0, -(placement.pitch ?? 0), placement.yaw, 'ZYX');
+    if (placement.turn) {
+      scriptEuler.set(placement.turn.roll, placement.turn.pitch, placement.turn.yaw, 'ZYX');
+      this.root.quaternion.multiply(scriptTurn.setFromEuler(scriptEuler));
+    }
     this.root.scale.setScalar(placement.scale);
     // The mixer sets animated rotations; the rest start from their pose, so
     // billboard turns never pile up.

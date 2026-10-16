@@ -22,8 +22,9 @@ import { keyframeTimes, writeGlb } from './unit-model.mjs';
 
 // AnimationData.dbc IDs an effect plays: Stand once (its start); for effects
 // that last, then Hold looping (158, the idle) and Decay (159) as they end.
-// Without a Hold, a lasting effect loops Stand.
-export const EFFECT_SEQUENCES = { Stand: 0, Hold: 158, Decay: 159 };
+// Without a Hold, a lasting effect loops Stand. A missile loops Fly (144)
+// in flight and plays Impact (191) as it lands, where its model has them.
+export const EFFECT_SEQUENCES = { Stand: 0, Hold: 158, Decay: 159, Fly: 144, Impact: 191 };
 const M2_NO_LOOP = 0xFFFF;
 const M2_NO_INDEX = 0xFFFF;
 const M2_TRACK_INTERPOLATION_NONE = 0;

@@ -409,7 +409,7 @@ test('exports a missile\'s points and offsets, the missile targeting kit, roots,
   const frostbolt = visuals.forSpell(116);
   assert.deepEqual(plain(frostbolt.missile), {
     id: 3493, scale: 1, areaSize: 0, attachment: 18, destinationAttachment: 1, rawAttachments: true,
-    castOffset: [0.5, 1, -2], impactOffset: [0, 3, 0],
+    castOffset: [0.5, 1, -2], impactOffset: [0, 3, 0], waitsForRelease: false,
   });
   assert.equal(frostbolt.kits.missileTargeting.id, 500);
   assert.equal(frostbolt.rootsUnit, true);
@@ -419,6 +419,107 @@ test('exports a missile\'s points and offsets, the missile targeting kit, roots,
   // Rain models by row, counted from 0; a row past the end falls back to the first.
   assert.equal(visuals.areaModel(1), 'Spells\\RainOfFire_Impact_Base.m2');
   assert.equal(visuals.areaModel(9), 'Spells\\Blizzard_Impact_Base.m2');
+});
+
+test('exports how a missile flies: its release, ground following, motion script, and gravity arc', async () => {
+  const { SpellVisuals } = await load('spell-visuals.mjs');
+  const files = {
+    'DBFilesClient\\Spell.dbc': dbc(234, [{ 0: 6544, 131: 70, 227: 621 }, { 0: 75, 131: 71 }]),
+    'DBFilesClient\\SpellVisual.dbc': dbc(32, [
+      // Cast kit 800 plays SpellCastDirected (behaviour 53); follows the
+      // ground 500 thousandths up; motion script 13.
+      { 0: 70, 2: 800, 8: 3493, 17: float(500), 18: float(250), 19: float(800), 20: 1 | 8, 21: 13 },
+      // Released at once (flag 4), though its cast kit casts.
+      { 0: 71, 2: 800, 8: 3493, 13: 0x4 },
+    ]),
+    'DBFilesClient\\SpellVisualKit.dbc': dbc(38, [kitRecord(800, { 2: 53 })]),
+    'DBFilesClient\\SpellVisualEffectName.dbc': dbc(8, [{ 0: 3493, 2: 'Spells\\Arrow.mdx', 4: float(1) }]),
+    'DBFilesClient\\AnimationData.dbc': dbc(8, [{ 0: 53, 1: 'SpellCastDirected', 6: 53 }]),
+    'DBFilesClient\\SpellMissileMotion.dbc': dbc(5, [{ 0: 13, 1: 'Parabola', 2: 'transMag = progress * 2', 4: 3 }]),
+    'DBFilesClient\\SpellMissile.dbc': dbc(15, [{ 0: 621, 1: 1, 2: float(0.5), 3: float(0.7), 4: float(22), 5: float(24), 12: float(19.29) }]),
+  };
+  const visuals = new SpellVisuals((name) => files[name] ?? (name.toLowerCase() === 'spells\\arrow.m2' ? Buffer.alloc(1) : null));
+  const leap = visuals.forSpell(6544).missile;
+  assert.equal(leap.waitsForRelease, true);
+  assert.deepEqual(plain(leap.followGround), { height: 0.5, dropSpeed: 0.25, approach: 0.8, flags: 9 });
+  assert.equal(leap.motion.count, 3);
+  assert.deepEqual(plain(leap.motion.script), [['set', 'transMag', ['op', '*', ['var', 'progress'], ['num', 2]], false]]);
+  near(leap.trajectory.gravity, 19.29, 'gravity');
+  near(leap.trajectory.pitch[1], 0.7, 'pitch');
+  assert.deepEqual(plain(leap.trajectory.speed), [22, 24]);
+  const shot = visuals.forSpell(75).missile;
+  assert.equal(shot.waitsForRelease, false);
+  assert.equal(shot.trajectory, undefined);
+});
+
+test('parses the Lua the client\'s motion scripts use', async () => {
+  const { parseMotionScript } = await load('missile-motion.mjs');
+  assert.deepEqual(parseMotionScript('local a = -2 ^ 2 -- comment\nb = 1 + 2 * 3'), [
+    ['set', 'a', ['neg', ['op', '^', ['num', 2], ['num', 2]]], true],
+    ['set', 'b', ['op', '+', ['num', 1], ['op', '*', ['num', 2], ['num', 3]]], false],
+  ]);
+  const first = [['op', 'and', ['op', '<', ['var', 'x'], ['num', 1]], ['op', '>=', ['var', 'y'], ['num', 2]]], [['set', 'z', ['num', 1], false]]];
+  const second = [['op', '==', ['var', 'x'], ['num', 2]], [['set', 'z', ['num', 2], false]]];
+  const otherwise = [['set', 'z', ['call', 'math.fmod', [['var', 'x'], ['num', 3]]], false]];
+  assert.deepEqual(parseMotionScript('local slope\nif (x < 1 and y >= 2) then z = 1 elseif x == 2 then z = 2 else z = math.fmod(x, 3) end'), [
+    ['set', 'slope', ['nil'], true],
+    ['if', [first, second], otherwise],
+  ]);
+  assert.throws(() => parseMotionScript('while true do end'), /motion script/);
+});
+
+test('runs a motion script as the client does: degrees for sin and cos, unset outputs 0, nil arithmetic fails', () => {
+  const { runMotionScript } = loadModule('../renderer/scripts/utils/missile-motion.ts');
+  const inputs = {
+    progress: 0.5, time: 1, missileIndex: 2, missileCount: 4, distanceToFirePos: 5, distanceToImpactPos: 5, startDistance: 10,
+    totalDistance: 10, rand1: 0.1, rand2: 0.2, rand3: 0.3, spellID: 1,
+  };
+  // Spiral Vortex's angle: each missile its share of the circle, turning.
+  const out = runMotionScript([
+    ['set', 'transAngle', ['op', '+', ['op', '*', ['op', '/', ['var', 'missileIndex'], ['var', 'missileCount']], ['num', 360]], ['num', 0]], false],
+    ['set', 'transMag', ['call', 'sin', [['num', 90]]], false],
+    ['if', [[['op', '>', ['var', 'progress'], ['num', 0.4]], [['set', 'local1', ['num', 3], true], ['set', 'scale', ['var', 'local1'], false]]]], null],
+  ], inputs);
+  assert.equal(out.transAngle, 180);
+  near(out.transMag, 1, 'sin of 90 degrees');
+  assert.equal(out.scale, 3);
+  assert.equal(out.transUp, 0);
+  assert.throws(() => runMotionScript([['set', 'speedAbs', ['op', '*', ['var', 'speedAbs'], ['num', 0.5]], false]], inputs), /non-number/);
+});
+
+test('flies a missile: sped up to land on time, along a gravity arc, bent by its script', () => {
+  const { MissileFlight, trajectoryVelocity } = loadModule('../renderer/scripts/utils/missile-flight.ts');
+  // Released half a second after the cast, 20 yards out at 20 yards a
+  // second: it has half a second left, so it flies twice as fast.
+  const flight = new MissileFlight({ launch: [0, 0, 0], casterAt: [0, 0, 0], releaseAt: 500, castAt: 0, arriveAt: 1000, speed: 20 }, [20, 0, 0]);
+  assert.equal(flight.currentSpeed, 40);
+  near(flight.step(750, [20, 0, 0]).position[0], 10, 'half way');
+  assert.equal(flight.step(1000, [20, 0, 0]).arrived, true);
+  // Never faster than twice its speed.
+  const late = new MissileFlight({ launch: [0, 0, 0], casterAt: [0, 0, 0], releaseAt: 2000, castAt: 0, arriveAt: 1000, speed: 20 }, [20, 0, 0]);
+  assert.equal(late.currentSpeed, 40);
+
+  // A 45 degree arc 20 yards out on level ground under 19.29 gravity.
+  const arc = trajectoryVelocity(Math.PI / 4, [20, 0, 0], 19.29);
+  near(arc.velocity[0], arc.velocity[2], 'as fast up as along');
+  near(arc.velocity[0] * arc.time, 20, 'lands 20 yards on');
+  const lobbed = new MissileFlight({
+    launch: [0, 0, 0], casterAt: [0, 0, 0], releaseAt: 0, castAt: 0, arriveAt: arc.time * 1000, speed: 20,
+    trajectory: { gravity: 19.29, pitch: [Math.PI / 4, Math.PI / 4], speed: [20, 20] },
+  }, [20, 0, 0]);
+  const top = lobbed.step(arc.time * 500, [20, 0, 0]);
+  near(top.position[0], 10, 'half way along');
+  assert.ok(top.position[2] > 4, 'high in the middle');
+
+  // Parabola: up by its height at the middle, through an angle of 0.
+  const curved = new MissileFlight({
+    launch: [0, 0, 0], casterAt: [0, 0, 0], releaseAt: 0, castAt: 0, arriveAt: 1000, speed: 20,
+    motion: { count: 1, script: [['set', 'transMag', ['num', 3], false]] },
+  }, [20, 0, 0]);
+  curved.step(0, [20, 0, 0]);
+  const frame = curved.step(500, [20, 0, 0]);
+  near(frame.position[0], 10, 'along');
+  near(frame.position[2], 3, 'lifted');
 });
 
 test('decodes the chain IDs a combo packs', async () => {

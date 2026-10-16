@@ -217,10 +217,12 @@ export function buildUnitDocument(model, { name, textureFor, scale = 1, alpha = 
   const channels = animatedChannels(model.clips, model.bones.length);
   const durations = {};
   const speeds = {};
+  const releases = {};
   for (const clip of model.clips) {
     const animation = document.createAnimation(clip.name);
     durations[clip.name] = clip.duration / 1000;
     if (clip.moveSpeed > 0) speeds[clip.name] = clip.moveSpeed;
+    if (clip.releaseMs !== null && clip.releaseMs !== undefined) releases[clip.name] = clip.releaseMs / 1000;
     channels.forEach((paths, boneIndex) => {
       const bone = model.bones[boneIndex];
       const parent = model.bones[bone.parentIndex];
@@ -245,8 +247,11 @@ export function buildUnitDocument(model, { name, textureFor, scale = 1, alpha = 
     });
   }
   // Durations restore each clip's full length (the last key can come early);
-  // speeds are the yards per second a movement clip was made for.
-  root.setExtras({ wowClipDurations: durations, wowClipSpeeds: speeds, ...(alpha < 1 ? { wowModelAlpha: alpha } : {}) });
+  // speeds are the yards per second a movement clip was made for; releases
+  // are when (seconds in) a cast clip lets a spell's missile go.
+  root.setExtras({
+    wowClipDurations: durations, wowClipSpeeds: speeds, wowClipReleases: releases, ...(alpha < 1 ? { wowModelAlpha: alpha } : {}),
+  });
   return document;
 }
 

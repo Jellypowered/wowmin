@@ -40,6 +40,8 @@ export interface Projectile {
   color: string;
   startAt: number;
   travelMs: number;
+  // The spell's speed (yards a second; 0 for none).
+  speed: number;
   // Instant spells without a missile get a quick streak instead.
   streak: boolean;
   // Arrows and bullets: small and pale.
@@ -452,7 +454,7 @@ export class CombatEffectStore {
         travelMs = getTravelMs(yards, event.missileSpeed);
         this.projectileList.push({
           source, target: target!, spellId: event.spellId, schoolMask: event.schoolMask, color, startAt: at,
-          travelMs, streak: event.missileSpeed <= 0, physical,
+          travelMs, speed: event.missileSpeed, streak: event.missileSpeed <= 0, physical,
         });
       }
     }

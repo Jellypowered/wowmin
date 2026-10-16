@@ -4,6 +4,7 @@
 // 3.3.5 and were checked against the client's tables.
 
 import { readDbc } from './dbc.mjs';
+import { parseMotionScript } from './missile-motion.mjs';
 
 const SPELL_VISUAL_FIELD = 131;
 // Spell.dbc's enUS name and rank ("Rank 3", "Racial").
@@ -23,6 +24,12 @@ const SPELL_TARGET_FIELDS = [86, 87, 88, 89, 90, 91];
 const SPELL_RADIUS_FIELDS = [92, 93, 94];
 const SPELL_TRIGGER_FIELDS = [116, 117, 118];
 const SPELL_SCHOOL_MASK_FIELD = 225;
+// A spell's missile record (SpellMissile): one with flag 1 flies a gravity
+// arc (catapults, vehicle guns, Heroic Leap) at a pitch and speed in these
+// ranges.
+const SPELL_MISSILE_FIELD = 227;
+const MISSILE_FLAG_TRAJECTORY = 0x1;
+const MISSILE_FIELDS = { flags: 1, pitchMin: 2, pitchMax: 3, speedMin: 4, speedMax: 5, gravity: 12 };
 // A spell that roots its target (SPELL_AURA_MOD_ROOT): its kits' world
 // effect follows the unit rather than staying where it started.
 const AURA_MOD_ROOT = 26;
@@ -50,6 +57,24 @@ const VISUAL_MISSILE_MODEL = 8;
 const VISUAL_MISSILE_DESTINATION_ATTACHMENT = 10;
 const VISUAL_FLAGS = 13;
 const VISUAL_FLAG_RAW_ATTACHMENTS = 0x200;
+// A visual whose missiles leave as the spell fires, not on the cast
+// animation's release.
+const VISUAL_FLAG_RELEASE_AT_ONCE = 0x4;
+// A missile that follows the ground: its height (thousandths of a yard,
+// at least a quarter yard), how fast it drops to it, from how far along its
+// flight it heads in to its target (thousandths), and flags (1: on).
+const VISUAL_FOLLOW_GROUND = { height: 17, dropSpeed: 18, approach: 19, flags: 20 };
+const FOLLOW_GROUND_ON = 0x1;
+const MIN_FOLLOW_HEIGHT = 0.25;
+// The missile's motion script (SpellMissileMotion: name, script, flags,
+// how many missiles fly).
+const VISUAL_MISSILE_MOTION = 21;
+const MOTION_SCRIPT = 2;
+const MOTION_COUNT = 4;
+// AnimationData's behaviour: a cast kit whose animation casts a spell (or
+// throws) holds its missiles until the animation releases them.
+const ANIMATION_BEHAVIOR = 6;
+const RELEASING_BEHAVIORS = new Set([2, 32, 33, 53, 54, 46, 49, 107]);
 const VISUAL_MISSILE_ATTACHMENT = 16;
 const VISUAL_MISSILE_CAST_OFFSET = 26;
 const VISUAL_MISSILE_IMPACT_OFFSET = 29;
@@ -257,6 +282,8 @@ export class SpellVisuals {
     }
     const art = this.forVisual(spell.uint(SPELL_VISUAL_FIELD));
     if (!art) return null;
+    const trajectory = art.missile ? this.trajectory(spell) : null;
+    if (trajectory) art.missile.trajectory = trajectory;
     const bearerArea = this.bearerArea(spell);
     const rootsUnit = SPELL_AURA_FIELDS.some((field) => spell.int(field) === AURA_MOD_ROOT);
     return { spellId, ...art, ...(bearerArea ? { bearerArea } : {}), ...(rootsUnit ? { rootsUnit } : {}) };
@@ -287,10 +314,47 @@ export class SpellVisuals {
     const chainEffect = CHAIN_KIT_STAGES.some((stage) => kits[stage]?.procs.some((proc) => CHAIN_PROCEDURES.includes(proc.code)));
     return {
       visualId: visual.uint(0),
-      missile: missile && { ...missile, ...points },
+      missile: missile && { ...missile, ...points, ...this.missileFlight(visual, kits.cast) },
       kits,
       ...(chain ? { chain } : {}),
       ...(chainEffect ? { chainEffect } : {}),
+    };
+  }
+
+  // How a visual's missile flies: whether it waits for the cast animation
+  // to release it, whether it follows the ground and how, and its motion
+  // script and how many fly.
+  missileFlight(visual, castKit) {
+    const behavior = castKit && castKit.anim > 0 ? this.table('AnimationData').get(castKit.anim)?.int(ANIMATION_BEHAVIOR) : undefined;
+    const waitsForRelease = !(visual.uint(VISUAL_FLAGS) & VISUAL_FLAG_RELEASE_AT_ONCE) && RELEASING_BEHAVIORS.has(behavior);
+    const followFlags = visual.uint(VISUAL_FOLLOW_GROUND.flags);
+    const followGround = followFlags & FOLLOW_GROUND_ON ? {
+      height: Math.max(MIN_FOLLOW_HEIGHT, visual.float(VISUAL_FOLLOW_GROUND.height) / 1000),
+      dropSpeed: visual.float(VISUAL_FOLLOW_GROUND.dropSpeed) / 1000,
+      approach: Math.min(1, Math.max(0, visual.float(VISUAL_FOLLOW_GROUND.approach) / 1000)),
+      flags: followFlags,
+    } : null;
+    const motionRow = this.table('SpellMissileMotion').get(visual.uint(VISUAL_MISSILE_MOTION));
+    let motion = null;
+    if (motionRow) {
+      try {
+        motion = { count: Math.max(1, motionRow.uint(MOTION_COUNT)), script: parseMotionScript(motionRow.string(MOTION_SCRIPT)) };
+      } catch {
+        motion = null;
+      }
+    }
+    return { waitsForRelease, ...(followGround ? { followGround } : {}), ...(motion ? { motion } : {}) };
+  }
+
+  // A spell's gravity arc, if its missile flies one: gravity, and the pitch
+  // and speed ranges it is launched at.
+  trajectory(spell) {
+    const row = this.table('SpellMissile').get(spell.uint(SPELL_MISSILE_FIELD));
+    if (!row || !(row.int(MISSILE_FIELDS.flags) & MISSILE_FLAG_TRAJECTORY)) return null;
+    return {
+      gravity: row.float(MISSILE_FIELDS.gravity),
+      pitch: [row.float(MISSILE_FIELDS.pitchMin), row.float(MISSILE_FIELDS.pitchMax)],
+      speed: [row.float(MISSILE_FIELDS.speedMin), row.float(MISSILE_FIELDS.speedMax)],
     };
   }
 

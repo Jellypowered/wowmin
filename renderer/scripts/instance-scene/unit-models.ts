@@ -202,6 +202,8 @@ interface ModelTemplate {
   // The clips' names, for choosing stance clips.
   clipNames?: ReadonlySet<string>;
   speeds?: Record<string, number>;
+  // When (seconds in) each cast clip lets a spell's missile go.
+  releases?: Record<string, number>;
   // Floor ring radius in model units, from the model's footprint.
   radius?: number;
   // Standing height in model units (times the display scale).
@@ -511,6 +513,13 @@ export class UnitModelLayer {
     return unit && point ? threeToServer(this.pointWorld(unit, point, scratchVector.set(0, 0, 0))) : null;
   }
 
+  // When (ms into the clip) a drawn unit's cast clip lets a spell's missile
+  // go, or null if the unit isn't drawn, lacks the clip, or it never does.
+  releaseMsOf(id: string, clip: string): number | null {
+    const seconds = this.units.get(id)?.template.releases?.[clip];
+    return seconds === undefined ? null : seconds * 1000;
+  }
+
   // Whether a unit is drawn as its model, so its attachments are known.
   isDrawn(id: string): boolean {
     return this.units.has(id);
@@ -686,6 +695,7 @@ export class UnitModelLayer {
       }));
       loading.clipNames = new Set(loading.clips.keys());
       loading.speeds = (root?.userData.wowClipSpeeds ?? {}) as Record<string, number>;
+      loading.releases = (root?.userData.wowClipReleases ?? {}) as Record<string, number>;
       loading.scene = gltf.scene;
       loading.state = 'ready';
       this.onLoaded();

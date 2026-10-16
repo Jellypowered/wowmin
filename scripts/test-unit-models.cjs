@@ -496,3 +496,27 @@ test('keeps spell art in its own versioned folder and clears only stale cache fo
   assert.equal(models.pathFor({ kind: 'creature', key: '892', params: {} }), path.join(root, unit, 'creature', '892.glb'));
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+test('reads when a sequence first releases a spell, from the model or its .anim file', async () => {
+  const { releaseTimeMs } = await load('m2-skinned.mjs');
+  // Two events at 300 and 336: a footstep, and $CSR. Its track's times for
+  // sequence 1 are at 600 (one time, at 700: 250 ms).
+  const model = Buffer.alloc(800);
+  model.writeUInt32LE(2, 256);
+  model.writeUInt32LE(300, 260);
+  model.write('$FSD', 300, 'latin1');
+  model.write('$CSR', 336, 'latin1');
+  model.writeInt16LE(-1, 336 + 26);
+  model.writeUInt32LE(2, 336 + 28);
+  model.writeUInt32LE(600, 336 + 32);
+  model.writeUInt32LE(1, 608);
+  model.writeUInt32LE(700, 612);
+  model.writeUInt32LE(250, 700);
+  const bytes = new Uint8Array(model.buffer, model.byteOffset, model.byteLength);
+  assert.equal(releaseTimeMs(bytes, null, 1), 250);
+  assert.equal(releaseTimeMs(bytes, null, 0), null);
+  // An external sequence's times are in its .anim file.
+  const anim = Buffer.alloc(800);
+  anim.writeUInt32LE(90, 700);
+  assert.equal(releaseTimeMs(bytes, new Uint8Array(anim.buffer, anim.byteOffset, anim.byteLength), 1), 90);
+});

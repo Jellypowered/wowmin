@@ -23,6 +23,45 @@ const M2_BONE_TRACKS = { translationTrack: 16, rotationTrack: 36, scaleTrack: 56
 const M2_TRACK_TIMES = 4;
 const M2_TRACK_KEYS = 12;
 const M2_TRACK_INTERPOLATION_NONE = 0;
+// The header's events, each 36 bytes: four-letter ID, data, bone, unused,
+// position, then its track: interpolation, global sequence, and per
+// sequence the times it fires.
+const M2_EVENTS_OFFSET = 256;
+const M2_EVENT_SIZE = 36;
+const M2_EVENT_TRACK = 24;
+// The events a spell's missile is released at: left hand, right hand, a
+// thrown weapon, a bow or gun.
+const RELEASE_EVENTS = new Set(['$CSL', '$CSR', '$CST', '$BWR']);
+
+// When in a sequence (ms) the model first releases a spell's missile, or
+// null if it never does. An external sequence's times are in its .anim
+// file (`animBytes`).
+export function releaseTimeMs(modelBytes, animBytes, sequenceIndex) {
+  const model = new DataView(modelBytes.buffer, modelBytes.byteOffset, modelBytes.byteLength);
+  if (model.byteLength < M2_EVENTS_OFFSET + 8) return null;
+  const count = model.getUint32(M2_EVENTS_OFFSET, true);
+  const offset = model.getUint32(M2_EVENTS_OFFSET + 4, true);
+  if (offset + count * M2_EVENT_SIZE > model.byteLength) return null;
+  const source = animBytes ? new DataView(animBytes.buffer, animBytes.byteOffset, animBytes.byteLength) : model;
+  let first = null;
+  for (let index = 0; index < count; index += 1) {
+    const base = offset + index * M2_EVENT_SIZE;
+    const name = String.fromCharCode(...modelBytes.subarray(base, base + 4));
+    if (!RELEASE_EVENTS.has(name)) continue;
+    const track = base + M2_EVENT_TRACK;
+    if (model.getInt16(track + 2, true) !== -1) continue;
+    const sequences = model.getUint32(track + 4, true);
+    if (sequenceIndex >= sequences) continue;
+    const entry = model.getUint32(track + 8, true) + sequenceIndex * 8;
+    if (entry + 8 > model.byteLength) continue;
+    const times = model.getUint32(entry, true);
+    const at = model.getUint32(entry + 4, true);
+    if (!times || at + 4 > source.byteLength) continue;
+    const time = source.getUint32(at, true);
+    if (first === null || time < first) first = time;
+  }
+  return first;
+}
 
 // AnimationData.dbc IDs of the animations exported, by the name the renderer
 // asks for.
@@ -228,13 +267,17 @@ export function loadSkinnedM2(modelName, readFile, { showSection = () => true, a
   const clips = selectSequences(model.sequences, animations, { external: true }).flatMap((sequence) => {
     const parentPivot = (bone) => model.bones[bone.parentIndex]?.pivot;
     if (!sequence.external) {
-      return [{ ...clipInfo(sequence), bones: model.bones.map((bone) => boneChannels(bone, parentPivot(bone), sequence.index)) }];
+      return [{
+        ...clipInfo(sequence), releaseMs: releaseTimeMs(modelBytes, null, sequence.index),
+        bones: model.bones.map((bone) => boneChannels(bone, parentPivot(bone), sequence.index)),
+      }];
     }
     const animBuffer = readFile(animFileName(modelName, model.sequences[sequence.index]));
     if (!animBuffer) return [];
     const animBytes = asBytes(animBuffer);
     return [{
       ...clipInfo(sequence),
+      releaseMs: releaseTimeMs(modelBytes, animBytes, sequence.index),
       bones: model.bones.map((bone, boneIndex) => boneChannelsFrom(bone, parentPivot(bone), (track) => {
         const trackName = Object.keys(M2_BONE_TRACKS).find((name) => bone[name] === track);
         return externalTrackKeys(modelBytes, animBytes, boneIndex, trackName, track, sequence.index);

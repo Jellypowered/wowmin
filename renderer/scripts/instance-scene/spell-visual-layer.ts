@@ -6,7 +6,8 @@ import {
 } from '../utils/spell-events';
 import { type ChainDraw, ChainLightning } from './chain-ribbons';
 import { useServerAxes } from './iso-camera';
-import { EffectInstance, type EffectPlacement, type EffectTemplate, EffectTemplateCache, type EffectView, getEffectView } from './m2-effect';
+import { EffectInstance, type EffectPlacement, type EffectTemplate, EffectTemplateCache, type EffectView, getEffectView, type MissileClips } from './m2-effect';
+import { type FlightFrame, MissileFlight } from '../utils/missile-flight';
 import type { UnitAnchor } from './spell-effects';
 import type { UnitLook } from './unit-models';
 import {
@@ -38,6 +39,31 @@ export interface UnitInfo {
   // The ground under `target`, searched from `center` (the area's middle),
   // or `center` if there is none.
   ground: (center: Point3, target: Point3) => Point3;
+  // When (ms in) a drawn unit's clip lets a spell's missile go, or null.
+  releaseMs: (unit: UnitKey, clip: string) => number | null;
+  // Where a segment first meets the ground or a building, as a share of its
+  // length, or null.
+  intersect: (from: Point3, to: Point3) => number | null;
+}
+
+// A missile waits at most this long for its caster's animation to let it go.
+const MAX_RELEASE_WAIT_MS = 2000;
+// A missile following the ground with this flag keeps its height over the
+// target's feet rather than aiming at its point.
+const FOLLOW_TARGET_HEIGHT = 0x8;
+// Without the visual's landing point, a missile lands at the chest, else
+// the base, where the model has them.
+const MISSILE_LANDING_FALLBACKS = [15, 19];
+// A missile that never reaches its target (it fled, say) is ended this long
+// past when the spell landed.
+const MISSILE_OVERRUN_MS = 2000;
+
+// A missile being played: when it is let go, its copies (a motion script
+// can fly several), and its targeting art on the target while they fly.
+interface PlayingMissile {
+  releaseAt: number;
+  copies: Array<{ flight: MissileFlight; effect: PlayingEffect; frame: FlightFrame | null }> | null;
+  targeting: PlayingEffect[];
 }
 
 // Kit slots onto WowMin's estimated points, for units not drawn as models.
@@ -89,6 +115,7 @@ export interface BearerAreaCircle {
 
 // Global particle budget: past it, emitters stop spawning until room frees.
 const PARTICLE_BUDGET = 4000;
+const DEGREES = Math.PI / 180;
 // The release event a chain leaves its caster from when its visual names no
 // point.
 const CHAIN_RELEASE_EVENT = '$CSL';
@@ -98,7 +125,7 @@ export class SpellVisualLayer {
   private readonly visuals = new Map<number, SpellVisual | null | 'loading'>();
   private readonly templates: EffectTemplateCache;
   private readonly playing: PlayingEffect[] = [];
-  private readonly missiles = new Map<Projectile, { effect: PlayingEffect; targeting: PlayingEffect[] }>();
+  private readonly missiles = new Map<Projectile, PlayingMissile>();
   private readonly casts = new Map<CastGlow, { kit: VisualKit; effects: PlayingEffect[]; startedAt: number }>();
   private readonly seenImpacts = new WeakSet<Impact>();
   // Areas being played: their lasting effects, and what they rain.
@@ -125,6 +152,7 @@ export class SpellVisualLayer {
   // they keep up with it (each frame brings new positions).
   private units: UnitInfo = {
     anchor: () => null, attachment: () => null, isDrawn: () => false, scale: () => 1, height: () => 2, facing: () => 0, ground: (center) => center,
+    releaseMs: () => null, intersect: () => null,
   };
   private readonly chains: ChainLightning;
   // Spells that auras with a bearer area cast (Starfall's 30 yard search),
@@ -300,12 +328,15 @@ export class SpellVisualLayer {
         if (!areasNow.has(area) && !playing.rain && playing.impactAt === null) this.areas.delete(area);
       }
     }
-    // Missiles the store has finished with have landed, and their
-    // targeting art with them.
-    for (const [projectile, { effect, targeting }] of this.missiles) {
-      if (!store || now >= projectile.startAt + projectile.travelMs) {
-        effect.instance.stop();
-        for (const playing of targeting) playing.instance.stop(now);
+    // Missiles: let go when their caster's animation does, then flown
+    // until each copy lands; their targeting art ends as the last does.
+    for (const [projectile, missile] of this.missiles) {
+      if (!missile.copies && store && now >= missile.releaseAt) this.launchMissile(projectile, missile, now);
+      const overrun = now >= projectile.startAt + projectile.travelMs + MISSILE_OVERRUN_MS;
+      const landed = missile.copies?.every(({ frame }) => frame?.arrived) ?? false;
+      if (!store || overrun || landed || (!missile.copies && now >= missile.releaseAt)) {
+        for (const { effect } of missile.copies ?? []) effect.instance.stop(now);
+        for (const playing of missile.targeting) playing.instance.stop(now);
         this.missiles.delete(projectile);
       }
     }
@@ -418,8 +449,8 @@ export class SpellVisualLayer {
     return templates.some((template) => template === undefined) ? undefined : templates as Array<EffectTemplate | null>;
   }
 
-  private play(template: EffectTemplate, now: number, loop: boolean, place: PlayingEffect['place']): PlayingEffect {
-    const instance = new EffectInstance(template, now, loop);
+  private play(template: EffectTemplate, now: number, loop: boolean, place: PlayingEffect['place'], missile: MissileClips | null = null): PlayingEffect {
+    const instance = new EffectInstance(template, now, loop, missile);
     this.group.add(instance.root, instance.particles);
     const effect: PlayingEffect = { instance, place, stopAt: null, last: null };
     this.playing.push(effect);
@@ -605,45 +636,90 @@ export class SpellVisualLayer {
   }
 
   // Where a missile or chain lands on its target: the visual's point and
-  // offset when the model has that point, else the offset from three
-  // quarters up it.
-  private landingPoint(points: VisualPoints, target: UnitKey): Point3 | null {
+  // offset when the model has that point (for a missile, else its chest or
+  // base), else the offset from three quarters up it.
+  private landingPoint(points: VisualPoints, target: UnitKey, fallbacks: number[] = []): Point3 | null {
     const offset = missileOffset(points.impactOffset);
     const point = missileAttachment(points.destinationAttachment, points.rawAttachments);
     if (point !== null && this.units.isDrawn(target)) {
-      const at = this.units.attachment(target, point, offset);
-      if (at) return at;
+      for (const candidate of [point, ...fallbacks]) {
+        const at = this.units.attachment(target, candidate, offset);
+        if (at) return at;
+      }
     }
     const feet = this.units.anchor(target, 'feet');
     return feet && offsetFrom(feet, offset, this.units.facing(target), this.units.height(target) * MISSILE_HEIGHT_SHARE);
   }
 
-  // A missile flies from where it left its caster to its landing point on
-  // the target, following the target; the spell's missile targeting kit
-  // plays on the target while it flies.
+  // A spell's missile, as the client flies it: none for a spell without
+  // speed (it lands at once); let go when the caster's cast animation lets
+  // it go (at most two seconds on), or at once; see launchMissile.
   private startMissile(projectile: Projectile, now: number): void {
-    if (this.missiles.has(projectile) || now < projectile.startAt) return;
+    if (this.missiles.has(projectile) || now < projectile.startAt || projectile.streak) return;
     const art = this.art(projectile.spellId, projectile.schoolMask);
     const missile = art?.missile;
-    if (!missile) return;
-    const template = this.template(missile.id);
-    if (!template) return;
+    if (!missile || !this.template(missile.id)) return;
+    let releaseAt = projectile.startAt;
+    const clip = missile.waitsForRelease ? kitAnimationName(art.kits.cast?.anim) : null;
+    const releaseMs = clip ? this.units.releaseMs(projectile.source, clip) : null;
+    if (releaseMs !== null) releaseAt += Math.min(MAX_RELEASE_WAIT_MS, releaseMs);
+    this.missiles.set(projectile, { releaseAt, copies: null, targeting: [] });
+  }
+
+  // Lets a missile go from where its caster releases it: a copy for each
+  // its motion script flies, each looping its flight clip at its speed and
+  // playing its impact clip as it lands; and the targeting art on the
+  // target while they fly.
+  private launchMissile(projectile: Projectile, playing: PlayingMissile, now: number): void {
+    const art = this.art(projectile.spellId, projectile.schoolMask);
+    const missile = art?.missile;
+    const template = missile ? this.template(missile.id) : null;
+    const launch = missile ? this.firePoint(missile, projectile.source) : null;
+    const casterAt = this.units.anchor(projectile.source, 'feet');
+    const target = missile ? this.missileTarget(missile, projectile.target) : null;
+    if (!art || !missile || !template || !launch || !casterAt || !target) {
+      playing.copies = [];
+      return;
+    }
+    const count = missile.motion?.count ?? 1;
+    const flyMs = template.effect.clips?.Fly;
+    playing.copies = Array.from({ length: count }, (_, index) => {
+      const flight = new MissileFlight({
+        launch, casterAt, releaseAt: now, castAt: projectile.startAt, arriveAt: projectile.startAt + projectile.travelMs,
+        speed: projectile.speed,
+        index, count, spellId: projectile.spellId, motion: missile.motion, followGround: missile.followGround, trajectory: missile.trajectory,
+        intersect: this.units.intersect,
+      }, target);
+      const clips: MissileClips = { rate: flyMs && flight.initialYards > 0 ? (flyMs * flight.currentSpeed * 0.001) / flight.initialYards : 1 };
+      const copy = { flight, effect: null as unknown as PlayingEffect, frame: null as FlightFrame | null };
+      copy.effect = this.play(template, now, true, (time) => {
+        const to = this.missileTarget(missile, projectile.target);
+        if (!to) return null;
+        const frame = copy.frame?.arrived ? copy.frame : flight.step(time, to);
+        copy.frame = frame;
+        if (frame.arrived) copy.effect.instance.stop(time);
+        const [x, y, z] = frame.forward;
+        const position = frame.arrived ? to : frame.position;
+        return {
+          position, yaw: Math.atan2(y, x), pitch: Math.atan2(z, Math.hypot(x, y)), scale: missile.scale * frame.scale,
+          turn: frame.turn && { yaw: frame.turn.yaw * DEGREES, pitch: frame.turn.pitch * DEGREES, roll: frame.turn.roll * DEGREES },
+        };
+      }, clips);
+      return copy;
+    });
     const targetingKit = art.kits.missileTargeting;
     const targetingTemplates = targetingKit ? this.kitTemplates(targetingKit) : null;
-    if (targetingTemplates === undefined) return;
-    let from: Point3 | null = null;
-    const effect = this.play(template, now, true, (time) => {
-      from ??= this.firePoint(missile, projectile.source);
-      const to = this.landingPoint(missile, projectile.target);
-      if (!from || !to) return null;
-      const t = Math.min(1, Math.max(0, (time - projectile.startAt) / projectile.travelMs));
-      const position: Point3 = [from[0] + (to[0] - from[0]) * t, from[1] + (to[1] - from[1]) * t, from[2] + (to[2] - from[2]) * t];
-      const dx = to[0] - from[0];
-      const dy = to[1] - from[1];
-      return { position, yaw: Math.atan2(dy, dx), pitch: Math.atan2(to[2] - from[2], Math.hypot(dx, dy)), scale: missile.scale };
-    });
-    const targeting = targetingKit && targetingTemplates ? this.playKit(targetingKit, targetingTemplates, projectile.target, now, true) : [];
-    this.missiles.set(projectile, { effect, targeting });
+    if (targetingKit && targetingTemplates) playing.targeting = this.playKit(targetingKit, targetingTemplates, projectile.target, now, true);
+  }
+
+  // Where a missile aims on its target this frame; one following the
+  // ground with that flag keeps its height over the target's feet.
+  private missileTarget(missile: VisualMissile, target: UnitKey): Point3 | null {
+    const point = this.landingPoint(missile, target, MISSILE_LANDING_FALLBACKS);
+    const follow = missile.followGround;
+    if (!point || !follow || !(follow.flags & FOLLOW_TARGET_HEIGHT)) return point;
+    const feet = this.units.anchor(target, 'feet');
+    return feet ? [point[0], point[1], feet[2] + follow.height] : point;
   }
 
   // A spell landing on a unit: on its caster the caster impact kit, on

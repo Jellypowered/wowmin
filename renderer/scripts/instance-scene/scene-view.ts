@@ -823,6 +823,8 @@ export class InstanceSceneView {
       height: (unit) => this.units.heightOf(unit) ?? DEFAULT_UNIT_HEIGHT,
       facing: (unit) => this.units.orientationOf(unit) ?? 0,
       ground: (center, target) => this.groundUnder(center, target),
+      releaseMs: (unit, clip) => this.units.releaseMsOf(unit, clip),
+      intersect: (from, to) => this.intersect(from, to),
     };
     this.spellVisuals.update(store, now, units, this.camera, auras);
     const looks = this.spellVisuals.unitLooks(now);
@@ -861,6 +863,22 @@ export class InstanceSceneView {
     const ground = this.solidHit(root);
     this.raycaster.far = Infinity;
     return ground ? threeToServer(ground.point) : center;
+  }
+
+  // Where a segment first meets the map's terrain or buildings, as a share
+  // of its length, or null.
+  private intersect(from: Point3, to: Point3): number | null {
+    const root = this.shown;
+    if (!root) return null;
+    const start = serverToThree(from);
+    const end = serverToThree(to);
+    const length = start.distanceTo(end);
+    if (length <= 0) return null;
+    this.raycaster.set(start, end.sub(start).normalize());
+    this.raycaster.far = length;
+    const hit = this.solidHit(root);
+    this.raycaster.far = Infinity;
+    return hit ? hit.distance / length : null;
   }
 
   // The raycaster's nearest hit on the map's terrain and buildings (not its

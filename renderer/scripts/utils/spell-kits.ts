@@ -1,4 +1,6 @@
 import type { SpellChain } from './lightning';
+import type { FollowGround, Trajectory } from './missile-flight';
+import type { MissileMotion } from './missile-motion';
 import type { CastGlow, Point3 } from './spell-events';
 
 // The client's spell art as wowmin plays it: a spell's kits by stage, which
@@ -63,10 +65,16 @@ export interface VisualPoints {
   impactOffset?: Point3;
 }
 
-// A spell's missile: its model, and where it leaves and lands.
+// A spell's missile: its model, where it leaves and lands, and how it
+// flies: whether it waits for the cast animation to release it, and its
+// motion script, ground following, and gravity arc, if any.
 export interface VisualMissile extends VisualPoints {
   id: number;
   scale: number;
+  waitsForRelease?: boolean;
+  motion?: MissileMotion;
+  followGround?: FollowGround;
+  trajectory?: Trajectory;
 }
 
 export interface SpellVisual {

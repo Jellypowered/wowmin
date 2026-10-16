@@ -224,8 +224,11 @@ function frame(): void {
     scale: (unit) => units.scaleOf(unit) ?? 1,
     height: (unit) => units.heightOf(unit) ?? 2,
     facing: (unit) => facing.get(unit) ?? 0,
-    // No scene: falling models land on the preview's flat floor.
+    // No scene: falling models land on the preview's flat floor, and the
+    // ground is that floor (z 0).
     ground: (center, target) => [target[0], target[1], center[2]],
+    releaseMs: (unit, clip) => units.releaseMsOf(unit, clip),
+    intersect: (from, to) => (from[2] >= 0 && to[2] < 0 ? from[2] / (from[2] - to[2]) : null),
   }, camera, currentAuras(virtualNow));
   glows.update(field('glows').checked ? store : null, virtualNow, anchor, (entry) => visuals.handles(entry));
   renderer.render(scene, camera);
