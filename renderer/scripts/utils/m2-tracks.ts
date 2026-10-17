@@ -32,44 +32,70 @@ export type Vec3 = [number, number, number];
 // The track's value at the clock's time, `width` numbers per key; the
 // fallback when the track is missing or has no keys for this clip.
 export function evalTrack(track: ExportedTrack | null | undefined, width: number, clock: TrackClock, fallback: number[]): number[] {
-  if (!track) return fallback;
-  let keys: [number[], number[]] | undefined;
-  let time: number;
+  const out = new Array<number>(width);
+  return evalTrackInto(track, width, clock, out) ? out : fallback;
+}
+
+// As evalTrack, written into `out` (`width` numbers); false, leaving `out`
+// as it was, where evalTrack gives the fallback.
+export function evalTrackInto(track: ExportedTrack | null | undefined, width: number, clock: TrackClock, out: number[]): boolean {
+  if (!track) return false;
   if (track.g >= 0) {
-    keys = track.k.global;
+    const keys = track.k.global;
+    if (!keys) return false;
     const loop = clock.loops[track.g] ?? 0;
-    time = loop > 0 ? clock.elapsedMs % loop : 0;
-  } else {
-    // No keys for this clip means the default, not another clip's keys: an
-    // effect's start (Stand) often fades in or bursts, and its idle (Hold)
-    // must not replay that.
-    keys = track.k[clock.clip];
-    time = clock.timeMs;
+    return interpolateInto(keys[0], keys[1], width, loop > 0 ? clock.elapsedMs % loop : 0, track.s, out);
   }
-  if (!keys) return fallback;
-  return interpolate(keys[0], keys[1], width, time, track.s);
+  // No keys for this clip means the default, not another clip's keys: an
+  // effect's start (Stand) often fades in or bursts, and its idle (Hold)
+  // must not replay that.
+  const keys = track.k[clock.clip];
+  return keys ? interpolateInto(keys[0], keys[1], width, clock.timeMs, track.s, out) : false;
 }
 
 export function interpolate(times: number[], values: number[], width: number, time: number, step = false): number[] {
+  const out = new Array<number>(width);
+  return interpolateInto(times, values, width, time, step, out) ? out : [];
+}
+
+// The keys' value at `time` written into `out` (`width` numbers); false if
+// there are no keys.
+export function interpolateInto(times: number[], values: number[], width: number, time: number, step: boolean, out: number[]): boolean {
   const count = Math.min(times.length, Math.floor(values.length / width));
-  if (!count) return [];
-  const at = (index: number) => values.slice(index * width, index * width + width);
-  if (count === 1 || time <= times[0]) return at(0);
-  if (time >= times[count - 1]) return at(count - 1);
-  let index = 0;
-  while (index < count - 2 && times[index + 1] <= time) index += 1;
-  if (step) return at(index);
-  const span = times[index + 1] - times[index];
-  const t = span > 0 ? (time - times[index]) / span : 0;
-  const from = at(index);
-  const to = at(index + 1);
-  return from.map((value, component) => value + (to[component] - value) * t);
+  if (!count) return false;
+  let index: number;
+  let t = 0;
+  if (count === 1 || time <= times[0]) index = 0;
+  else if (time >= times[count - 1]) index = count - 1;
+  else {
+    index = 0;
+    while (index < count - 2 && times[index + 1] <= time) index += 1;
+    if (!step) {
+      const span = times[index + 1] - times[index];
+      t = span > 0 ? (time - times[index]) / span : 0;
+    }
+  }
+  const from = index * width;
+  if (t === 0) {
+    for (let component = 0; component < width; component += 1) out[component] = values[from + component];
+  } else {
+    for (let component = 0; component < width; component += 1) {
+      const value = values[from + component];
+      out[component] = value + (values[from + width + component] - value) * t;
+    }
+  }
+  return true;
 }
 
 // A curve over a particle's life at `fraction` (0 born, 1 dying).
 export function evalLifeCurve(curve: LifeCurve, width: number, fraction: number, fallback: number[]): number[] {
-  const values = interpolate(curve.t, curve.v, width, Math.min(1, Math.max(0, fraction)));
-  return values.length ? values : fallback;
+  const out = new Array<number>(width);
+  return evalLifeCurveInto(curve, width, fraction, out) ? out : fallback;
+}
+
+// As evalLifeCurve, written into `out`; false where it gives the fallback.
+export function evalLifeCurveInto(curve: LifeCurve, width: number, fraction: number, out: number[]): boolean {
+  return interpolateInto(curve.t, curve.v, width, Math.min(1, Math.max(0, fraction)), false, out);
 }
 
 // UV rectangle [u0, v0, u1, v1] of cell `cell` on a texture of rows x
@@ -77,12 +103,21 @@ export function evalLifeCurve(curve: LifeCurve, width: number, fraction: number,
 // the top left, the cell rounded to the nearest. A texture whose rows or
 // columns aren't a power of two is one cell.
 export function cellUv(cell: number, rows: number, columns: number): [number, number, number, number] {
+  return cellUvInto(cell, rows, columns, [0, 0, 0, 0]);
+}
+
+// As cellUv, written into `out`.
+export function cellUvInto(cell: number, rows: number, columns: number, out: [number, number, number, number]): [number, number, number, number] {
   const power = (value: number) => value >= 1 && (value & (value - 1)) === 0;
-  if (!power(rows) || !power(columns)) return [0, 0, 1, 1];
+  if (!power(rows) || !power(columns)) {
+    out[0] = 0; out[1] = 0; out[2] = 1; out[3] = 1;
+    return out;
+  }
   const index = Math.max(0, Math.round(cell));
   const column = index & (columns - 1);
   const row = index >> Math.log2(columns);
-  return [column / columns, row / rows, (column + 1) / columns, (row + 1) / rows];
+  out[0] = column / columns; out[1] = row / rows; out[2] = (column + 1) / columns; out[3] = (row + 1) / rows;
+  return out;
 }
 
 // A random number in [-1, 1), and in [0, 1).

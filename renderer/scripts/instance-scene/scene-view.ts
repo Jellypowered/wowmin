@@ -893,7 +893,7 @@ export class InstanceSceneView {
       intersect: (from, to) => this.intersect(from, to),
       blades: (unit) => this.units.bladesOf(unit),
       effectScales: (unit) => this.units.effectScalesOf(unit),
-      attachmentTurn: (unit, attachment) => (positions.has(unit) ? this.units.attachmentTurnOf(unit, attachment) : null),
+      attachmentTurn: (unit, attachment, out) => (positions.has(unit) ? this.units.attachmentTurnOf(unit, attachment, out) : null),
       creatureTypeFlags,
     };
     this.spellVisuals.update(store, now, units, this.camera, auras);

@@ -51,8 +51,8 @@ export interface UnitInfo {
   // A creature's creature_template type_flags (0 for players).
   creatureTypeFlags: (unit: UnitKey) => number;
   // Which way a drawn unit's attachment is turned (world, three.js axes),
-  // or null.
-  attachmentTurn: (unit: UnitKey, attachment: number) => Quaternion | null;
+  // written into `out`, or null.
+  attachmentTurn: (unit: UnitKey, attachment: number, out: Quaternion) => Quaternion | null;
   // How the client sizes spell effects on a drawn unit's model, or null.
   effectScales: (unit: UnitKey) => EffectScales | null;
 }
@@ -129,6 +129,7 @@ export interface BearerAreaCircle {
 const PARTICLE_BUDGET = 4000;
 const DEGREES = Math.PI / 180;
 const layerQuaternion = new Quaternion();
+const attachmentQuaternion = new Quaternion();
 // The release event a chain leaves its caster from when its visual names no
 // point.
 const CHAIN_RELEASE_EVENT = '$CSL';
@@ -531,7 +532,7 @@ export class SpellVisualLayer {
         const point = fixed ?? (attachment === null ? atFeet() : onModel
           ? this.units.attachment(unit, attachment, offset) : this.units.anchor(unit, slotRole(effect.slot)));
         // Riding on an attachment, it turns with it, as the client's does.
-        const quaternion = onModel ? this.layerTurn(this.units.attachmentTurn(unit, attachment!)) : null;
+        const quaternion = onModel ? this.layerTurn(this.units.attachmentTurn(unit, attachment!, attachmentQuaternion)) : null;
         const scale = unitEffectScale(effect, this.units.scale(unit), this.units.effectScales(unit), attachment === null);
         return point ? { position: point, yaw: this.units.facing(unit), quaternion, turn, scale } : null;
       });

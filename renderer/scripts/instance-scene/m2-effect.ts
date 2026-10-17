@@ -38,18 +38,20 @@ import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js
 
 import {
   cameraDistanceFor,
-  cellUv,
+  cellUvInto,
   distanceThinning,
   type EffectBlend,
   emitCount,
-  evalLifeCurve,
+  evalLifeCurveInto,
   evalTrack,
+  evalTrackInto,
   type ExportedTrack,
   type LifeCurve,
   materialBlend,
   particleBlend,
   particleSteps,
   signedRandom,
+  type SpawnParams,
   spawnParticle,
   TWINKLE_TABLE,
   twinkleEntry,
@@ -448,6 +450,10 @@ interface Particle {
   model: EffectInstance | null;
   orientation: Quaternion | null;
   tumble: Vec3;
+  // Where its model goes this frame, rewritten each frame.
+  placement: EffectPlacement | null;
+  // How far towards the camera it is this frame (sorted emitters).
+  depth: number;
 }
 
 interface EmitterState {
@@ -456,15 +462,29 @@ interface EmitterState {
   particles: Particle[];
   carry: number;
   batch: QuadBatch;
-  // Where its frame's origin was last frame (layer), and what follows from
-  // its moving: the velocity particles inherit, and the follow offset.
-  lastOrigin: Vec3 | null;
+  // Where its frame's origin is (layer) and was last frame, if it has one
+  // yet, and what follows from its moving: the way it moved, the velocity
+  // particles inherit, and the follow offset for each step.
+  origin: Vec3;
+  lastOrigin: Vec3;
+  hasOrigin: boolean;
+  moved: Vec3;
   parentVelocity: Vec3;
   inheritTimer: number;
+  stepFollow: Vec3;
   // Whether a burst emitter has fired since it last showed.
   burstFired: boolean;
-  // Its frame this frame (layer coordinates).
+  // Its frame this frame (layer coordinates), and the frame's linear part
+  // (a child emitter's is its parent's).
   frame: Matrix4;
+  frameLinear: Matrix3;
+  // Its tracks' values this frame: lifespan, whether it is enabled, its
+  // rate, gravity, and how it lets particles go.
+  lifeBase: number;
+  enabled: boolean;
+  baseRate: number;
+  gravity: number;
+  spawnParams: SpawnParams;
   // The model its particles are drawn as, if they are.
   model: EffectTemplate | null;
   // Emitters letting particles go from each of its own, and whether it is
@@ -498,7 +518,10 @@ interface RibbonState {
   // Oldest first.
   edges: RibbonEdge[];
   carry: number;
-  last: RibbonPose | null;
+  // Its pose this frame and last (once it has one), swapped each frame.
+  pose: RibbonPose;
+  last: RibbonPose;
+  hasLast: boolean;
   started: boolean;
   batches: QuadBatch[];
 }
@@ -548,7 +571,6 @@ const particlePosition = new Vector3();
 const particleTurn = new Quaternion();
 const tumbleTurn = new Quaternion();
 const tumbleAxis = new Vector3();
-const tempVector = new Vector3();
 const tempMatrix3 = new Matrix3();
 const tempQuaternion = new Quaternion();
 const tempParent = new Quaternion();
@@ -568,21 +590,115 @@ const axisX = new Vector3();
 const axisY = new Vector3();
 const axisZ = new Vector3();
 
-const transformPoint = (matrix: Matrix4, point: number[]): Vec3 => {
-  tempVector.set(point[0], point[1], point[2]).applyMatrix4(matrix);
-  return [tempVector.x, tempVector.y, tempVector.z];
+// Vector helpers writing into `out`, which may be one of their inputs.
+const transformPointInto = (out: Vec3, matrix: Matrix4, point: Vec3): Vec3 => {
+  const e = matrix.elements;
+  const x = point[0];
+  const y = point[1];
+  const z = point[2];
+  const w = 1 / (e[3] * x + e[7] * y + e[11] * z + e[15]);
+  out[0] = (e[0] * x + e[4] * y + e[8] * z + e[12]) * w;
+  out[1] = (e[1] * x + e[5] * y + e[9] * z + e[13]) * w;
+  out[2] = (e[2] * x + e[6] * y + e[10] * z + e[14]) * w;
+  return out;
 };
 // A direction through a matrix's linear part, scale and all.
-const linear = (matrix: Matrix4, direction: Vec3): Vec3 => {
-  tempVector.set(direction[0], direction[1], direction[2]).applyMatrix3(tempMatrix3.setFromMatrix4(matrix));
-  return [tempVector.x, tempVector.y, tempVector.z];
+const linearInto = (out: Vec3, matrix: Matrix3, direction: Vec3): Vec3 => {
+  const e = matrix.elements;
+  const x = direction[0];
+  const y = direction[1];
+  const z = direction[2];
+  out[0] = e[0] * x + e[3] * y + e[6] * z;
+  out[1] = e[1] * x + e[4] * y + e[7] * z;
+  out[2] = e[2] * x + e[5] * y + e[8] * z;
+  return out;
 };
-const add = (a: Vec3, b: Vec3, scale = 1): Vec3 => [a[0] + b[0] * scale, a[1] + b[1] * scale, a[2] + b[2] * scale];
+const addInto = (out: Vec3, a: Vec3, b: Vec3, scale = 1): Vec3 => {
+  out[0] = a[0] + b[0] * scale;
+  out[1] = a[1] + b[1] * scale;
+  out[2] = a[2] + b[2] * scale;
+  return out;
+};
+const scaleInto = (out: Vec3, v: Vec3, scale: number): Vec3 => {
+  out[0] = v[0] * scale;
+  out[1] = v[1] * scale;
+  out[2] = v[2] * scale;
+  return out;
+};
 const length = (v: Vec3): number => Math.hypot(v[0], v[1], v[2]);
-const normalize = (v: Vec3): Vec3 => {
+const normalizeInto = (out: Vec3, v: Vec3): Vec3 => {
   const size = length(v) || 1;
-  return [v[0] / size, v[1] / size, v[2] / size];
+  out[0] = v[0] / size;
+  out[1] = v[1] / size;
+  out[2] = v[2] / size;
+  return out;
 };
+// A quad's corners round `center`, `width` along `right` and `height` along
+// `up` each way, in order round it.
+const quadInto = (corners: Vec3[], center: Vec3, right: Vec3, width: number, up: Vec3, height: number): Vec3[] => {
+  for (let axis = 0; axis < 3; axis += 1) {
+    const c = center[axis];
+    const r = right[axis];
+    const u = up[axis];
+    corners[0][axis] = c + r * -width + u * -height;
+    corners[1][axis] = c + r * width + u * -height;
+    corners[2][axis] = c + r * width + u * height;
+    corners[3][axis] = c + r * -width + u * height;
+  }
+  return corners;
+};
+const WHITE: readonly number[] = [1, 1, 1];
+const WHITE_BYTES: readonly number[] = [255, 255, 255];
+const ZERO: Vec3 = [0, 0, 0];
+const X_AXIS: Vec3 = [1, 0, 0];
+const Y_AXIS: Vec3 = [0, 1, 0];
+const Z_AXIS: Vec3 = [0, 0, 1];
+// Scratch for the particle and ribbon loops; never held across a call that
+// may update another instance (a model particle's).
+const curveScratch = [0, 0, 0, 0];
+const valueScratch = [0];
+const uvScratch: [number, number, number, number] = [0, 0, 0, 0];
+const colorScratch: [number, number, number, number] = [0, 0, 0, 0];
+const cornerScratch: Vec3[] = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
+const centerScratch: Vec3 = [0, 0, 0];
+const velocityScratch: Vec3 = [0, 0, 0];
+const rightScratch: Vec3 = [0, 0, 0];
+const upScratch: Vec3 = [0, 0, 0];
+const planeXScratch: Vec3 = [0, 0, 0];
+const planeYScratch: Vec3 = [0, 0, 0];
+const acrossScratch: Vec3 = [0, 0, 0];
+const endScratch: Vec3 = [0, 0, 0];
+const atScratch: Vec3 = [0, 0, 0];
+const beforeScratch: Vec3 = [0, 0, 0];
+const fromScratch: Vec3 = [0, 0, 0];
+const childMovedScratch: Vec3 = [0, 0, 0];
+const ribbonScratch = { startBelow: [0, 0, 0] as Vec3, startAbove: [0, 0, 0] as Vec3, endBelow: [0, 0, 0] as Vec3, endAbove: [0, 0, 0] as Vec3,
+  startTangent: [0, 0, 0] as Vec3, endTangent: [0, 0, 0] as Vec3 };
+const billboardA = new Vector3();
+const billboardB = new Vector3();
+const billboardC = new Vector3();
+
+// A one-number track's value, or `fallback`.
+const trackValue = (track: ExportedTrack | null, clock: TrackClock, fallback: number): number =>
+  (evalTrackInto(track, 1, clock, valueScratch) ? valueScratch[0] : fallback);
+const byDepth = (a: Particle, b: Particle): number => a.depth - b.depth;
+// A particle's colour and opacity `fraction` through its life, by its
+// emitter's curves, as bytes made 0 to 1 (opacity to the byte by
+// `toByte`: model particles floor it, quads round it).
+function particleColorInto(out: [number, number, number, number], def: ExportedEmitter, fraction: number,
+  toByte: (value: number) => number): [number, number, number, number] {
+  const color = evalLifeCurveInto(def.color, 3, fraction, curveScratch) ? curveScratch : WHITE_BYTES;
+  out[0] = Math.round(color[0]) / 255;
+  out[1] = Math.round(color[1]) / 255;
+  out[2] = Math.round(color[2]) / 255;
+  const alpha = evalLifeCurveInto(def.alpha, 1, fraction, curveScratch) ? curveScratch[0] : 1;
+  out[3] = Math.min(1, Math.max(0, toByte(alpha * 255) / 255));
+  return out;
+}
+// How long a particle of the emitter lives (seconds), by its life seed.
+const particleLife = (emitter: EmitterState, lifeSeed: number): number =>
+  Math.max(MIN_LIFE, emitter.lifeBase + lifeSeed * emitter.def.lifespanVariation);
+const newPose = (): RibbonPose => ({ position: [0, 0, 0], forward: [0, 0, 0], up: [0, 0, 0] });
 
 // The camera's directions in the layer's coordinates, for billboards.
 // What an emitter's particles are let go into this frame: the share of its
@@ -630,6 +746,8 @@ export class EffectInstance {
   private readonly model: Object3D;
   private readonly mixer: AnimationMixer;
   private readonly emitters: EmitterState[];
+  // The emitters and their child emitters.
+  private readonly everyEmitter: EmitterState[];
   private readonly ribbons: RibbonState[];
   private readonly billboards: Object3D[] = [];
   private readonly materials: AnimatedMaterial[] = [];
@@ -648,7 +766,7 @@ export class EffectInstance {
   private stopRequested = false;
   // Colour and opacity it is drawn in on top of its own, as a model
   // particle is by its particle's.
-  private tint: [number, number, number, number] = [1, 1, 1, 1];
+  private readonly tint: [number, number, number, number] = [1, 1, 1, 1];
 
   constructor(private readonly template: EffectTemplate, now: number, private readonly loop: boolean,
     private readonly missile: MissileClips | null = null, birth = false) {
@@ -692,13 +810,20 @@ export class EffectInstance {
       const childDefs = child || def.childEmitters === undefined ? [] : template.particleModels[def.childEmitters]?.effect.emitters ?? [];
       return {
         def, joint: child ? null : joints.get(def.bone) ?? null, particles: [], carry: 0, batch,
-        lastOrigin: null, parentVelocity: [0, 0, 0], inheritTimer: 0, burstFired: false, frame: new Matrix4(),
+        origin: [0, 0, 0], lastOrigin: [0, 0, 0], hasOrigin: false, moved: [0, 0, 0], parentVelocity: [0, 0, 0], inheritTimer: 0,
+        stepFollow: [0, 0, 0], burstFired: false, frame: new Matrix4(), frameLinear: new Matrix3(),
+        lifeBase: 1, enabled: false, baseRate: 0, gravity: 0,
+        spawnParams: {
+          emitterType: def.emitterType, areaWidth: 0, areaLength: 0, verticalRange: 0, horizontalRange: 0, speed: 0, speedVariation: 0, zSource: 0,
+          upward: def.emitterType === 2 && Boolean(def.flags & FLAG_UPWARD), splinePoints: def.splinePoints,
+        },
         model: def.particleModel === undefined ? null : template.particleModels[def.particleModel] ?? null,
         children: childDefs.map((childDef) => emitterState(childDef, true)),
         child,
       };
     };
     this.emitters = template.effect.emitters.map((def) => emitterState(def, false));
+    this.everyEmitter = this.emitters.flatMap((emitter) => [emitter, ...emitter.children]);
     this.ribbons = template.effect.ribbons.map((def) => {
       const passes = def.passes?.length ? def.passes : [{ textureMaterial: def.textureMaterial, blend: def.blend }];
       const batches = passes.map((pass) => {
@@ -707,7 +832,7 @@ export class EffectInstance {
         this.particles.add(batch.mesh);
         return batch;
       });
-      return { def, joint: joints.get(def.bone) ?? null, edges: [], carry: 0, last: null, started: false, batches };
+      return { def, joint: joints.get(def.bone) ?? null, edges: [], carry: 0, pose: newPose(), last: newPose(), hasLast: false, started: false, batches };
     });
   }
 
@@ -769,8 +894,10 @@ export class EffectInstance {
 
   // Stopped, with nothing left on screen.
   get done(): boolean {
-    return !this.emitting && this.allEmitters().every((emitter) => !emitter.particles.length)
-      && this.ribbons.every((ribbon) => ribbon.edges.length < 1);
+    if (this.emitting) return false;
+    for (const emitter of this.everyEmitter) if (emitter.particles.length) return false;
+    for (const ribbon of this.ribbons) if (ribbon.edges.length) return false;
+    return true;
   }
 
   update(now: number, placement: EffectPlacement, view: EffectView, layer: Object3D, budget: { left: number }): void {
@@ -811,18 +938,18 @@ export class EffectInstance {
     for (const ribbon of this.ribbons) this.updateRibbon(ribbon, clock, Math.min(0.1, seconds), layerInverse);
   }
 
-  private allEmitters(): EmitterState[] {
-    return this.emitters.flatMap((emitter) => [emitter, ...emitter.children]);
-  }
-
   // Draws it in this colour and opacity on top of its own.
-  setTint(tint: [number, number, number, number]): void {
-    this.tint = tint;
+  setTint(red: number, green: number, blue: number, alpha: number): void {
+    const tint = this.tint;
+    tint[0] = red;
+    tint[1] = green;
+    tint[2] = blue;
+    tint[3] = alpha;
   }
 
   dispose(): void {
     this.mixer.stopAllAction();
-    for (const emitter of this.allEmitters()) {
+    for (const emitter of this.everyEmitter) {
       emitter.batch.dispose();
       for (const particle of emitter.particles) particle.model?.dispose();
     }
@@ -863,11 +990,11 @@ export class EffectInstance {
   }
 
   private animateMaterials(clock: TrackClock): void {
+    const tint = this.tint;
     for (const animated of this.materials) {
-      const [r, g, b] = evalTrack(animated.color, 3, clock, [1, 1, 1]);
-      const [tr, tg, tb, ta] = this.tint;
-      animated.material.color.setRGB(r * tr, g * tg, b * tb);
-      const alpha = evalTrack(animated.alpha, 1, clock, [1])[0] * evalTrack(animated.weight, 1, clock, [1])[0] * ta;
+      const color = evalTrackInto(animated.color, 3, clock, curveScratch) ? curveScratch : WHITE;
+      animated.material.color.setRGB(color[0] * tint[0], color[1] * tint[1], color[2] * tint[2]);
+      const alpha = trackValue(animated.alpha, clock, 1) * trackValue(animated.weight, clock, 1) * tint[3];
       animated.material.opacity = Math.min(1, Math.max(0, alpha));
       const map = animated.material.map;
       if (!map) continue;
@@ -889,12 +1016,10 @@ export class EffectInstance {
     const screenRight = billboardRight.fromArray(view.right).applyQuaternion(layerQuaternion);
     basis.makeBasis(toCamera, axisY.crossVectors(screenUp, toCamera), screenUp);
     const facing = facingScratch.setFromRotationMatrix(basis);
-    // A world axis's (right, up) on screen.
-    const onScreen = (axis: Vector3): [number, number] => [axis.dot(screenRight), axis.dot(screenUp)];
     // The screen's direction for (right, up), made a unit world axis.
-    const fromScreen = (right: number, up: number): Vector3 => {
+    const fromScreenInto = (out: Vector3, right: number, up: number): Vector3 => {
       const size = Math.hypot(right, up) || 1;
-      return new Vector3().addScaledVector(screenRight, right / size).addScaledVector(screenUp, up / size);
+      return out.copy(screenRight).multiplyScalar(right / size).addScaledVector(screenUp, up / size);
     };
     for (const bone of this.billboards) {
       const flags = bone.userData.wowBillboard as number;
@@ -904,20 +1029,18 @@ export class EffectInstance {
       } else {
         // The bone's axes as animated, in the world.
         const turn = tempQuaternion.copy(tempParent).multiply(bone.quaternion);
-        const a = new Vector3(1, 0, 0).applyQuaternion(turn);
-        const b = new Vector3(0, 1, 0).applyQuaternion(turn);
-        const c = new Vector3(0, 0, 1).applyQuaternion(turn);
+        const a = billboardA.set(1, 0, 0).applyQuaternion(turn);
+        const b = billboardB.set(0, 1, 0).applyQuaternion(turn);
+        const c = billboardC.set(0, 0, 1).applyQuaternion(turn);
+        // The locked axis's (right, up) on screen.
         if (flags & BILLBOARD_LOCK_X) {
-          const [r, u] = onScreen(a);
-          b.copy(fromScreen(u, -r));
+          fromScreenInto(b, a.dot(screenUp), -a.dot(screenRight));
           c.crossVectors(a, b);
         } else if (flags & BILLBOARD_LOCK_Y) {
-          const [r, u] = onScreen(b);
-          a.copy(fromScreen(-u, r));
+          fromScreenInto(a, -b.dot(screenUp), b.dot(screenRight));
           c.crossVectors(a, b);
         } else {
-          const [r, u] = onScreen(c);
-          b.copy(fromScreen(u, -r));
+          fromScreenInto(b, c.dot(screenUp), -c.dot(screenRight));
           a.crossVectors(b, c);
         }
         basis.makeBasis(a.normalize(), b.normalize(), c.normalize());
@@ -943,27 +1066,35 @@ export class EffectInstance {
     // turned a quarter about Z.
     const frame = emitter.frame.copy(this.emitterMatrix(emitter.joint, def.bonePivot, layerInverse))
       .multiply(pivotScratch.makeTranslation(def.position[0], def.position[1], def.position[2])).multiply(EMITTER_TURN);
-    const origin = transformPoint(frame, [0, 0, 0]);
-    const lastOrigin = emitter.lastOrigin ?? origin;
-    emitter.lastOrigin = origin;
-    const moved: Vec3 = [origin[0] - lastOrigin[0], origin[1] - lastOrigin[1], origin[2] - lastOrigin[2]];
-    const frameScale = length(linear(frame, [1, 0, 0]));
+    const frameLinear = emitter.frameLinear.setFromMatrix4(frame);
+    const origin = transformPointInto(emitter.origin, frame, ZERO);
+    const lastOrigin = emitter.hasOrigin ? emitter.lastOrigin : origin;
+    const moved = emitter.moved;
+    for (let axis = 0; axis < 3; axis += 1) moved[axis] = origin[axis] - lastOrigin[axis];
+    scaleInto(emitter.lastOrigin, origin, 1);
+    emitter.hasOrigin = true;
+    // The frame's scale along its X.
+    const frameScale = Math.hypot(frameLinear.elements[0], frameLinear.elements[1], frameLinear.elements[2]);
+    this.prepareEmitter(emitter, clock);
+    for (const child of emitter.children) {
+      child.frameLinear.copy(frameLinear);
+      this.prepareEmitter(child, clock);
+    }
 
     // What follows from the emitter moving: particles it leaves follow it
     // by a share that grows with its speed, and new ones inherit its speed.
-    let follow: Vec3 = [0, 0, 0];
+    let share = 0;
     if (flags & FLAG_FOLLOW && seconds > 0) {
       const [speed1, scale1, speed2, scale2] = [def.followSpeed1 ?? 0, def.followScale1 ?? 0, def.followSpeed2 ?? 0, def.followScale2 ?? 0];
       const slope = Math.abs(speed2 - speed1) < 2.3841858e-7 ? 0 : (scale2 - scale1) / (speed2 - speed1);
       const intercept = Math.abs(speed2 - speed1) < 2.3841858e-7 ? 0 : scale1 - speed1 * slope;
-      const share = Math.min(1, Math.max(0, (length(moved) / seconds) * slope + intercept));
-      follow = [moved[0] * share, moved[1] * share, moved[2] * share];
+      share = Math.min(1, Math.max(0, (length(moved) / seconds) * slope + intercept));
     }
     if (flags & FLAG_INHERIT_VELOCITY) {
       emitter.inheritTimer += seconds;
       if (emitter.inheritTimer > INHERIT_VELOCITY_STEP) {
         const scale = emitter.particles.length ? (def.inheritVelocityScale ?? 0) / (emitter.inheritTimer * 30) : 0;
-        emitter.parentVelocity = [moved[0] * scale, moved[1] * scale, moved[2] * scale];
+        for (let axis = 0; axis < 3; axis += 1) emitter.parentVelocity[axis] = moved[axis] * scale;
         emitter.inheritTimer = 0;
       }
     }
@@ -971,31 +1102,48 @@ export class EffectInstance {
     // A long frame goes in steps, the following shared between them; the
     // emitter lets fewer go the further it is from the camera, and its
     // child emitters as many fewer.
-    const steps = particleSteps(seconds, evalTrack(def.lifespan, 1, clock, [1])[0]);
-    const stepFollow: Vec3 = [follow[0] / steps.length, follow[1] / steps.length, follow[2] / steps.length];
+    const steps = particleSteps(seconds, emitter.lifeBase);
+    const stepFollow = emitter.stepFollow;
+    for (let axis = 0; axis < 3; axis += 1) stepFollow[axis] = (moved[axis] * share) / steps.length;
     const around: Surroundings = { thinning: distanceThinning(view.distance(origin)), ground: view.ground };
     for (const step of steps) {
-      this.spawn(emitter, this.birthCount(emitter, clock, step, around.thinning), frame, moved, clock, step, around.ground, budget);
-      this.moveParticles(emitter, clock, step, origin, stepFollow, frame, around, budget);
+      this.spawn(emitter, this.birthCount(emitter, step, around.thinning), frame, moved, step, around.ground, budget);
+      this.moveParticles(emitter, step, origin, stepFollow, frame, around, budget);
       // Its child emitters' particles, born at its own (as they move).
-      for (const child of emitter.children) this.moveParticles(child, clock, step, null, [0, 0, 0], frame, around, budget);
+      for (const child of emitter.children) this.moveParticles(child, step, null, ZERO, frame, around, budget);
     }
     budget.left -= emitter.particles.length;
     for (const child of emitter.children) budget.left -= child.particles.length;
-    const lifeOf = this.lifeOf(emitter, clock);
-    if (emitter.model) this.drawParticleModels(emitter, frame, frameScale, view, lifeOf, budget);
-    else this.drawParticles(emitter, frame, frameScale, view, lifeOf);
-    for (const child of emitter.children) this.drawParticles(child, frame, frameScale, view, this.lifeOf(child, clock));
+    if (emitter.model) this.drawParticleModels(emitter, frame, frameScale, view, budget);
+    else this.drawParticles(emitter, frame, frameScale, view);
+    for (const child of emitter.children) this.drawParticles(child, frame, frameScale, view);
+  }
+
+  // The emitter's tracks' values this frame.
+  private prepareEmitter(emitter: EmitterState, clock: TrackClock): void {
+    const def = emitter.def;
+    emitter.lifeBase = trackValue(def.lifespan, clock, 1);
+    emitter.enabled = trackValue(def.enabled, clock, 1) !== 0;
+    emitter.baseRate = trackValue(def.emissionRate, clock, 0);
+    emitter.gravity = -(evalTrackInto(def.gravity, 3, clock, curveScratch) ? curveScratch[2] : 0);
+    const spawn = emitter.spawnParams;
+    spawn.areaWidth = trackValue(def.emissionAreaWidth, clock, 0);
+    spawn.areaLength = trackValue(def.emissionAreaLength, clock, 0);
+    spawn.verticalRange = trackValue(def.verticalRange, clock, 0);
+    spawn.horizontalRange = trackValue(def.horizontalRange, clock, 0);
+    spawn.speed = trackValue(def.emissionSpeed, clock, 0);
+    spawn.speedVariation = trackValue(def.speedVariation, clock, 0);
+    spawn.zSource = trackValue(def.zSource, clock, 0);
   }
 
   // How many particles an emitter lets go this step, its rate scaled by
   // `thinning`. A burst emitter lets its rate's worth go at once as it
   // shows; the rest emit at their rate (with its variation), carrying the
   // remainder.
-  private birthCount(emitter: EmitterState, clock: TrackClock, seconds: number, thinning: number): number {
+  private birthCount(emitter: EmitterState, seconds: number, thinning: number): number {
     const def = emitter.def;
-    const visible = this.emitting && evalTrack(def.enabled, 1, clock, [1])[0] !== 0;
-    const base = visible ? evalTrack(def.emissionRate, 1, clock, [0])[0] : 0;
+    const visible = this.emitting && emitter.enabled;
+    const base = visible ? emitter.baseRate : 0;
     const rate = (base + signedRandom() * def.emissionRateVariation) * thinning;
     if (def.flags & FLAG_BURST) {
       const fired = emitter.burstFired;
@@ -1008,54 +1156,34 @@ export class EffectInstance {
     return count;
   }
 
-  private lifeOf(emitter: EmitterState, clock: TrackClock): (particle: Pick<Particle, 'lifeSeed'>) => number {
-    const lifeBase = evalTrack(emitter.def.lifespan, 1, clock, [1])[0];
-    return (particle) => Math.max(MIN_LIFE, lifeBase + particle.lifeSeed * emitter.def.lifespanVariation);
-  }
-
   // New particles from the emitter's frame (layer coordinates), `moved` the
   // way it came this frame, those flagged so put on `ground`.
-  private spawn(emitter: EmitterState, births: number, frame: Matrix4, moved: Vec3, clock: TrackClock, seconds: number,
+  private spawn(emitter: EmitterState, births: number, frame: Matrix4, moved: Vec3, seconds: number,
     ground: EffectView['ground'], budget: { left: number }): void {
     const room = Math.min(births, MAX_PARTICLES_PER_EMITTER - emitter.particles.length, Math.max(0, budget.left));
     if (room <= 0) return;
     const def = emitter.def;
     const flags = def.flags;
     const local = isLocal(emitter);
-    const value = (track: ExportedTrack | null) => evalTrack(track, 1, clock, [0])[0];
-    const spawn = {
-      emitterType: def.emitterType,
-      areaWidth: value(def.emissionAreaWidth),
-      areaLength: value(def.emissionAreaLength),
-      verticalRange: value(def.verticalRange),
-      horizontalRange: value(def.horizontalRange),
-      speed: value(def.emissionSpeed),
-      speedVariation: value(def.speedVariation),
-      zSource: value(def.zSource),
-      upward: def.emitterType === 2 && Boolean(flags & FLAG_UPWARD),
-      splinePoints: def.splinePoints,
-    };
     const cells = Math.max(1, def.rows * def.columns);
-    const lifeOf = this.lifeOf(emitter, clock);
     for (let index = 0; index < room; index += 1) {
-      const born = spawnParticle(spawn);
-      let position = born.position;
-      let velocity = born.velocity;
+      // Its position and velocity are its own from here, changed in place.
+      const { position, velocity } = spawnParticle(emitter.spawnParams);
       const age = Math.random() * seconds;
       const lifeSeed = signedRandom();
       if (!local) {
-        position = transformPoint(frame, position);
-        velocity = linear(frame, velocity);
+        transformPointInto(position, frame, position);
+        linearInto(velocity, emitter.frameLinear, velocity);
         // Spread along the way the emitter came this frame.
-        if (flags & FLAG_SPREAD_ALONG_PATH) position = add(position, moved, Math.random() - 1);
+        if (flags & FLAG_SPREAD_ALONG_PATH) addInto(position, position, moved, Math.random() - 1);
         // On the ground, lifted by its size then.
         const height = flags & FLAG_GROUND && ground ? ground(position) : null;
         if (height !== null) {
-          const [sizeX, sizeY] = evalLifeCurve(def.scale, 2, age / lifeOf({ lifeSeed }), [1, 1]);
-          position[2] = height + Math.max(sizeX, sizeY ?? sizeX);
+          const sized = evalLifeCurveInto(def.scale, 2, age / particleLife(emitter, lifeSeed), curveScratch);
+          position[2] = height + (sized ? Math.max(curveScratch[0], curveScratch[1]) : 1);
         }
       }
-      if (flags & FLAG_INHERIT_VELOCITY) velocity = add(velocity, emitter.parentVelocity, 1 + signedRandom() * spawn.speedVariation);
+      if (flags & FLAG_INHERIT_VELOCITY) addInto(velocity, velocity, emitter.parentVelocity, 1 + signedRandom() * emitter.spawnParams.speedVariation);
       const scaleX = 1 + signedRandom() * (def.scaleVary?.[0] ?? 0);
       const model = emitter.model ? this.spawnModel(emitter, frame, local, flags) : null;
       emitter.particles.push({
@@ -1072,62 +1200,84 @@ export class EffectInstance {
         model: model?.instance ?? null,
         orientation: model?.orientation ?? null,
         tumble: model?.tumble ?? [0, 0, 0],
+        placement: model ? { position: [0, 0, 0], yaw: 0, quaternion: [0, 0, 0, 1], scale: 1, stretch: [1, 1, 1] } : null,
+        depth: 0,
       });
     }
     budget.left -= room;
   }
 
-  // Moves an emitter's particles and drops the dead: wind while it blows,
-  // following the emitter, then their own speed, gravity down its frame's
-  // Z, and drag. Each that lives lets its child emitters' particles go from
-  // where it is (in its surroundings), turned as the emitter's frame
-  // (`frame`) is, as it moved and heading as it heads. `origin` is the
-  // emitter's (null for a child's particles, which never die heading
-  // outward).
-  private moveParticles(emitter: EmitterState, clock: TrackClock, seconds: number, origin: Vec3 | null, follow: Vec3,
+  // Moves an emitter's particles and drops the dead, keeping their order:
+  // wind while it blows, following the emitter, then their own speed,
+  // gravity down its frame's Z, and drag. Each that lives lets its child
+  // emitters' particles go from where it is (in its surroundings), turned
+  // as the emitter's frame (`frame`) is, as it moved and heading as it
+  // heads. `origin` is the emitter's (null for a child's particles, which
+  // never die heading outward).
+  private moveParticles(emitter: EmitterState, seconds: number, origin: Vec3 | null, follow: Vec3,
     frame: Matrix4, around: Surroundings, budget: { left: number }): void {
     const def = emitter.def;
     const flags = def.flags;
     const local = isLocal(emitter);
-    const gravity = -(evalTrack(def.gravity, 3, clock, [0, 0, 0])[2] ?? 0);
-    const wind = (def.wind ?? [0, 0, 0]) as Vec3;
+    const gravity = emitter.gravity;
+    const wind = (def.wind ?? ZERO) as Vec3;
     const windTime = def.windTime ?? 0;
     const drag = Math.min(1, def.drag * seconds);
-    const lifeOf = this.lifeOf(emitter, clock);
-    const alive = (particle: Particle) => {
+    const killOutward = Boolean(origin && def.emitterType === 2 && flags & FLAG_KILL_OUTWARD);
+    const children = emitter.children;
+    const particles = emitter.particles;
+    let kept = 0;
+    for (let index = 0; index < particles.length; index += 1) {
+      const particle = particles[index];
+      const position = particle.position;
+      const velocity = particle.velocity;
+      beforeScratch[0] = position[0];
+      beforeScratch[1] = position[1];
+      beforeScratch[2] = position[2];
       particle.age += seconds;
-      if (particle.age >= lifeOf(particle)) return false;
-      if (particle.orientation) this.tumble(particle, seconds);
-      if (windTime > particle.age) particle.velocity = add(particle.velocity, wind, seconds);
-      if (flags & FLAG_FOLLOW && particle.age > seconds * 2) particle.position = add(particle.position, follow);
-      const step: Vec3 = [particle.velocity[0] * seconds, particle.velocity[1] * seconds, particle.velocity[2] * seconds];
-      particle.position = add(particle.position, step);
-      particle.position[2] -= gravity * seconds * seconds * 0.5;
-      particle.velocity[2] -= gravity * seconds;
-      if (drag) particle.velocity = [0, 1, 2].map((axis) => particle.velocity[axis] * (1 - drag)) as Vec3;
-      // A sphere's particles flagged so die as they head outward.
-      if (origin && def.emitterType === 2 && flags & FLAG_KILL_OUTWARD) {
-        const from = local ? particle.position : [particle.position[0] - origin[0], particle.position[1] - origin[1], particle.position[2] - origin[2]];
-        if (from[0] * step[0] + from[1] * step[1] + from[2] * step[2] > 0) return false;
+      let alive = particle.age < particleLife(emitter, particle.lifeSeed);
+      if (alive) {
+        if (particle.orientation) this.tumble(particle, seconds);
+        if (windTime > particle.age) addInto(velocity, velocity, wind, seconds);
+        if (flags & FLAG_FOLLOW && particle.age > seconds * 2) addInto(position, position, follow);
+        const stepX = velocity[0] * seconds;
+        const stepY = velocity[1] * seconds;
+        const stepZ = velocity[2] * seconds;
+        position[0] += stepX;
+        position[1] += stepY;
+        position[2] += stepZ;
+        position[2] -= gravity * seconds * seconds * 0.5;
+        velocity[2] -= gravity * seconds;
+        if (drag) {
+          velocity[0] *= 1 - drag;
+          velocity[1] *= 1 - drag;
+          velocity[2] *= 1 - drag;
+        }
+        // A sphere's particles flagged so die as they head outward.
+        if (killOutward) {
+          const from = local ? ZERO : origin!;
+          if ((position[0] - from[0]) * stepX + (position[1] - from[1]) * stepY + (position[2] - from[2]) * stepZ > 0) alive = false;
+        }
       }
-      return true;
-    };
-    emitter.particles = emitter.particles.filter((particle) => {
-      const before = particle.position;
-      if (!alive(particle)) {
+      if (!alive) {
         particle.model?.dispose();
-        return false;
+        continue;
       }
-      for (const child of emitter.children) {
-        const at = local ? transformPoint(frame, particle.position) : particle.position;
-        const from = local ? transformPoint(frame, before) : before;
-        child.parentVelocity = local ? linear(frame, particle.velocity) : particle.velocity;
+      if (children.length) {
+        const at = local ? transformPointInto(atScratch, frame, position) : position;
+        const from = local ? transformPointInto(fromScratch, frame, beforeScratch) : beforeScratch;
+        for (let axis = 0; axis < 3; axis += 1) childMovedScratch[axis] = at[axis] - from[axis];
         const childFrame = childFrameScratch.copy(frame).setPosition(at[0], at[1], at[2]);
-        this.spawn(child, this.birthCount(child, clock, seconds, around.thinning), childFrame, [at[0] - from[0], at[1] - from[1], at[2] - from[2]],
-          clock, seconds, around.ground, budget);
+        for (const child of children) {
+          if (local) linearInto(child.parentVelocity, emitter.frameLinear, velocity);
+          else scaleInto(child.parentVelocity, velocity, 1);
+          this.spawn(child, this.birthCount(child, seconds, around.thinning), childFrame, childMovedScratch, seconds, around.ground, budget);
+        }
       }
-      return true;
-    });
+      particles[kept] = particle;
+      kept += 1;
+    }
+    particles.length = kept;
   }
 
   // A model particle's model, turned as the emitter's frame is as it is
@@ -1162,8 +1312,7 @@ export class EffectInstance {
   // by its scale curve and twinkle (and the emitter's scale where flagged),
   // its depth by the mean of the two, tinted by its colour and opacity
   // curves; hidden while it twinkles off.
-  private drawParticleModels(emitter: EmitterState, frame: Matrix4, frameScale: number, view: EffectView,
-    lifeOf: (particle: Particle) => number, budget: { left: number }): void {
+  private drawParticleModels(emitter: EmitterState, frame: Matrix4, frameScale: number, view: EffectView, budget: { left: number }): void {
     const def = emitter.def;
     const flags = def.flags;
     const local = Boolean(flags & FLAG_LOCAL);
@@ -1173,30 +1322,27 @@ export class EffectInstance {
     const layer = this.particles.parent ?? this.particles;
     for (const particle of emitter.particles) {
       const model = particle.model;
-      if (!model || !particle.orientation) continue;
+      const placement = particle.placement;
+      if (!model || !particle.orientation || !placement) continue;
       const entry = twinkles ? twinkleEntry(particle.age, def.twinkleSpeed, particle.twinkle) : TWINKLE_TABLE[0];
       const shown = !(def.twinklePercent < 1 && def.twinklePercent < entry);
       model.root.visible = shown;
       model.particles.visible = shown;
       if (!shown) continue;
-      const fraction = particle.age / lifeOf(particle);
-      const [r, g, b] = evalLifeCurve(def.color, 3, fraction, [255, 255, 255]).map(Math.round);
-      const [alpha] = evalLifeCurve(def.alpha, 1, fraction, [1]);
-      model.setTint([r / 255, g / 255, b / 255, Math.min(1, Math.max(0, Math.floor(alpha * 255) / 255))]);
-      const [curveX, curveY] = evalLifeCurve(def.scale, 2, fraction, [1, 1]);
+      const fraction = particle.age / particleLife(emitter, particle.lifeSeed);
+      const [red, green, blue, alpha] = particleColorInto(colorScratch, def, fraction, Math.floor);
+      model.setTint(red, green, blue, alpha);
+      const scaled = evalLifeCurveInto(def.scale, 2, fraction, curveScratch);
       const sizeScale = (twinkleSpan * entry + twinkleBase) * (!local && flags & FLAG_MODEL_SCALE ? frameScale : 1);
-      const sx = curveX * sizeScale;
-      const sy = (curveY ?? curveX) * sizeScale;
+      const sx = (scaled ? curveScratch[0] : 1) * sizeScale;
+      const sy = (scaled ? curveScratch[1] : 1) * sizeScale;
       particleMatrix.compose(particlePosition.fromArray(particle.position), particle.orientation, particleScale.set(sx, sy, (sx + sy) / 2));
       if (local) particleMatrix.premultiply(frame);
       particleMatrix.decompose(particlePosition, particleTurn, particleScale);
-      model.update(this.lastAt, {
-        position: [particlePosition.x, particlePosition.y, particlePosition.z],
-        yaw: 0,
-        quaternion: [particleTurn.x, particleTurn.y, particleTurn.z, particleTurn.w],
-        scale: 1,
-        stretch: [particleScale.x, particleScale.y, particleScale.z],
-      }, view, layer, budget);
+      particlePosition.toArray(placement.position);
+      particleTurn.toArray(placement.quaternion!);
+      particleScale.toArray(placement.stretch!);
+      model.update(this.lastAt, placement, view, layer, budget);
     }
   }
 
@@ -1204,7 +1350,7 @@ export class EffectInstance {
   // lying in the XY plane), turned by its spin or stretched along its way,
   // and a tail behind it, sized by its scale curve and variation and
   // twinkle, coloured by its curves.
-  private drawParticles(emitter: EmitterState, frame: Matrix4, frameScale: number, view: EffectView, lifeOf: (particle: Particle) => number): void {
+  private drawParticles(emitter: EmitterState, frame: Matrix4, frameScale: number, view: EffectView): void {
     const def = emitter.def;
     const flags = def.flags;
     const local = Boolean(flags & FLAG_LOCAL);
@@ -1216,15 +1362,17 @@ export class EffectInstance {
       batch.end();
       return;
     }
-    const centerOf = (particle: Particle) => (local ? transformPoint(frame, particle.position) : particle.position);
-    const velocityOf = (particle: Particle) => (local ? linear(frame, particle.velocity) : particle.velocity);
-    let particles = emitter.particles;
+    const particles = emitter.particles;
+    const frameLinear = emitter.frameLinear;
+    const viewRight = view.right;
+    const viewUp = view.up;
     if (flags & FLAG_SORT) {
-      const depth = (particle: Particle) => {
-        const center = centerOf(particle);
-        return center[0] * view.toCamera[0] + center[1] * view.toCamera[1] + center[2] * view.toCamera[2];
-      };
-      particles = [...particles].sort((a, b) => depth(a) - depth(b));
+      const toCamera = view.toCamera;
+      for (const particle of particles) {
+        const center = local ? transformPointInto(centerScratch, frame, particle.position) : particle.position;
+        particle.depth = center[0] * toCamera[0] + center[1] * toCamera[1] + center[2] * toCamera[2];
+      }
+      particles.sort(byDepth);
     }
     const twinkleBase = def.twinkleScale?.[0] ?? 1;
     const twinkleSpan = (def.twinkleScale?.[1] ?? 1) - twinkleBase;
@@ -1232,41 +1380,41 @@ export class EffectInstance {
     const spins = def.spin !== 0 || def.spinVariation !== 0;
     // The XY plane: the layer's for particles left in the world, the
     // emitter's (unscaled) for those that move with it.
-    const planeX: Vec3 = local ? normalize(linear(frame, [1, 0, 0])) : [1, 0, 0];
-    const planeY: Vec3 = local ? normalize(linear(frame, [0, 1, 0])) : [0, 1, 0];
-    const screen = (vector: Vec3): [number, number] => [
-      vector[0] * view.right[0] + vector[1] * view.right[1] + vector[2] * view.right[2],
-      vector[0] * view.up[0] + vector[1] * view.up[1] + vector[2] * view.up[2],
-    ];
+    const planeX = local ? normalizeInto(planeXScratch, linearInto(planeXScratch, frameLinear, X_AXIS)) : X_AXIS;
+    const planeY = local ? normalizeInto(planeYScratch, linearInto(planeYScratch, frameLinear, Y_AXIS)) : Y_AXIS;
+    const color = colorScratch;
     for (const particle of particles) {
       const entry = twinkles ? twinkleEntry(particle.age, def.twinkleSpeed, particle.twinkle) : TWINKLE_TABLE[0];
       if (def.twinklePercent < 1 && def.twinklePercent < entry) continue;
-      const fraction = particle.age / lifeOf(particle);
-      const [r, g, b] = evalLifeCurve(def.color, 3, fraction, [255, 255, 255]).map(Math.round);
-      const [alpha] = evalLifeCurve(def.alpha, 1, fraction, [1]);
-      const color: [number, number, number, number] = [r / 255, g / 255, b / 255, Math.min(1, Math.max(0, Math.round(alpha * 255) / 255))];
-      const [curveX, curveY] = evalLifeCurve(def.scale, 2, fraction, [1, 1]);
+      const fraction = particle.age / particleLife(emitter, particle.lifeSeed);
+      particleColorInto(color, def, fraction, Math.round);
+      const scaled = evalLifeCurveInto(def.scale, 2, fraction, curveScratch);
       const sizeScale = (twinkleSpan * entry + twinkleBase) * (flags & FLAG_MODEL_SCALE ? frameScale : 1);
-      const sx = curveX * particle.scaleX * sizeScale;
-      const sy = (curveY ?? curveX) * particle.scaleY * sizeScale;
-      const center = centerOf(particle);
+      const sx = (scaled ? curveScratch[0] : 1) * particle.scaleX * sizeScale;
+      const sy = (scaled ? curveScratch[1] : 1) * particle.scaleY * sizeScale;
+      const center = local ? transformPointInto(centerScratch, frame, particle.position) : particle.position;
+      const velocity = local ? linearInto(velocityScratch, frameLinear, particle.velocity) : particle.velocity;
       if (head) {
-        const cell = def.headCell.t.length ? evalLifeCurve(def.headCell, 1, fraction, [0])[0] : particle.cell;
-        const uv = cellUv(cell, def.rows, def.columns);
-        const velocity = velocityOf(particle);
-        let right = view.right as Vec3;
-        let up = view.up as Vec3;
+        const cell = def.headCell.t.length ? (evalLifeCurveInto(def.headCell, 1, fraction, curveScratch) ? curveScratch[0] : 0) : particle.cell;
+        const uv = cellUvInto(cell, def.rows, def.columns, uvScratch);
+        let right = viewRight;
+        let up = viewUp;
         let width = sx;
-        if (flags & FLAG_VELOCITY_ORIENT && length(velocity) ** 2 > 2.3841858e-7) {
+        const speedSquared = velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2];
+        if (flags & FLAG_VELOCITY_ORIENT && speedSquared > 2.3841858e-7) {
           // Along the way it goes on screen, longer the more of its speed
           // shows there.
-          const back: Vec3 = [-velocity[0], -velocity[1], -velocity[2]];
-          const [fx, fy] = screen(back);
+          const fx = -(velocity[0] * viewRight[0] + velocity[1] * viewRight[1] + velocity[2] * viewRight[2]);
+          const fy = -(velocity[0] * viewUp[0] + velocity[1] * viewUp[1] + velocity[2] * viewUp[2]);
           const flat = Math.hypot(fx, fy);
           if (flat > 2.3841858e-7) {
-            width = (flat / length(back)) * sx;
-            right = add([view.right[0] * fx / flat, view.right[1] * fx / flat, view.right[2] * fx / flat], view.up as Vec3, fy / flat);
-            up = add([view.up[0] * fx / flat, view.up[1] * fx / flat, view.up[2] * fx / flat], view.right as Vec3, -fy / flat);
+            width = (flat / Math.sqrt(speedSquared)) * sx;
+            for (let axis = 0; axis < 3; axis += 1) {
+              rightScratch[axis] = viewRight[axis] * fx / flat + viewUp[axis] * (fy / flat);
+              upScratch[axis] = viewUp[axis] * fx / flat + viewRight[axis] * (-fy / flat);
+            }
+            right = rightScratch;
+            up = upScratch;
           }
         } else {
           if (flags & FLAG_XY_QUAD) {
@@ -1277,42 +1425,45 @@ export class EffectInstance {
             const angle = (particle.age * particle.spinRate + particle.spin) * particle.spinSign;
             const cos = Math.cos(angle);
             const sin = Math.sin(angle);
-            const turnedRight = add([right[0] * cos, right[1] * cos, right[2] * cos], up, sin);
-            up = add([up[0] * cos, up[1] * cos, up[2] * cos], right, -sin);
-            right = turnedRight;
+            for (let axis = 0; axis < 3; axis += 1) {
+              const r = right[axis];
+              const u = up[axis];
+              rightScratch[axis] = r * cos + u * sin;
+              upScratch[axis] = u * cos + r * -sin;
+            }
+            right = rightScratch;
+            up = upScratch;
           }
         }
-        batch.add([
-          add(add(center, right, -width), up, -sy),
-          add(add(center, right, width), up, -sy),
-          add(add(center, right, width), up, sy),
-          add(add(center, right, -width), up, sy),
-        ], uv, color);
+        batch.add(quadInto(cornerScratch, center, right, width, up, sy), uv, color);
       }
       if (tail) {
-        const cell = evalLifeCurve(def.tailCell, 1, fraction, [0])[0];
-        const uv = cellUv(cell, def.rows, def.columns);
+        const cell = evalLifeCurveInto(def.tailCell, 1, fraction, curveScratch) ? curveScratch[0] : 0;
+        const uv = cellUvInto(cell, def.rows, def.columns, uvScratch);
         const time = flags & FLAG_CLAMP_TAIL_TO_AGE ? Math.min(def.tailLength, particle.age) : def.tailLength;
-        const velocity = velocityOf(particle);
-        const back: Vec3 = [-velocity[0] * time, -velocity[1] * time, -velocity[2] * time];
-        const [fx, fy] = screen(back);
+        const backX = -velocity[0] * time;
+        const backY = -velocity[1] * time;
+        const backZ = -velocity[2] * time;
+        const fx = backX * viewRight[0] + backY * viewRight[1] + backZ * viewRight[2];
+        const fy = backX * viewUp[0] + backY * viewUp[1] + backZ * viewUp[2];
         const flatSquared = fx * fx + fy * fy;
         if (flatSquared < MIN_TAIL_SQUARED) {
-          batch.add([
-            add(add(center, view.right as Vec3, -sx), view.up as Vec3, -sy),
-            add(add(center, view.right as Vec3, sx), view.up as Vec3, -sy),
-            add(add(center, view.right as Vec3, sx), view.up as Vec3, sy),
-            add(add(center, view.right as Vec3, -sx), view.up as Vec3, sy),
-          ], uv, color);
+          batch.add(quadInto(cornerScratch, center, viewRight, sx, viewUp, sy), uv, color);
           continue;
         }
         // A strip from the particle back along its way, as wide as its size
         // across that way on screen.
         const inverse = 1 / Math.sqrt(flatSquared);
-        const across = add([view.right[0] * -fy * sy * inverse, view.right[1] * -fy * sy * inverse, view.right[2] * -fy * sy * inverse],
-          view.up as Vec3, fx * sx * inverse);
-        const end = add(center, back);
-        batch.addTail(add(center, across), add(center, across, -1), add(end, across), add(end, across, -1), uv, color);
+        for (let axis = 0; axis < 3; axis += 1) acrossScratch[axis] = viewRight[axis] * -fy * sy * inverse + viewUp[axis] * (fx * sx * inverse);
+        endScratch[0] = center[0] + backX;
+        endScratch[1] = center[1] + backY;
+        endScratch[2] = center[2] + backZ;
+        const [a, b, c, d] = cornerScratch;
+        addInto(a, center, acrossScratch);
+        addInto(b, center, acrossScratch, -1);
+        addInto(c, endScratch, acrossScratch);
+        addInto(d, endScratch, acrossScratch, -1);
+        batch.addTail(a, b, c, d, uv, color);
       }
     }
     batch.end();
@@ -1328,34 +1479,46 @@ export class EffectInstance {
     const def = ribbon.def;
     const frame = ribbonFrame.copy(this.emitterMatrix(ribbon.joint, def.bonePivot, layerInverse))
       .multiply(pivotScratch.makeTranslation(def.position[0], def.position[1], def.position[2]));
-    const pose: RibbonPose = { position: transformPoint(frame, [0, 0, 0]), forward: linear(frame, [0, 0, 1]), up: linear(frame, [0, 1, 0]) };
-    const last = ribbon.last ?? pose;
-    ribbon.last = pose;
+    const frameLinear = tempMatrix3.setFromMatrix4(frame);
+    const pose = ribbon.pose;
+    transformPointInto(pose.position, frame, ZERO);
+    linearInto(pose.forward, frameLinear, Z_AXIS);
+    linearInto(pose.up, frameLinear, Y_AXIS);
+    const last = ribbon.hasLast ? ribbon.last : pose;
     const rate = Math.ceil(def.edgesPerSecond);
     const lifetime = Math.max(MIN_RIBBON_LIFETIME, def.edgeLifetime);
     let dt = seconds;
     if (!ribbon.started && rate > 0) dt = 1 / rate + 0.0001;
     ribbon.started = true;
     dt = Math.min(lifetime, Math.max(0, dt));
-    ribbon.edges = ribbon.edges.filter((edge) => edge.age + dt <= lifetime);
+    const edges = ribbon.edges;
+    let kept = 0;
+    for (let index = 0; index < edges.length; index += 1) {
+      if (edges[index].age + dt > lifetime) continue;
+      edges[kept] = edges[index];
+      kept += 1;
+    }
+    edges.length = kept;
 
-    const above = evalTrack(def.heightAbove, 1, clock, [DEFAULT_RIBBON_HEIGHT])[0];
-    const below = evalTrack(def.heightBelow, 1, clock, [DEFAULT_RIBBON_HEIGHT])[0];
+    const above = trackValue(def.heightAbove, clock, DEFAULT_RIBBON_HEIGHT);
+    const below = trackValue(def.heightBelow, clock, DEFAULT_RIBBON_HEIGHT);
+    // New edges keep this frame's colour.
     const [r, g, b] = evalTrack(def.color, 3, clock, [1, 1, 1]);
-    const [alpha] = evalTrack(def.alpha, 1, clock, [1]);
+    const alpha = trackValue(def.alpha, clock, 1);
     const color: [number, number, number, number] = [r, g, b, Math.min(1, Math.max(0, alpha))];
     // The curve from the last pose to this one, its ends leaving along each
     // pose's forward.
-    const distance = length([pose.position[0] - last.position[0], pose.position[1] - last.position[1], pose.position[2] - last.position[2]]);
-    const startBelow = add(last.position, last.up, -below);
-    const startAbove = add(last.position, last.up, above);
-    const endBelow = add(pose.position, pose.up, -below);
-    const endAbove = add(pose.position, pose.up, above);
-    const startTangent: Vec3 = [last.forward[0] * distance, last.forward[1] * distance, last.forward[2] * distance];
-    const endTangent: Vec3 = [pose.forward[0] * distance, pose.forward[1] * distance, pose.forward[2] * distance];
+    const distance = Math.hypot(pose.position[0] - last.position[0], pose.position[1] - last.position[1], pose.position[2] - last.position[2]);
+    const { startBelow, startAbove, endBelow, endAbove, startTangent, endTangent } = ribbonScratch;
+    addInto(startBelow, last.position, last.up, -below);
+    addInto(startAbove, last.position, last.up, above);
+    addInto(endBelow, pose.position, pose.up, -below);
+    addInto(endAbove, pose.position, pose.up, above);
+    scaleInto(startTangent, last.forward, distance);
+    scaleInto(endTangent, pose.forward, distance);
     const along = (from: Vec3, to: Vec3, t: number): Vec3 => [0, 1, 2].map((axis) =>
       (to[axis] - (1 - t) * endTangent[axis]) * t + (startTangent[axis] * t + from[axis]) * (1 - t)) as Vec3;
-    const visible = evalTrack(def.visibility, 1, clock, [1])[0] !== 0;
+    const visible = trackValue(def.visibility, clock, 1) !== 0;
     const live = this.emitting && visible;
     if (live) {
       const target = dt * rate + ribbon.carry;
@@ -1364,34 +1527,42 @@ export class EffectInstance {
         const steps = Math.floor(target - 1) + 1;
         for (let step = 0; step < steps; step += 1) {
           const t = (step + 1 - ribbon.carry) * scale;
-          ribbon.edges.push({ below: along(startBelow, endBelow, t), above: along(startAbove, endAbove, t), age: -t * dt, color });
+          edges.push({ below: along(startBelow, endBelow, t), above: along(startAbove, endAbove, t), age: -t * dt, color });
         }
       }
       ribbon.carry = target - Math.floor(target);
       const capacity = Math.ceil(rate * lifetime) + 2;
-      if (ribbon.edges.length > capacity) ribbon.edges.splice(0, ribbon.edges.length - capacity);
+      if (edges.length > capacity) edges.splice(0, edges.length - capacity);
     }
-    for (const edge of ribbon.edges) {
+    for (const edge of edges) {
       const drop = (edge.age * 2 + dt) * def.gravity * dt;
       edge.below[2] += drop;
       edge.above[2] += drop;
       edge.age += dt;
     }
+    // This pose is next frame's last.
+    ribbon.pose = ribbon.last;
+    ribbon.last = pose;
+    ribbon.hasLast = true;
 
-    // The texture slot's cell: u along by age, the lower edge at its top.
+    // The texture slot's cell: u along by age, the lower edge at its top;
+    // the edges in turn, then the live head.
     const columns = Math.max(1, def.columns);
     const rows = Math.max(1, def.rows);
-    const slot = Math.max(0, Math.round(evalTrack(def.textureSlot, 1, clock, [0])[0]));
+    const slot = Math.max(0, Math.round(trackValue(def.textureSlot, clock, 0)));
     const slotU = (slot % columns) / columns;
     const slotV = Math.floor(slot / columns) / rows;
-    const points = live ? [...ribbon.edges, { below: endBelow, above: endAbove, age: 0, color }] : ribbon.edges;
+    const u = (age: number) => slotU + (age / lifetime) / columns;
     for (const batch of ribbon.batches) {
       batch.begin();
-      for (let index = 0; index < points.length - 1; index += 1) {
-        const from = points[index];
-        const to = points[index + 1];
-        batch.addRibbonSegment(from.below, from.above, to.below, to.above,
-          slotU + (from.age / lifetime) / columns, slotU + (to.age / lifetime) / columns, slotV, slotV + 1 / rows, from.color, to.color);
+      for (let index = 0; index < edges.length - 1; index += 1) {
+        const from = edges[index];
+        const to = edges[index + 1];
+        batch.addRibbonSegment(from.below, from.above, to.below, to.above, u(from.age), u(to.age), slotV, slotV + 1 / rows, from.color, to.color);
+      }
+      const newest = edges[edges.length - 1];
+      if (live && newest) {
+        batch.addRibbonSegment(newest.below, newest.above, endBelow, endAbove, u(newest.age), u(0), slotV, slotV + 1 / rows, newest.color, color);
       }
       batch.end();
     }

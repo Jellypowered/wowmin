@@ -196,6 +196,43 @@ test('evaluates life curves and texture cells', () => {
   assert.deepEqual(plain(tracks.cellUv(2, 3, 3)), [0, 0, 1, 1]);
 });
 
+test('writes tracks, curves and cells in place as the allocating versions give them', () => {
+  const clock = { clip: 'Stand', timeMs: 50, elapsedMs: 1250, loops: [1000] };
+  const into = (call) => {
+    const out = [-1, -1, -1, -1];
+    return call(out) ? plain(out) : null;
+  };
+  const curves = [
+    { times: [0], values: [3, 4] },
+    { times: [0, 100], values: [0, 10, 100, 110] },
+    { times: [10, 20, 40], values: [1, 2, 5, 6, 9, 10] },
+  ];
+  for (const { times, values } of curves) {
+    for (const time of [-5, 0, 15, 20, 30, 50, 100, 500]) {
+      for (const step of [false, true]) {
+        const expected = plain(tracks.interpolate(times, values, 2, time, step));
+        assert.deepEqual(into((out) => tracks.interpolateInto(times, values, 2, time, step, out))?.slice(0, 2), expected, `${times} at ${time} ${step}`);
+      }
+    }
+  }
+  assert.equal(into((out) => tracks.interpolateInto([], [], 2, 5, false, out)), null);
+  const track = { g: -1, s: false, k: { Stand: [[0, 100], [0, 10, 100, 110]] } };
+  for (const candidate of [track, { ...track, s: true }, { g: 0, s: false, k: { global: [[0, 1000], [0, 4, 8, 12]] } }]) {
+    assert.deepEqual(into((out) => tracks.evalTrackInto(candidate, 2, clock, out)).slice(0, 2), plain(tracks.evalTrack(candidate, 2, clock, [7, 7])));
+  }
+  // Where the allocating version gives the fallback, nothing is written.
+  assert.equal(into((out) => tracks.evalTrackInto(null, 2, clock, out)), null);
+  assert.equal(into((out) => tracks.evalTrackInto(track, 2, { ...clock, clip: 'Hold' }, out)), null);
+  const curve = { t: [0, 0.5, 1], v: [0, 10, 0] };
+  for (const fraction of [-1, 0, 0.25, 0.5, 0.9, 1, 2]) {
+    assert.deepEqual(into((out) => tracks.evalLifeCurveInto(curve, 1, fraction, out)).slice(0, 1), plain(tracks.evalLifeCurve(curve, 1, fraction, [9])));
+  }
+  assert.equal(into((out) => tracks.evalLifeCurveInto({ t: [], v: [] }, 1, 0.25, out)), null);
+  for (const [cell, rows, columns] of [[0, 4, 4], [5, 4, 4], [1.6, 4, 4], [2, 3, 3], [3, 2, 8]]) {
+    assert.deepEqual(plain(tracks.cellUvInto(cell, rows, columns, [9, 9, 9, 9])), plain(tracks.cellUv(cell, rows, columns)));
+  }
+});
+
 test('moves, scales and turns textures about their middle as the client does', () => {
   const apply = (m, [u, v]) => [m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5]];
   const quarter = [0, 0, Math.sin(Math.PI / 4), Math.cos(Math.PI / 4)];

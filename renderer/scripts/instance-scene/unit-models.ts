@@ -384,7 +384,6 @@ const scratchVector = new Vector3();
 const scratchMatrix = new Matrix4();
 const scratchPosition = new Vector3();
 const scratchScale = new Vector3();
-const scratchTurn = new Quaternion();
 const ZERO_OFFSET: Point3 = [0, 0, 0];
 
 // The first of a role's attachments a unit's model has.
@@ -557,14 +556,14 @@ export class UnitModelLayer {
 
   // Which way a drawn unit's attachment (M2 ID) is turned, in world space
   // (three.js axes), as an effect riding on it turns; null if the unit
-  // isn't drawn or its model lacks it.
-  attachmentTurnOf(id: string, attachment: number): Quaternion | null {
+  // isn't drawn or its model lacks it. Written into `out`.
+  attachmentTurnOf(id: string, attachment: number, out: Quaternion): Quaternion | null {
     const unit = this.units.get(id);
     const point = unit?.effectAttachments.get(attachment);
     if (!unit || !point) return null;
     scratchMatrix.multiplyMatrices(unit.top.matrixWorld, unit.skeletonToTop).multiply(point.matrixWorld);
-    scratchMatrix.decompose(scratchPosition, scratchTurn, scratchScale);
-    return scratchTurn.clone();
+    scratchMatrix.decompose(scratchPosition, out, scratchScale);
+    return out;
   }
 
   // A point in a unit's skeleton, in world space: `local` is in the point's
