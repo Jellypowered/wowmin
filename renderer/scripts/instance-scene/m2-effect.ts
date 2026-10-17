@@ -25,6 +25,7 @@ import {
   NormalBlending,
   type Object3D,
   OneFactor,
+  OrthographicCamera,
   Quaternion,
   RepeatWrapping,
   SrcColorFactor,
@@ -36,7 +37,9 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
 
 import {
+  cameraDistanceFor,
   cellUv,
+  distanceThinning,
   type EffectBlend,
   emitCount,
   evalLifeCurve,
@@ -45,12 +48,13 @@ import {
   type LifeCurve,
   materialBlend,
   particleBlend,
-  quaternionAngleZ,
+  particleSteps,
   signedRandom,
   spawnParticle,
   TWINKLE_TABLE,
   twinkleEntry,
   type TrackClock,
+  uvMatrix,
   type Vec3,
 } from '../utils/m2-tracks';
 
@@ -169,6 +173,8 @@ const FLAG_RANDOM_SPIN_SIGN = 0x200;
 const FLAG_CLAMP_TAIL_TO_AGE = 0x400;
 const FLAG_SPREAD_ALONG_PATH = 0x800;
 const FLAG_XY_QUAD = 0x1000;
+// Particles left in the world start on the ground under them.
+const FLAG_GROUND = 0x2000;
 const FLAG_FOLLOW = 0x4000;
 const FLAG_BURST = 0x8000;
 const FLAG_RANDOM_CELL = 0x10000;
@@ -198,6 +204,9 @@ const MAX_RIBBON_EDGES = 256;
 const MIN_RIBBON_LIFETIME = 0.25;
 const DEFAULT_RIBBON_HEIGHT = 10;
 const EFFECT_RENDER_ORDER = 4;
+// The longest frame an effect catches up on (seconds); a longer gap (a
+// hidden tab) isn't replayed.
+const MAX_FRAME_SECONDS = 1;
 
 const loader = new GLTFLoader();
 
@@ -576,19 +585,41 @@ const normalize = (v: Vec3): Vec3 => {
 };
 
 // The camera's directions in the layer's coordinates, for billboards.
+// What an emitter's particles are let go into this frame: the share of its
+// rate it lets go for its distance, and the ground.
+interface Surroundings {
+  thinning: number;
+  ground: EffectView['ground'];
+}
+
 export interface EffectView {
   right: Vec3;
   up: Vec3;
   toCamera: Vec3;
+  // How far a point (layer coordinates) is from the camera, in yards. An
+  // orthographic view puts everything as far as the client's camera would
+  // stand to show as much.
+  distance: (point: Vec3) => number;
+  // The height of the ground below a point (layer coordinates), or null if
+  // there's none near.
+  ground: ((point: Vec3) => number | null) | null;
 }
 
-export function getEffectView(camera: Camera, layer: Object3D): EffectView {
+export function getEffectView(camera: Camera, layer: Object3D, ground: EffectView['ground'] = null): EffectView {
   const inverse = tempQuaternion.copy(layer.getWorldQuaternion(new Quaternion())).invert();
   const direction = (x: number, y: number, z: number): Vec3 => {
     const vector = new Vector3(x, y, z).applyQuaternion(camera.quaternion).applyQuaternion(inverse);
     return [vector.x, vector.y, vector.z];
   };
-  return { right: direction(1, 0, 0), up: direction(0, 1, 0), toCamera: direction(0, 0, 1) };
+  let distance: EffectView['distance'];
+  if (camera instanceof OrthographicCamera) {
+    const standing = cameraDistanceFor((camera.top - camera.bottom) / camera.zoom);
+    distance = () => standing;
+  } else {
+    const { x, y, z } = layer.worldToLocal(camera.getWorldPosition(new Vector3()));
+    distance = (point) => Math.hypot(point[0] - x, point[1] - y, point[2] - z);
+  }
+  return { right: direction(1, 0, 0), up: direction(0, 1, 0), toCamera: direction(0, 0, 1), distance, ground };
 }
 
 export class EffectInstance {
@@ -743,7 +774,7 @@ export class EffectInstance {
   }
 
   update(now: number, placement: EffectPlacement, view: EffectView, layer: Object3D, budget: { left: number }): void {
-    const seconds = Math.min(0.1, Math.max(0, (now - this.lastAt) / 1000));
+    const seconds = Math.min(MAX_FRAME_SECONDS, Math.max(0, (now - this.lastAt) / 1000));
     this.lastAt = now;
     const elapsed = now - this.startAt;
     const phaseLength = this.clips[this.phase] ?? this.duration;
@@ -777,7 +808,7 @@ export class EffectInstance {
 
     const layerInverse = tempMatrix.copy(layer.matrixWorld).invert();
     for (const emitter of this.emitters) this.updateEmitter(emitter, clock, seconds, layerInverse, view, budget);
-    for (const ribbon of this.ribbons) this.updateRibbon(ribbon, clock, seconds, layerInverse);
+    for (const ribbon of this.ribbons) this.updateRibbon(ribbon, clock, Math.min(0.1, seconds), layerInverse);
   }
 
   private allEmitters(): EmitterState[] {
@@ -814,7 +845,7 @@ export class EffectInstance {
     if (map) {
       map.wrapS = RepeatWrapping;
       map.wrapT = RepeatWrapping;
-      map.center.set(0.5, 0.5);
+      map.matrixAutoUpdate = false;
       map.needsUpdate = true;
     }
     const material = new MeshBasicMaterial({ map, side: DoubleSide, forceSinglePass: true });
@@ -840,11 +871,8 @@ export class EffectInstance {
       animated.material.opacity = Math.min(1, Math.max(0, alpha));
       const map = animated.material.map;
       if (!map) continue;
-      const [x, y] = evalTrack(animated.uvTranslation, 3, clock, [0, 0, 0]);
-      const [sx, sy] = evalTrack(animated.uvScaling, 3, clock, [1, 1, 1]);
-      map.offset.set(x, y);
-      map.repeat.set(sx || 1, sy || 1);
-      map.rotation = animated.uvRotation ? quaternionAngleZ(evalTrack(animated.uvRotation, 4, clock, [0, 0, 0, 1])) : 0;
+      map.matrix.set(...uvMatrix(evalTrack(animated.uvTranslation, 3, clock, [0, 0, 0]), evalTrack(animated.uvRotation, 4, clock, [0, 0, 0, 1]),
+        evalTrack(animated.uvScaling, 3, clock, [1, 1, 1])));
     }
   }
 
@@ -940,45 +968,55 @@ export class EffectInstance {
       }
     }
 
-    this.spawn(emitter, this.birthCount(emitter, clock, seconds), frame, moved, clock, seconds, budget);
-    this.moveParticles(emitter, clock, seconds, origin, follow, frame, budget);
+    // A long frame goes in steps, the following shared between them; the
+    // emitter lets fewer go the further it is from the camera, and its
+    // child emitters as many fewer.
+    const steps = particleSteps(seconds, evalTrack(def.lifespan, 1, clock, [1])[0]);
+    const stepFollow: Vec3 = [follow[0] / steps.length, follow[1] / steps.length, follow[2] / steps.length];
+    const around: Surroundings = { thinning: distanceThinning(view.distance(origin)), ground: view.ground };
+    for (const step of steps) {
+      this.spawn(emitter, this.birthCount(emitter, clock, step, around.thinning), frame, moved, clock, step, around.ground, budget);
+      this.moveParticles(emitter, clock, step, origin, stepFollow, frame, around, budget);
+      // Its child emitters' particles, born at its own (as they move).
+      for (const child of emitter.children) this.moveParticles(child, clock, step, null, [0, 0, 0], frame, around, budget);
+    }
+    budget.left -= emitter.particles.length;
+    for (const child of emitter.children) budget.left -= child.particles.length;
     const lifeOf = this.lifeOf(emitter, clock);
     if (emitter.model) this.drawParticleModels(emitter, frame, frameScale, view, lifeOf, budget);
     else this.drawParticles(emitter, frame, frameScale, view, lifeOf);
-    // Its child emitters' particles, born at its own (as they move).
-    for (const child of emitter.children) {
-      this.moveParticles(child, clock, seconds, null, [0, 0, 0], frame, budget);
-      this.drawParticles(child, frame, frameScale, view, this.lifeOf(child, clock));
-    }
+    for (const child of emitter.children) this.drawParticles(child, frame, frameScale, view, this.lifeOf(child, clock));
   }
 
-  // How many particles an emitter lets go this frame. A burst emitter lets
-  // its rate's worth go at once as it shows; the rest emit at their rate
-  // (with its variation), carrying the remainder.
-  private birthCount(emitter: EmitterState, clock: TrackClock, seconds: number): number {
+  // How many particles an emitter lets go this step, its rate scaled by
+  // `thinning`. A burst emitter lets its rate's worth go at once as it
+  // shows; the rest emit at their rate (with its variation), carrying the
+  // remainder.
+  private birthCount(emitter: EmitterState, clock: TrackClock, seconds: number, thinning: number): number {
     const def = emitter.def;
     const visible = this.emitting && evalTrack(def.enabled, 1, clock, [1])[0] !== 0;
-    const rate = visible ? evalTrack(def.emissionRate, 1, clock, [0])[0] : 0;
+    const base = visible ? evalTrack(def.emissionRate, 1, clock, [0])[0] : 0;
+    const rate = (base + signedRandom() * def.emissionRateVariation) * thinning;
     if (def.flags & FLAG_BURST) {
       const fired = emitter.burstFired;
-      emitter.burstFired = visible && rate > 0;
-      return visible && rate > 0 && !fired ? Math.floor(rate) : 0;
+      emitter.burstFired = visible && base > 0;
+      return visible && base > 0 && !fired ? Math.max(0, Math.floor(rate)) : 0;
     }
     if (!visible) return 0;
-    const { count, carry } = emitCount(emitter.carry, rate + signedRandom() * def.emissionRateVariation, seconds);
+    const { count, carry } = emitCount(emitter.carry, rate, seconds);
     emitter.carry = carry;
     return count;
   }
 
-  private lifeOf(emitter: EmitterState, clock: TrackClock): (particle: Particle) => number {
+  private lifeOf(emitter: EmitterState, clock: TrackClock): (particle: Pick<Particle, 'lifeSeed'>) => number {
     const lifeBase = evalTrack(emitter.def.lifespan, 1, clock, [1])[0];
     return (particle) => Math.max(MIN_LIFE, lifeBase + particle.lifeSeed * emitter.def.lifespanVariation);
   }
 
   // New particles from the emitter's frame (layer coordinates), `moved` the
-  // way it came this frame.
+  // way it came this frame, those flagged so put on `ground`.
   private spawn(emitter: EmitterState, births: number, frame: Matrix4, moved: Vec3, clock: TrackClock, seconds: number,
-    budget: { left: number }): void {
+    ground: EffectView['ground'], budget: { left: number }): void {
     const room = Math.min(births, MAX_PARTICLES_PER_EMITTER - emitter.particles.length, Math.max(0, budget.left));
     if (room <= 0) return;
     const def = emitter.def;
@@ -998,21 +1036,30 @@ export class EffectInstance {
       splinePoints: def.splinePoints,
     };
     const cells = Math.max(1, def.rows * def.columns);
+    const lifeOf = this.lifeOf(emitter, clock);
     for (let index = 0; index < room; index += 1) {
       const born = spawnParticle(spawn);
       let position = born.position;
       let velocity = born.velocity;
+      const age = Math.random() * seconds;
+      const lifeSeed = signedRandom();
       if (!local) {
         position = transformPoint(frame, position);
         velocity = linear(frame, velocity);
         // Spread along the way the emitter came this frame.
         if (flags & FLAG_SPREAD_ALONG_PATH) position = add(position, moved, Math.random() - 1);
+        // On the ground, lifted by its size then.
+        const height = flags & FLAG_GROUND && ground ? ground(position) : null;
+        if (height !== null) {
+          const [sizeX, sizeY] = evalLifeCurve(def.scale, 2, age / lifeOf({ lifeSeed }), [1, 1]);
+          position[2] = height + Math.max(sizeX, sizeY ?? sizeX);
+        }
       }
       if (flags & FLAG_INHERIT_VELOCITY) velocity = add(velocity, emitter.parentVelocity, 1 + signedRandom() * spawn.speedVariation);
       const scaleX = 1 + signedRandom() * (def.scaleVary?.[0] ?? 0);
       const model = emitter.model ? this.spawnModel(emitter, frame, local, flags) : null;
       emitter.particles.push({
-        position, velocity, age: Math.random() * seconds, lifeSeed: signedRandom(),
+        position, velocity, age, lifeSeed,
         scaleX: Math.max(MIN_SCALE_VARIATION, scaleX),
         scaleY: Math.max(MIN_SCALE_VARIATION, flags & FLAG_SCALE_XY ? 1 + signedRandom() * (def.scaleVary?.[1] ?? 0) : scaleX),
         cell: flags & FLAG_RANDOM_CELL && cells > 1 ? Math.floor(Math.random() * cells) : 0,
@@ -1033,11 +1080,12 @@ export class EffectInstance {
   // Moves an emitter's particles and drops the dead: wind while it blows,
   // following the emitter, then their own speed, gravity down its frame's
   // Z, and drag. Each that lives lets its child emitters' particles go from
-  // where it is, turned as the emitter's frame (`frame`) is, as it moved
-  // and heading as it heads. `origin` is the emitter's (null for a child's
-  // particles, which never die heading outward).
+  // where it is (in its surroundings), turned as the emitter's frame
+  // (`frame`) is, as it moved and heading as it heads. `origin` is the
+  // emitter's (null for a child's particles, which never die heading
+  // outward).
   private moveParticles(emitter: EmitterState, clock: TrackClock, seconds: number, origin: Vec3 | null, follow: Vec3,
-    frame: Matrix4, budget: { left: number }): void {
+    frame: Matrix4, around: Surroundings, budget: { left: number }): void {
     const def = emitter.def;
     const flags = def.flags;
     const local = isLocal(emitter);
@@ -1075,12 +1123,11 @@ export class EffectInstance {
         const from = local ? transformPoint(frame, before) : before;
         child.parentVelocity = local ? linear(frame, particle.velocity) : particle.velocity;
         const childFrame = childFrameScratch.copy(frame).setPosition(at[0], at[1], at[2]);
-        this.spawn(child, this.birthCount(child, clock, seconds), childFrame, [at[0] - from[0], at[1] - from[1], at[2] - from[2]],
-          clock, seconds, budget);
+        this.spawn(child, this.birthCount(child, clock, seconds, around.thinning), childFrame, [at[0] - from[0], at[1] - from[1], at[2] - from[2]],
+          clock, seconds, around.ground, budget);
       }
       return true;
     });
-    budget.left -= emitter.particles.length;
   }
 
   // A model particle's model, turned as the emitter's frame is as it is

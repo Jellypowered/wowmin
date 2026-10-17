@@ -43,6 +43,7 @@ import {
   blendLight, type BuildingBatchLight, buildingBatchLight, CLIENT_AMBIENT_GAIN, CLIENT_DIRECT_GAIN, characterAmbientScale, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors,
   lightAt, type MapLights, nearestObjectLights, scaleAmbient, type Rgb, sunDirection, timeOfDay,
 } from '../utils/map-light';
+import { PARTICLE_GROUND_DEPTH } from '../utils/m2-tracks';
 import type { CombatEffectStore, Point3, UnitKey } from '../utils/spell-events';
 import { applyIsoCamera, serverToThree, threeToServer } from './iso-camera';
 import { ALL_SPELL_AIDS, type SpellAids, SpellEffectLayer, type UnitAnchorRole } from './spell-effects';
@@ -175,6 +176,10 @@ const SHARD_START_LIFT = 1 / 6;
 const SHARD_SEARCH_HEIGHT = 50 / 3;
 const SHARD_ROOF_SHARE = 0.95;
 const SHARD_GROUND_DEPTH = 100 / 3;
+// Ground heights kept for particles before starting over, and new ones
+// looked up a frame (the rest of a frame's particles stay where they're born).
+const GROUND_CACHE_LIMIT = 4096;
+const GROUND_RAYS_PER_FRAME = 64;
 
 // Party fade, matching getSceneFade() in map-projection.ts: each volume keeps
 // its surroundings solid, fading out over the height range above and below and
@@ -620,6 +625,10 @@ export class InstanceSceneView {
   private readonly states = new Map<string, SceneLoadState>();
   private readonly materials = new Map<string, Material>();
   private shown: Object3D | null = null;
+  // Ground heights for particles, for the scene and floors as last shown.
+  private readonly groundHeights = new Map<string, number | null>();
+  private groundKey = '';
+  private groundRays = 0;
   private lost = false;
   // Player and creature models; lit, unlike the scene.
   private readonly units: UnitModelLayer;
@@ -669,9 +678,10 @@ export class InstanceSceneView {
     this.units = new UnitModelLayer(this.redraw);
     this.scene.add(this.units.group);
     this.scene.add(this.effects.group);
-    this.spellVisuals = new SpellVisualLayer(this.redraw);
+    const ground = (point: Point3) => this.groundBelow(point);
+    this.spellVisuals = new SpellVisualLayer(this.redraw, ground);
     this.scene.add(this.spellVisuals.group);
-    this.gameObjects = new GameObjectLayer(this.redraw);
+    this.gameObjects = new GameObjectLayer(this.redraw, ground);
     this.scene.add(this.gameObjects.group);
     this.scene.add(this.ambient, ...this.objectLights);
     this.sun.position.set(0.4, 1, 0.6);
@@ -816,6 +826,7 @@ export class InstanceSceneView {
     aids: SpellAids = ALL_SPELL_AIDS, creatureTypeFlags: (unit: UnitKey) => number = () => 0): number {
     if (this.lost) return 0;
     const before = this.effects.count + this.spellVisuals.count;
+    this.groundRays = 0;
     const anchor = (unit: UnitKey, role: UnitAnchorRole) => this.anchor(positions, unit, role);
     const units: UnitInfo = {
       anchor,
@@ -860,15 +871,29 @@ export class InstanceSceneView {
     const start = serverToThree([center[0], center[1], center[2] + SHARD_START_LIFT]);
     const end = serverToThree([x, y, center[2] + SHARD_SEARCH_HEIGHT]);
     const length = start.distanceTo(end);
-    this.raycaster.set(start, end.clone().sub(start).normalize());
-    this.raycaster.far = length;
-    const roof = this.solidHit(root);
+    const roof = this.cast(root, start, end.clone().sub(start).normalize(), length);
     const top = roof ? start.lerp(end, (roof.distance / length) * SHARD_ROOF_SHARE) : end;
-    this.raycaster.set(top, DOWN);
-    this.raycaster.far = SHARD_GROUND_DEPTH;
-    const ground = this.solidHit(root);
-    this.raycaster.far = Infinity;
+    const ground = this.cast(root, top, DOWN, SHARD_GROUND_DEPTH);
     return ground ? threeToServer(ground.point) : center;
+  }
+
+  // The height of the first surface up to PARTICLE_GROUND_DEPTH below a
+  // point, as the client finds the ground for particles that start on it;
+  // kept by the half yard across (two up and down), since many are born
+  // close together.
+  private groundBelow([x, y, z]: Point3): number | null {
+    const root = this.shown;
+    if (!root) return null;
+    if (this.groundHeights.size > GROUND_CACHE_LIMIT) this.groundHeights.clear();
+    const key = `${Math.round(x * 2)},${Math.round(y * 2)},${Math.round(z / 2)}`;
+    const known = this.groundHeights.get(key);
+    if (known !== undefined) return known;
+    if (this.groundRays >= GROUND_RAYS_PER_FRAME) return null;
+    this.groundRays += 1;
+    const hit = this.cast(root, serverToThree([x, y, z]), DOWN, PARTICLE_GROUND_DEPTH);
+    const height = hit ? threeToServer(hit.point)[2] : null;
+    this.groundHeights.set(key, height);
+    return height;
   }
 
   // Where a segment first meets the map's terrain or buildings, as a share
@@ -880,11 +905,18 @@ export class InstanceSceneView {
     const end = serverToThree(to);
     const length = start.distanceTo(end);
     if (length <= 0) return null;
-    this.raycaster.set(start, end.sub(start).normalize());
-    this.raycaster.far = length;
+    const hit = this.cast(root, start, end.sub(start).normalize(), length);
+    return hit ? hit.distance / length : null;
+  }
+
+  // The nearest hit within `far` of a ray from `start` along `direction`, as
+  // solidHit finds them.
+  private cast(root: Object3D, start: Vector3, direction: Vector3, far: number): Intersection | null {
+    this.raycaster.set(start, direction);
+    this.raycaster.far = far;
     const hit = this.solidHit(root);
     this.raycaster.far = Infinity;
-    return hit ? hit.distance / length : null;
+    return hit;
   }
 
   // The raycaster's nearest hit on the map's terrain and buildings (not its
@@ -922,6 +954,7 @@ export class InstanceSceneView {
     if (this.lost) return 0;
     const fade = this.lastFade;
     const shown = fade ? poses.filter(({ position }) => isDrawnAt(position, fade)) : poses;
+    this.groundRays = 0;
     this.gameObjects.update(shown, now, this.camera);
     return this.gameObjects.count;
   }
@@ -1020,6 +1053,10 @@ export class InstanceSceneView {
       ...active.flatMap((volume) => [volume.minX, volume.maxX, volume.minY, volume.maxY, volume.minZ, volume.maxZ]
         .map((value) => Math.round(value))),
     ].join('|');
+    if (visibilityKey !== this.groundKey) {
+      this.groundKey = visibilityKey;
+      this.groundHeights.clear();
+    }
     const lightKey = this.applyLighting(view.center);
     const frameKey = [
       visibilityKey, width, height, pixelRatio, view.pixelsPerUnit.toFixed(4),

@@ -194,7 +194,41 @@ test('evaluates life curves and texture cells', () => {
   // Rounded to the nearest cell; a sheet that isn't a power of two is one cell.
   assert.deepEqual(plain(tracks.cellUv(1.6, 4, 4)), [0.5, 0, 0.75, 0.25]);
   assert.deepEqual(plain(tracks.cellUv(2, 3, 3)), [0, 0, 1, 1]);
-  near(tracks.quaternionAngleZ([0, 0, Math.sin(Math.PI / 4), Math.cos(Math.PI / 4)]), Math.PI / 2, 'uv rotation');
+});
+
+test('moves, scales and turns textures about their middle as the client does', () => {
+  const apply = (m, [u, v]) => [m[0] * u + m[1] * v + m[2], m[3] * u + m[4] * v + m[5]];
+  const quarter = [0, 0, Math.sin(Math.PI / 4), Math.cos(Math.PI / 4)];
+  const same = (actual, expected, label) => actual.forEach((value, index) => near(value, expected[index], label));
+  same(tracks.uvMatrix([0, 0, 0], [0, 0, 0, 1], [1, 1, 1]), [1, 0, 0, 0, 1, 0, 0, 0, 1], 'identity');
+  // A quarter turn about the middle, anticlockwise: (1, 0.5) goes to (0.5, 1).
+  same(apply(tracks.uvMatrix([0, 0, 0], quarter, [1, 1, 1]), [1, 0.5]), [0.5, 1], 'turn');
+  same(apply(tracks.uvMatrix([0, 0, 0], quarter, [1, 1, 1]), [0.5, 0.5]), [0.5, 0.5], 'middle stays');
+  // Scaled about the middle.
+  same(apply(tracks.uvMatrix([0, 0, 0], [0, 0, 0, 1], [2, 3, 1]), [1, 1]), [1.5, 2], 'scale');
+  // Moved first, then scaled and turned: the move is scaled too.
+  same(apply(tracks.uvMatrix([0.25, 0, 0], [0, 0, 0, 1], [2, 1, 1]), [0.5, 0.5]), [1, 0.5], 'move then scale');
+  same(apply(tracks.uvMatrix([0.25, 0, 0], quarter, [1, 1, 1]), [0.5, 0.5]), [0.5, 0.75], 'move then turn');
+});
+
+test('splits long frames into the client\'s steps and thins far emitters', () => {
+  const sum = (steps) => steps.reduce((total, step) => total + step, 0);
+  assert.deepEqual(plain(tracks.particleSteps(0.05, 2)), [0.05]);
+  assert.deepEqual(plain(tracks.particleSteps(0.1, 2)), [0.1]);
+  const long = tracks.particleSteps(0.35, 2);
+  assert.equal(long.length, 4);
+  near(sum(long), 0.35, 'whole frame');
+  near(long[3], 0.05, 'remainder');
+  // No more whole steps than fit in a particle's life; the rest is dropped.
+  const capped = tracks.particleSteps(5, 0.25);
+  assert.equal(capped.length, 3);
+  near(sum(capped), 0.2, 'capped');
+  assert.equal(tracks.distanceThinning(20), 1);
+  assert.equal(tracks.distanceThinning(50), 1);
+  near(tracks.distanceThinning(75), 0.5, 'halfway');
+  assert.equal(tracks.distanceThinning(200), 0.25);
+  // The client's camera shows a view about as tall as it stands back.
+  near(tracks.cameraDistanceFor(50), 50 / (2 * Math.tan(Math.PI * 0.15)), 'camera distance');
 });
 
 test('spawns particles as the client\'s emitters do, and counts emission', () => {

@@ -176,7 +176,8 @@ export class SpellVisualLayer {
   // whose own rings the steady area replaces.
   private readonly bearerTriggers = new Set<number>();
 
-  constructor(private readonly onLoaded: () => void) {
+  // `groundBelow` finds the ground for particles that start on it.
+  constructor(private readonly onLoaded: () => void, private readonly groundBelow: EffectView['ground'] = null) {
     this.templates = new EffectTemplateCache(onLoaded, 'spell effect');
     this.chains = new ChainLightning(onLoaded);
     this.group.add(this.chains.group, this.trails.group);
@@ -377,7 +378,7 @@ export class SpellVisualLayer {
 
     // Effects bring their own nodes up to date; the scene view does the rest.
     this.group.updateWorldMatrix(true, false);
-    const view = getEffectView(camera, this.group);
+    const view = getEffectView(camera, this.group, this.groundBelow);
     this.updateChains(store?.chains ?? [], now, view, seconds);
     this.trails.update(now, this.units.blades);
     const budget = { left: PARTICLE_BUDGET };

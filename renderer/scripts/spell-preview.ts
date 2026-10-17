@@ -13,6 +13,7 @@ import { SpellEffectLayer, type UnitAnchorRole } from './instance-scene/spell-ef
 import { SpellVisualLayer } from './instance-scene/spell-visual-layer';
 import { type UnitModelPose, UnitModelLayer } from './instance-scene/unit-models';
 import type { StreamCombatEvent } from '../../src/types/api';
+import { PARTICLE_GROUND_DEPTH } from './utils/m2-tracks';
 import { CombatEffectStore, type Point3, type UnitKey } from './utils/spell-events';
 
 // Spell preview (dev tool, /spell-preview): plays one spell on a loop between
@@ -71,7 +72,8 @@ controls.update();
 
 const units = new UnitModelLayer(() => {});
 const glows = new SpellEffectLayer();
-const visuals = new SpellVisualLayer(() => {});
+// The ground is the preview's flat floor (z 0).
+const visuals = new SpellVisualLayer(() => {}, (point) => (point[2] >= 0 && point[2] <= PARTICLE_GROUND_DEPTH ? 0 : null));
 scene.add(units.group, glows.group, visuals.group);
 const store = new CombatEffectStore();
 

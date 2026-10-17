@@ -259,7 +259,44 @@ export function materialBlend(type: number): EffectBlend {
   }
 }
 
-// The angle of a UV rotation quaternion about Z.
-export function quaternionAngleZ(q: number[]): number {
-  return 2 * Math.atan2(q[2] ?? 0, q[3] ?? 1);
+export type Matrix3Elements = [number, number, number, number, number, number, number, number, number];
+
+// A texture's UV transform as the client builds it, row-major for a 3x3
+// matrix: moved by `translation` first, then scaled and turned (by the
+// quaternion) about the texture's middle.
+export function uvMatrix(translation: number[], rotation: number[], scaling: number[]): Matrix3Elements {
+  const [x, y, z, w] = [rotation[0] ?? 0, rotation[1] ?? 0, rotation[2] ?? 0, rotation[3] ?? 1];
+  const [sx, sy] = [scaling[0] ?? 1, scaling[1] ?? 1];
+  const a = (1 - 2 * (y * y + z * z)) * sx;
+  const b = 2 * (x * y - w * z) * sy;
+  const c = 2 * (x * y + w * z) * sx;
+  const d = (1 - 2 * (x * x + z * z)) * sy;
+  const u = (translation[0] ?? 0) - 0.5;
+  const v = (translation[1] ?? 0) - 0.5;
+  return [a, b, a * u + b * v + 0.5, c, d, c * u + d * v + 0.5, 0, 0, 1];
 }
+
+// The steps an emitter takes over a frame of `seconds`, as the client
+// splits them: a frame of up to a tenth of a second is one step; a longer
+// one is whole tenths, at most as many as fit in a particle's `life`, then
+// what's left over past the whole tenths.
+export function particleSteps(seconds: number, life: number): number[] {
+  if (seconds <= 0.1) return [Math.max(0, seconds)];
+  const whole = Math.floor(seconds * 10);
+  const steps = Math.max(0, Math.min(whole, Math.floor(life * 10)));
+  return [...Array<number>(steps).fill(0.1), seconds - whole * 0.1];
+}
+
+// The share of its rate an emitter `distance` yards from the camera lets
+// go: all of it within 50 yards, falling to a quarter by 87.5.
+export function distanceThinning(distance: number): number {
+  return Math.min(1, Math.max(0.25, 1 - (distance - 50) * 0.02));
+}
+
+// How far below a particle the client looks for the ground (yards).
+export const PARTICLE_GROUND_DEPTH = 20;
+
+// The client's camera field of view, top to bottom (radians), and how far
+// back it stands to show a view `height` yards tall.
+const CLIENT_FOV_Y = Math.PI / 2 * 0.6;
+export const cameraDistanceFor = (height: number): number => height / (2 * Math.tan(CLIENT_FOV_Y / 2));
