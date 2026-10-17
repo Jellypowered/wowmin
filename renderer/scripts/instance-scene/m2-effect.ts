@@ -202,6 +202,8 @@ const MODEL_TURNS: Record<string, [number, number, number, number]> = {
 };
 const MAX_PARTICLES_PER_EMITTER = 400;
 const MAX_RIBBON_EDGES = 256;
+// Quads an emitter's batch holds before it first grows.
+const PARTICLE_BATCH_START = 32;
 // The client's least ribbon lifetime (seconds), and heights without a track.
 const MIN_RIBBON_LIFETIME = 0.25;
 const DEFAULT_RIBBON_HEIGHT = 10;
@@ -313,39 +315,59 @@ function applyBlend(material: MeshBasicMaterial, blend: EffectBlend): void {
 }
 
 // A dynamic batch of quads: four vertices each, with position, uv, colour.
+// It holds `capacity` quads to start with and grows, up to `maxCapacity`,
+// as `begin` asks.
 class QuadBatch {
   readonly mesh: Mesh<BufferGeometry, MeshBasicMaterial>;
-  private readonly positions: Float32Array;
-  private readonly uvs: Float32Array;
-  private readonly colors: Float32Array;
+  private positions!: Float32Array;
+  private uvs!: Float32Array;
+  private colors!: Float32Array;
   count = 0;
 
-  constructor(capacity: number, texture: Texture | null, blend: EffectBlend) {
+  constructor(capacity: number, private readonly maxCapacity: number, texture: Texture | null, blend: EffectBlend) {
+    const material = new MeshBasicMaterial({ map: texture, vertexColors: true, side: DoubleSide, forceSinglePass: true });
+    applyBlend(material, blend);
+    this.mesh = new Mesh(this.geometryFor(Math.min(capacity, maxCapacity)), material);
+    this.mesh.frustumCulled = false;
+    this.mesh.renderOrder = EFFECT_RENDER_ORDER;
+  }
+
+  private geometryFor(capacity: number): BufferGeometry {
     this.positions = new Float32Array(capacity * 12);
     this.uvs = new Float32Array(capacity * 8);
     this.colors = new Float32Array(capacity * 16);
     const indices = new Uint16Array(capacity * 6);
     for (let quad = 0; quad < capacity; quad += 1) {
-      indices.set([quad * 4, quad * 4 + 1, quad * 4 + 2, quad * 4, quad * 4 + 2, quad * 4 + 3], quad * 6);
+      const at = quad * 6;
+      const corner = quad * 4;
+      indices[at] = corner;
+      indices[at + 1] = corner + 1;
+      indices[at + 2] = corner + 2;
+      indices[at + 3] = corner;
+      indices[at + 4] = corner + 2;
+      indices[at + 5] = corner + 3;
     }
     const geometry = new BufferGeometry();
     geometry.setAttribute('position', new BufferAttribute(this.positions, 3).setUsage(DynamicDrawUsage));
     geometry.setAttribute('uv', new BufferAttribute(this.uvs, 2).setUsage(DynamicDrawUsage));
     geometry.setAttribute('color', new BufferAttribute(this.colors, 4).setUsage(DynamicDrawUsage));
     geometry.setIndex(new BufferAttribute(indices, 1));
-    const material = new MeshBasicMaterial({ map: texture, vertexColors: true, side: DoubleSide, forceSinglePass: true });
-    applyBlend(material, blend);
-    this.mesh = new Mesh(geometry, material);
-    this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = EFFECT_RENDER_ORDER;
+    return geometry;
   }
 
   get capacity(): number {
     return this.positions.length / 12;
   }
 
-  begin(): void {
+  // Starts the frame's quads, with room for `quads` of them: a full batch
+  // doubles (at least to that many, at most to its greatest), in new
+  // buffers, since every frame writes its quads afresh.
+  begin(quads = 0): void {
     this.count = 0;
+    if (quads <= this.capacity || this.capacity >= this.maxCapacity) return;
+    const old = this.mesh.geometry;
+    this.mesh.geometry = this.geometryFor(Math.min(this.maxCapacity, Math.max(quads, this.capacity * 2)));
+    old.dispose();
   }
 
   // Corners in order round the quad, with their uvs, in one colour.
@@ -698,6 +720,10 @@ function particleColorInto(out: [number, number, number, number], def: ExportedE
 // How long a particle of the emitter lives (seconds), by its life seed.
 const particleLife = (emitter: EmitterState, lifeSeed: number): number =>
   Math.max(MIN_LIFE, emitter.lifeBase + lifeSeed * emitter.def.lifespanVariation);
+// The most edges a ribbon keeps: as many as it lays in a lifetime, and two.
+const ribbonRate = (def: ExportedRibbon): number => Math.ceil(def.edgesPerSecond);
+const ribbonLifetime = (def: ExportedRibbon): number => Math.max(MIN_RIBBON_LIFETIME, def.edgeLifetime);
+const ribbonEdgeLimit = (def: ExportedRibbon): number => Math.ceil(ribbonRate(def) * ribbonLifetime(def)) + 2;
 const newPose = (): RibbonPose => ({ position: [0, 0, 0], forward: [0, 0, 0], up: [0, 0, 0] });
 
 // The camera's directions in the layer's coordinates, for billboards.
@@ -802,8 +828,8 @@ export class EffectInstance {
       if (object instanceof Mesh) this.adoptMaterial(object);
     });
     const emitterState = (def: ExportedEmitter, child: boolean): EmitterState => {
-      // A head and a tail for each particle.
-      const batch = new QuadBatch(MAX_PARTICLES_PER_EMITTER * 2, def.textureMaterial ? template.textures.get(def.textureMaterial) ?? null : null,
+      // A head and a tail for each particle, at most.
+      const batch = new QuadBatch(PARTICLE_BATCH_START, MAX_PARTICLES_PER_EMITTER * 2, def.textureMaterial ? template.textures.get(def.textureMaterial) ?? null : null,
         particleBlend(def.blendingType));
       batch.mesh.renderOrder = EFFECT_RENDER_ORDER + (def.priorityPlane ?? 0) / 1000;
       this.particles.add(batch.mesh);
@@ -826,8 +852,10 @@ export class EffectInstance {
     this.everyEmitter = this.emitters.flatMap((emitter) => [emitter, ...emitter.children]);
     this.ribbons = template.effect.ribbons.map((def) => {
       const passes = def.passes?.length ? def.passes : [{ textureMaterial: def.textureMaterial, blend: def.blend }];
+      // As many segments as it keeps edges (one to the live head).
+      const segments = Math.min(MAX_RIBBON_EDGES, ribbonEdgeLimit(def) + 1);
       const batches = passes.map((pass) => {
-        const batch = new QuadBatch(MAX_RIBBON_EDGES, pass.textureMaterial ? template.textures.get(pass.textureMaterial) ?? null : null,
+        const batch = new QuadBatch(segments, segments, pass.textureMaterial ? template.textures.get(pass.textureMaterial) ?? null : null,
           materialBlend(pass.blend));
         this.particles.add(batch.mesh);
         return batch;
@@ -1355,14 +1383,14 @@ export class EffectInstance {
     const flags = def.flags;
     const local = Boolean(flags & FLAG_LOCAL);
     const batch = emitter.batch;
-    batch.begin();
     const head = Boolean(flags & FLAG_HEAD);
     const tail = Boolean(flags & FLAG_TAIL);
+    const particles = emitter.particles;
+    batch.begin(particles.length * ((head ? 1 : 0) + (tail ? 1 : 0)));
     if (!head && !tail) {
       batch.end();
       return;
     }
-    const particles = emitter.particles;
     const frameLinear = emitter.frameLinear;
     const viewRight = view.right;
     const viewUp = view.up;
@@ -1485,8 +1513,8 @@ export class EffectInstance {
     linearInto(pose.forward, frameLinear, Z_AXIS);
     linearInto(pose.up, frameLinear, Y_AXIS);
     const last = ribbon.hasLast ? ribbon.last : pose;
-    const rate = Math.ceil(def.edgesPerSecond);
-    const lifetime = Math.max(MIN_RIBBON_LIFETIME, def.edgeLifetime);
+    const rate = ribbonRate(def);
+    const lifetime = ribbonLifetime(def);
     let dt = seconds;
     if (!ribbon.started && rate > 0) dt = 1 / rate + 0.0001;
     ribbon.started = true;
@@ -1531,7 +1559,7 @@ export class EffectInstance {
         }
       }
       ribbon.carry = target - Math.floor(target);
-      const capacity = Math.ceil(rate * lifetime) + 2;
+      const capacity = ribbonEdgeLimit(def);
       if (edges.length > capacity) edges.splice(0, edges.length - capacity);
     }
     for (const edge of edges) {
