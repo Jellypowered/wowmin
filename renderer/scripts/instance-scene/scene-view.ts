@@ -629,6 +629,10 @@ export class InstanceSceneView {
   private readonly groundHeights = new Map<string, number | null>();
   private groundKey = '';
   private groundRays = 0;
+  // Rays cast against the map since the last frame drawn and the time they
+  // took (ms), for diagnosing slow frames.
+  private castCount = 0;
+  private castMs = 0;
   private lost = false;
   // Player and creature models; lit, unlike the scene.
   private readonly units: UnitModelLayer;
@@ -912,10 +916,13 @@ export class InstanceSceneView {
   // The nearest hit within `far` of a ray from `start` along `direction`, as
   // solidHit finds them.
   private cast(root: Object3D, start: Vector3, direction: Vector3, far: number): Intersection | null {
+    const startedAt = performance.now();
     this.raycaster.set(start, direction);
     this.raycaster.far = far;
     const hit = this.solidHit(root);
     this.raycaster.far = Infinity;
+    this.castCount += 1;
+    this.castMs += performance.now() - startedAt;
     return hit;
   }
 
@@ -1114,6 +1121,10 @@ export class InstanceSceneView {
     this.renderer.render(this.scene, this.camera);
     // Exposed for diagnosing slow scenes from the browser's developer tools.
     this.canvas.dataset.drawCalls = String(this.renderer.info.render.calls);
+    this.canvas.dataset.groundRays = String(this.castCount);
+    this.canvas.dataset.groundRayMs = this.castMs.toFixed(3);
+    this.castCount = 0;
+    this.castMs = 0;
     this.canvas.dataset.triangles = String(this.renderer.info.render.triangles);
     this.canvas.dataset.buffer = `${this.canvas.width}x${this.canvas.height}`;
     return true;

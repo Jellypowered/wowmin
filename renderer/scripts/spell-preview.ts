@@ -14,7 +14,7 @@ import { SpellVisualLayer } from './instance-scene/spell-visual-layer';
 import { type UnitModelPose, UnitModelLayer } from './instance-scene/unit-models';
 import type { StreamCombatEvent } from '../../src/types/api';
 import { PARTICLE_GROUND_DEPTH } from './utils/m2-tracks';
-import { CombatEffectStore, type Point3, type UnitKey } from './utils/spell-events';
+import { CombatEffectStore, type Point3, type UnitKey, unitKey } from './utils/spell-events';
 
 // Spell preview (dev tool, /spell-preview): plays one spell on a loop between
 // a caster and a target, close up, so its effects can be compared with the
@@ -23,34 +23,133 @@ import { CombatEffectStore, type Point3, type UnitKey } from './utils/spell-even
 // fires each second, flying at `speed`), area (radius), lasting (ms, a
 // lasting area), ground (the area on the target's ground), aura (ms the
 // spell's aura stays on the target), caster (a creature display), heal.
+//
+// Stress mode, from the query only: `stress=N` plays N casters, each with
+// its target and ally, on a ring, triple k playing preset k of `presets`
+// (button names, comma separated) in turn, its loop 400 ms after the last.
+// The status line, and the canvas's dataset for scripts, give frame time,
+// effects, particles, draw calls, textures, and heap once a second.
 
-const CASTER: UnitKey = 'p1';
-const TARGET: UnitKey = 'c2';
-const ALLY: UnitKey = 'p3';
 const GNOME_URL = 'assets/models/character/7-0-0-0-1-1-1-0-0.0.0.1867.0.0.0.0.0.0.472.0.0.0.glb';
-// The caster: the gnome mage, or a creature display (form or query `caster`).
-const casterUrl = (): string => {
-  const display = Number(field('caster').value) || 0;
-  return display > 0 ? `assets/models/creature/${display}.glb` : GNOME_URL;
-};
 const TARGET_URL = 'assets/models/creature/23561.glb';
 const ALLY_URL = 'assets/models/character/1-0-2-1-3-2-2-0-1128.1060.0.9674.51619.1184.3415.0.2952.13963.2806.32558.0.0.glb';
 const MIN_LOOP_MS = 5000;
 const DEFAULT_HEIGHT = 2;
+// The target stands this far ahead of its caster, the ally ahead and to
+// its left.
+const TARGET_DISTANCE = 14;
+const ALLY_OFFSET: [number, number] = [5, 4];
+const STRESS_MIN_RADIUS = 12;
+const STRESS_RADIUS_PER_TRIPLE = 1.2;
+const STRESS_LOOP_OFFSET_MS = 400;
+const DEFAULT_STRESS_PRESETS = ['Frostbolt', 'Fireball', 'Shadow Bolt', 'Holy Light', 'Arcane Missiles', 'Consecration', 'Flamestrike', 'Immolate',
+  'Renew', 'Power Word: Shield'];
+const STATS_INTERVAL_MS = 1000;
 
-const positions = new Map<UnitKey, Point3>([[CASTER, [0, 0, 0]], [TARGET, [14, 0, 0]], [ALLY, [5, 4, 0]]]);
-const facing = new Map<UnitKey, number>([[CASTER, 0], [TARGET, Math.PI], [ALLY, -Math.PI / 2]]);
+// What one play of a spell is: the form's fields, or a preset's.
+interface Preset {
+  spell: number;
+  speed: number;
+  cast: number;
+  channel: number;
+  bolt: number;
+  area: number;
+  lasting: number;
+  aura: number;
+  caster: number;
+  heal: boolean;
+  ground: boolean;
+}
+
+// A caster, its target, and its ally, and what they play (null: the form).
+interface Triple {
+  caster: UnitKey;
+  target: UnitKey;
+  ally: UnitKey;
+  guids: [number, number, number];
+  preset: Preset | null;
+  nextLoopAt: number;
+  offsetMs: number;
+}
 
 const form = document.getElementById('preview-form') as HTMLFormElement;
 const field = (name: string) => form.elements.namedItem(name) as HTMLInputElement;
 const params = new URLSearchParams(window.location.search);
-for (const name of ['spell', 'speed', 'cast', 'channel', 'bolt', 'area', 'lasting', 'aura', 'caster', 'rate']) {
+const NUMBER_FIELDS = ['spell', 'speed', 'cast', 'channel', 'bolt', 'area', 'lasting', 'aura', 'caster'] as const;
+const formPreset = (): Preset => ({
+  ...Object.fromEntries(NUMBER_FIELDS.map((name) => [name, Number(field(name).value) || 0])) as Record<typeof NUMBER_FIELDS[number], number>,
+  heal: field('heal').checked,
+  ground: field('ground').checked,
+});
+const presetButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-preset]')];
+// A preset button's spell (its data-preset JSON), fields it leaves out 0.
+const presetOf = (button: HTMLButtonElement): Preset => {
+  const preset = JSON.parse(button.dataset.preset!) as Record<string, number | boolean>;
+  return {
+    ...Object.fromEntries(NUMBER_FIELDS.map((key) => [key, Number(preset[key] ?? 0)])) as Record<typeof NUMBER_FIELDS[number], number>,
+    heal: Boolean(preset.heal),
+    ground: Boolean(preset.ground),
+  };
+};
+const namedPreset = (name: string): Preset | null => {
+  const button = presetButtons.find((candidate) => candidate.textContent?.trim().toLowerCase() === name.trim().toLowerCase());
+  return button ? presetOf(button) : null;
+};
+// The ring's radius for `count` casters.
+const ringRadius = (count: number): number => Math.max(STRESS_MIN_RADIUS, count * STRESS_RADIUS_PER_TRIPLE);
+
+// The caster: the gnome mage, or a creature display.
+const casterUrl = (preset: Preset): string => (preset.caster > 0 ? `assets/models/creature/${preset.caster}.glb` : GNOME_URL);
+
+const positions = new Map<UnitKey, Point3>();
+const facing = new Map<UnitKey, number>();
+const urls = new Map<UnitKey, () => string>();
+const triples: Triple[] = [];
+// Triple k stands at angle 2πk/N on the ring, facing out, its target
+// further out; a single triple stands at the origin facing +X.
+function addTriple(index: number, count: number, preset: Preset | null): void {
+  const angle = count > 1 ? (2 * Math.PI * index) / count : 0;
+  const radius = count > 1 ? ringRadius(count) : 0;
+  const [cos, sin] = [Math.cos(angle), Math.sin(angle)];
+  const guids: [number, number, number] = [1 + 3 * index, 2 + 3 * index, 3 + 3 * index];
+  const triple: Triple = {
+    caster: unitKey(guids[0], false), target: unitKey(guids[1], true), ally: unitKey(guids[2], false), guids, preset,
+    nextLoopAt: index * STRESS_LOOP_OFFSET_MS, offsetMs: index * STRESS_LOOP_OFFSET_MS,
+  };
+  positions.set(triple.caster, [radius * cos, radius * sin, 0]);
+  positions.set(triple.target, [(radius + TARGET_DISTANCE) * cos, (radius + TARGET_DISTANCE) * sin, 0]);
+  positions.set(triple.ally, [radius * cos + ALLY_OFFSET[0] * cos - ALLY_OFFSET[1] * sin, radius * sin + ALLY_OFFSET[0] * sin + ALLY_OFFSET[1] * cos, 0]);
+  facing.set(triple.caster, angle);
+  facing.set(triple.target, angle + Math.PI);
+  facing.set(triple.ally, angle - Math.PI / 2);
+  urls.set(triple.caster, () => casterUrl(triple.preset ?? formPreset()));
+  urls.set(triple.target, () => TARGET_URL);
+  urls.set(triple.ally, () => ALLY_URL);
+  triples.push(triple);
+}
+for (const name of [...NUMBER_FIELDS, 'rate']) {
   const value = params.get(name);
   if (value !== null) field(name).value = value;
 }
 if (params.has('heal')) field('heal').checked = params.get('heal') !== '0';
 if (params.has('ground')) field('ground').checked = params.get('ground') !== '0';
 if (params.has('glows')) field('glows').checked = params.get('glows') !== '0';
+
+const stress = Math.max(0, Math.floor(Number(params.get('stress')) || 0));
+if (stress > 0) {
+  const names = params.get('presets')?.split(',').filter((name) => name.trim()) ?? DEFAULT_STRESS_PRESETS;
+  const presets = names.map((name) => {
+    const preset = namedPreset(name);
+    if (!preset) console.warn(`No spell preview preset named ${name}`);
+    return preset;
+  }).filter((preset): preset is Preset => Boolean(preset));
+  if (!presets.length) presets.push(formPreset());
+  for (let index = 0; index < stress; index += 1) addTriple(index, stress, presets[index % presets.length]);
+} else {
+  addTriple(0, 1, null);
+}
+const casters = new Set(triples.map((triple) => triple.caster));
+const targets = new Set(triples.map((triple) => triple.target));
 
 const canvas = document.getElementById('preview-canvas') as HTMLCanvasElement;
 const renderer = new WebGLRenderer({ canvas, antialias: true });
@@ -61,13 +160,21 @@ scene.add(new AmbientLight(0xffffff, 2.2));
 const sun = new DirectionalLight(0xffffff, 1.6);
 sun.position.set(0.4, 1, 0.6);
 scene.add(sun);
-const grid = new GridHelper(40, 40, 0x334155, 0x1e293b);
-grid.position.set(7, 0, 0);
+// The ring's reach, for the floor and camera in stress mode.
+const reach = stress > 0 ? ringRadius(stress) + TARGET_DISTANCE + 4 : 0;
+const gridSize = stress > 0 ? Math.ceil(reach * 2) : 40;
+const grid = new GridHelper(gridSize, gridSize, 0x334155, 0x1e293b);
+grid.position.set(stress > 0 ? 0 : 7, 0, 0);
 scene.add(grid);
-const camera = new PerspectiveCamera(40, 1, 0.1, 500);
-camera.position.set(7, 6, 12);
+const camera = new PerspectiveCamera(40, 1, 0.1, 500 + reach * 4);
 const controls = new OrbitControls(camera, canvas);
-controls.target.set(7, 1.5, 0);
+if (stress > 0) {
+  camera.position.set(0, reach * 1.6, reach * 1.6);
+  controls.target.set(0, 1.5, 0);
+} else {
+  camera.position.set(7, 6, 12);
+  controls.target.set(7, 1.5, 0);
+}
 controls.update();
 
 const units = new UnitModelLayer(() => {});
@@ -91,8 +198,8 @@ function pose(id: UnitKey, url: string): UnitModelPose {
   const [x, y, z] = positions.get(id)!;
   return {
     id, url, x, y, z, orientation: facing.get(id)!, scale: 1, alive: true, inCombat: true,
-    style: id === TARGET ? 'melee' : 'cast',
-    weapons: { mainHandType: id === CASTER ? 17 : 0, mainHandSubclass: 10, offHandType: 0, rangedSubclass: 0 },
+    style: targets.has(id) ? 'melee' : 'cast',
+    weapons: { mainHandType: casters.has(id) ? 17 : 0, mainHandSubclass: 10, offHandType: 0, rangedSubclass: 0 },
     sheathState: 1, marker: { color: '#38bdf8', inCombat: false, selected: false, healthPct: null }, eventDriven: true,
   };
 }
@@ -108,32 +215,34 @@ function event(fields: Partial<StreamCombatEvent>): StreamCombatEvent {
 // Virtual time, so the whole scene can run slowed down.
 let virtualNow = 0;
 let lastReal = performance.now();
-let nextLoopAt = 0;
 
-// Schedules one play of the spell from `at`; returns how long it takes.
-function scheduleLoop(at: number): number {
-  const spellId = Number(field('spell').value) || 0;
-  const speed = Math.max(0, Number(field('speed').value) || 0);
-  const castMs = Math.max(0, Number(field('cast').value) || 0);
-  const channelMs = Math.max(0, Number(field('channel').value) || 0);
-  const radius = Math.max(0, Number(field('area').value) || 0);
-  const lastingMs = Math.max(0, Number(field('lasting').value) || 0);
-  const ground = field('ground').checked;
-  const auraMs = Math.max(0, Number(field('aura').value) || 0);
+// Schedules one play of the triple's spell from `at`; returns how long it
+// takes.
+function scheduleLoop(triple: Triple, at: number): number {
+  const preset = triple.preset ?? formPreset();
+  const spellId = preset.spell;
+  const speed = Math.max(0, preset.speed);
+  const castMs = Math.max(0, preset.cast);
+  const channelMs = Math.max(0, preset.channel);
+  const radius = Math.max(0, preset.area);
+  const lastingMs = Math.max(0, preset.lasting);
+  const ground = preset.ground;
+  const auraMs = Math.max(0, preset.aura);
   const length = Math.max(MIN_LOOP_MS, castMs + Math.max(channelMs, lastingMs, auraMs) + 3000);
-  const heal = field('heal').checked;
-  const target = heal ? { targetGuid: 3, targetCreature: false } : { targetGuid: 2, targetCreature: true };
-  const [from, to] = [positions.get(CASTER)!, positions.get(heal ? ALLY : TARGET)!];
+  const heal = preset.heal;
+  const [casterGuid, targetGuid, allyGuid] = triple.guids;
+  const target = heal ? { targetGuid: allyGuid, targetCreature: false } : { targetGuid, targetCreature: true };
+  const [from, to] = [positions.get(triple.caster)!, positions.get(heal ? triple.ally : triple.target)!];
   const travel = speed > 0 ? Math.hypot(to[0] - from[0], to[1] - from[1]) / speed * 1000 : 0;
   // The store plays events LIVE_RENDER_DELAY_MS after they arrive; ageMs
   // backdates them so they play at the times below.
   const push = (time: number, fields: Partial<StreamCombatEvent>) => {
-    setTimeoutVirtual(time, () => store.push({ mapId: 0, instanceId: 0, serverTimeMs: 0, dropped: 0, events: [event({ spellId, ...target, ...fields })] }, virtualNow));
+    setTimeoutVirtual(time, () => store.push({ mapId: 0, instanceId: 0, serverTimeMs: 0, dropped: 0, events: [event({ spellId, sourceGuid: casterGuid, ...target, ...fields })] }, virtualNow));
   };
   if (castMs > 0) push(at, { kind: 'castStart', value: castMs, helpful: heal });
   if (radius > 0) {
     // An area spell: at the target's feet, or round the caster.
-    const point = positions.get(ground ? TARGET : CASTER)!;
+    const point = positions.get(ground ? triple.target : triple.caster)!;
     push(at + castMs, {
       kind: 'castGo', area: true, radius, point: [...point], channeled: channelMs > 0, persistentArea: lastingMs > 0,
       value: channelMs || lastingMs, targetGuid: 0, helpful: heal,
@@ -145,7 +254,7 @@ function scheduleLoop(at: number): number {
   }
   if (channelMs > 0) {
     push(at + castMs, { kind: 'castGo', channeled: true, value: channelMs, helpful: heal });
-    const bolt = Number(field('bolt').value) || 0;
+    const bolt = preset.bolt;
     for (let tick = 1000; tick <= channelMs; tick += 1000) {
       if (bolt) {
         push(at + castMs + tick - travel, { kind: 'castGo', spellId: bolt, missileSpeed: speed, triggered: true, helpful: heal });
@@ -159,7 +268,7 @@ function scheduleLoop(at: number): number {
   push(at + castMs, { kind: 'castGo', missileSpeed: speed, helpful: heal });
   push(at + castMs + travel, { kind: heal ? 'heal' : 'damage', value: 1234, helpful: heal });
   if (auraMs > 0) {
-    auraWindows.push({ unit: heal ? ALLY : TARGET, spellId, from: at + castMs + travel, to: at + castMs + travel + auraMs });
+    auraWindows.push({ unit: heal ? triple.ally : triple.target, spellId, from: at + castMs + travel, to: at + castMs + travel + auraMs });
   }
   return length;
 }
@@ -187,12 +296,43 @@ function setTimeoutVirtual(at: number, run: () => void): void {
   timers.push({ at, run });
 }
 
+// Frame times (ms of work, from the frame's start to its draw having been
+// sent) since the stats were last shown.
+const frameTimes: number[] = [];
+let statsAt = performance.now();
+const memoryOf = (): number | null => {
+  const memory = (performance as Performance & { memory?: { usedJSHeapSize: number } }).memory;
+  return memory ? memory.usedJSHeapSize / 1e6 : null;
+};
+
+function showStats(real: number): void {
+  if (real - statsAt < STATS_INTERVAL_MS) return;
+  const seconds = (real - statsAt) / 1000;
+  statsAt = real;
+  const mean = frameTimes.length ? frameTimes.reduce((sum, time) => sum + time, 0) / frameTimes.length : 0;
+  const max = frameTimes.reduce((most, time) => Math.max(most, time), 0);
+  const fps = frameTimes.length / seconds;
+  frameTimes.length = 0;
+  const heap = memoryOf();
+  const stats = {
+    fps: fps.toFixed(1), frameMs: mean.toFixed(2), frameMaxMs: max.toFixed(2), effects: String(visuals.count), particles: String(visuals.particles),
+    drawCalls: String(renderer.info.render.calls), textures: String(renderer.info.memory.textures), geometries: String(renderer.info.memory.geometries),
+    heapMb: heap === null ? '' : heap.toFixed(1),
+  };
+  Object.assign(canvas.dataset, stats);
+  const status = document.getElementById('preview-status');
+  if (status) {
+    status.textContent = `${stats.fps} fps · ${stats.frameMs} ms (max ${stats.frameMaxMs}) · effects ${stats.effects} · particles ${stats.particles}`
+      + ` · ${stats.drawCalls} draws · ${stats.textures} textures${heap === null ? '' : ` · ${stats.heapMb} MB`}`;
+  }
+}
+
 function frame(): void {
   const real = performance.now();
   const rate = Math.max(0.05, Number(field('rate').value) || 1);
   virtualNow += (real - lastReal) * rate;
   lastReal = real;
-  if (virtualNow >= nextLoopAt) nextLoopAt += scheduleLoop(nextLoopAt);
+  for (const triple of triples) if (virtualNow >= triple.nextLoopAt) triple.nextLoopAt += scheduleLoop(triple, triple.nextLoopAt);
   for (let index = timers.length - 1; index >= 0; index -= 1) {
     if (timers[index].at <= virtualNow) {
       timers[index].run();
@@ -213,8 +353,8 @@ function frame(): void {
   });
   const strikes = new Map(cues.map((cue) => [cue.unit, cue.kind] as const));
   const animations = visuals.takeAnimations();
-  units.update([CASTER, TARGET, ALLY].map((id) => ({
-    ...pose(id, id === CASTER ? casterUrl() : id === TARGET ? TARGET_URL : ALLY_URL),
+  units.update([...urls].map(([id, url]) => ({
+    ...pose(id, url()),
     strike: strikes.get(id) ?? null,
     kitLoop: animations.get(id)?.loop ?? null,
     kitOnce: animations.get(id)?.once ?? null,
@@ -238,8 +378,8 @@ function frame(): void {
   }, camera, currentAuras(virtualNow));
   glows.update(field('glows').checked ? store : null, virtualNow, anchor, (entry) => visuals.handles(entry));
   renderer.render(scene, camera);
-  const status = document.getElementById('preview-status');
-  if (status) status.textContent = `effects ${visuals.count} · particles ${visuals.particles}`;
+  frameTimes.push(performance.now() - real);
+  showStats(real);
   requestAnimationFrame(frame);
 }
 
@@ -248,14 +388,14 @@ form.addEventListener('submit', (submitted) => {
   store.clear();
   timers.length = 0;
   auraWindows.length = 0;
-  nextLoopAt = virtualNow;
+  for (const triple of triples) triple.nextLoopAt = virtualNow + triple.offsetMs;
 });
-document.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((button) => {
+presetButtons.forEach((button) => {
   button.addEventListener('click', () => {
-    const preset = JSON.parse(button.dataset.preset!) as Record<string, number | boolean>;
-    for (const name of ['spell', 'speed', 'cast', 'channel', 'bolt', 'area', 'lasting', 'aura', 'caster']) field(name).value = String(preset[name] ?? 0);
-    field('heal').checked = Boolean(preset.heal);
-    field('ground').checked = Boolean(preset.ground);
+    const preset = presetOf(button);
+    for (const name of NUMBER_FIELDS) field(name).value = String(preset[name]);
+    field('heal').checked = preset.heal;
+    field('ground').checked = preset.ground;
     form.requestSubmit();
   });
 });
