@@ -165,8 +165,11 @@ accessed from a browser.
   `WOWMIN_TELEMETRY_POLL_MS` (default 1000, minimum 500)
 - For the 3D Instance Watch it also streams the watched instance over UDP at
   10 Hz (positions, roles, mobs, paths, appearances, combat events, auras,
-  game objects, markers). Live-stream protocol v2 adds each participant's role
-  mask while WoWMin retains v1 parsing. The stream runs only while a page is
+  game objects, markers). Stream v3 uses type-tagged non-player unit IDs so
+  pets, creatures, and vehicles cannot share a live identity; byte layouts
+  stay as in v2, which added participant role masks. WoWMin parses v1–v3
+  across all packet families. Deploy this reader before upgrading the module
+  to v3; older readers reject v3. The stream runs only while a page is
   watching: WoWMin renews it every few seconds with the
   `wowmin stream <mapId> <instanceId>` SOAP command, and the module stops
   sending when renewals stop

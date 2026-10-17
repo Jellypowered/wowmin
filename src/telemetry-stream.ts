@@ -36,14 +36,18 @@ const DEBUFF_SIZE = 16;
 const MARKER_SIZE = 8;
 const GAMEOBJECT_SIZE = 48;
 const PASSENGER_SIZE = 12;
-const VERSION = 2;
+const VERSION = 3;
 const LEGACY_VERSION = 1;
+const ROLE_MASK_VERSION = 2;
 const HEADER_SIZE = 28;
 const PLAYER_SIZE_V1 = 30;
 const PLAYER_SIZE_V2 = 31;
 
+// Version 3 keeps v2 layouts but makes non-player IDs type-tagged. Treat
+// IDs as opaque across every packet family; never strip their upper byte.
+
 function supportedVersion(version: number): boolean {
-  return version === LEGACY_VERSION || version === VERSION;
+  return version === LEGACY_VERSION || version === ROLE_MASK_VERSION || version === VERSION;
 }
 // Path, creature, and bot datagrams share a 24-byte header.
 const PATH_HEADER_SIZE = 24;

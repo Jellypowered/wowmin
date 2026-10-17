@@ -830,6 +830,12 @@ export class UnitModelLayer {
     unit.mixer.stopAllAction();
     this.setLook(unit, null);
     disposeMarker(unit.marker);
+    // Each skin's bone texture, made when it was first drawn, goes with it.
+    const skeletons = new Set<Skeleton>();
+    unit.model.traverse((object) => {
+      if (object instanceof SkinnedMesh) skeletons.add(object.skeleton);
+    });
+    for (const skeleton of skeletons) skeleton.dispose();
     this.group.remove(unit.root);
     this.units.delete(id);
   }
