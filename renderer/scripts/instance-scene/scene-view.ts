@@ -11,7 +11,6 @@ import {
   Frustum,
   InstancedBufferAttribute,
   InstancedMesh,
-  type Intersection,
   Material,
   Matrix4,
   Mesh,
@@ -44,6 +43,7 @@ import {
   lightAt, type MapLights, nearestObjectLights, scaleAmbient, type Rgb, sunDirection, timeOfDay,
 } from '../utils/map-light';
 import { PARTICLE_GROUND_DEPTH } from '../utils/m2-tracks';
+import { type FaceCulling, TriangleGrid } from '../utils/triangle-grid';
 import type { CombatEffectStore, Point3, UnitKey } from '../utils/spell-events';
 import { applyIsoCamera, serverToThree, threeToServer } from './iso-camera';
 import { ALL_SPELL_AIDS, type SpellAids, SpellEffectLayer, type UnitAnchorRole } from './spell-effects';
@@ -191,6 +191,47 @@ const GROUND_RAYS_PER_FRAME = 64;
 const NO_REACH = 1e9;
 const floorAreaColor = new Color();
 const DOWN = new Vector3(0, -1, 0);
+const SERVER_DOWN: Point3 = [0, 0, -1];
+// How far round a ray's box a mesh's box may lie and still be tested
+// (yards), for meshes whose box only grazes it.
+const RAY_BOX_MARGIN = 0.5;
+const gridVertex = new Vector3();
+// Idle time a grid build leaves unused (ms), and the wait between builds
+// where the browser has no idle callbacks.
+const GRID_IDLE_MARGIN_MS = 4;
+const GRID_FALLBACK_DELAY_MS = 50;
+
+// A solid mesh's triangles in server coordinates, gridded for rays, and
+// which faces its material lets a ray hit, as three.js's raycast decides.
+interface SolidGrid {
+  grid: TriangleGrid;
+  culling: FaceCulling;
+}
+
+function solidGridOf(mesh: Mesh): SolidGrid {
+  const position = mesh.geometry.getAttribute('position');
+  const points = new Float32Array(position.count * 3);
+  for (let index = 0; index < position.count; index += 1) {
+    gridVertex.fromBufferAttribute(position, index).applyMatrix4(mesh.matrixWorld);
+    // Server (x, y, z) is three.js's (x, z, -y).
+    points[index * 3] = gridVertex.x;
+    points[index * 3 + 1] = -gridVertex.z;
+    points[index * 3 + 2] = gridVertex.y;
+  }
+  const indices = mesh.geometry.getIndex();
+  const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+  const side = (material as Material | undefined)?.side ?? FrontSide;
+  // A mirroring transform turns the triangles' winding over.
+  const mirrored = mesh.matrixWorld.determinant() < 0;
+  const culling: FaceCulling = side === DoubleSide ? 'none' : (side === FrontSide) !== mirrored ? 'back' : 'front';
+  return { grid: TriangleGrid.build(points, indices ? indices.array : null), culling };
+}
+
+// Shown, with every parent shown.
+function drawnInScene(object: Object3D): boolean {
+  for (let node: Object3D | null = object; node; node = node.parent) if (!node.visible) return false;
+  return true;
+}
 const INDOOR_TOWARDS = serverToThree(INDOOR_LIGHT_DIRECTION.map((value) => -value) as Point3).normalize();
 // All fade values live in one uniform buffer shared by every scene material,
 // uploaded once a frame (per-material uniform arrays were re-sent on every
@@ -622,6 +663,14 @@ export class InstanceSceneView {
   private readonly roots = new Map<string, Object3D>();
   // World bounds of each mesh, so wholly faded meshes are not drawn.
   private readonly meshBounds = new Map<Object3D, MeshBounds[]>();
+  // Of those, the map's terrain, buildings, liquids, and single props: the
+  // meshes ground rays may hit (instanced props are left out).
+  private readonly solidMeshes = new Map<Object3D, MeshBounds[]>();
+  // Their triangle grids, built in idle time after a scene loads (or at a
+  // ray's need, if it comes first).
+  private readonly solidGrids = new WeakMap<Mesh, SolidGrid>();
+  private readonly gridQueue: Mesh[] = [];
+  private gridsScheduled = false;
   private readonly states = new Map<string, SceneLoadState>();
   private readonly materials = new Map<string, Material>();
   private shown: Object3D | null = null;
@@ -872,13 +921,14 @@ export class InstanceSceneView {
   private groundUnder(center: Point3, [x, y]: Point3): Point3 {
     const root = this.shown;
     if (!root) return center;
-    const start = serverToThree([center[0], center[1], center[2] + SHARD_START_LIFT]);
-    const end = serverToThree([x, y, center[2] + SHARD_SEARCH_HEIGHT]);
-    const length = start.distanceTo(end);
-    const roof = this.cast(root, start, end.clone().sub(start).normalize(), length);
-    const top = roof ? start.lerp(end, (roof.distance / length) * SHARD_ROOF_SHARE) : end;
-    const ground = this.cast(root, top, DOWN, SHARD_GROUND_DEPTH);
-    return ground ? threeToServer(ground.point) : center;
+    const start: Point3 = [center[0], center[1], center[2] + SHARD_START_LIFT];
+    const end: Point3 = [x, y, center[2] + SHARD_SEARCH_HEIGHT];
+    const length = Math.hypot(end[0] - start[0], end[1] - start[1], end[2] - start[2]);
+    const way = end.map((value, axis) => (value - start[axis]) / length) as Point3;
+    const roof = length > 0 ? this.cast(root, start, way, length) : null;
+    const top = roof === null ? end : start.map((value, axis) => value + way[axis] * roof * SHARD_ROOF_SHARE) as Point3;
+    const ground = this.cast(root, top, SERVER_DOWN, SHARD_GROUND_DEPTH);
+    return ground === null ? center : [top[0], top[1], top[2] - ground];
   }
 
   // The height of the first surface up to PARTICLE_GROUND_DEPTH below a
@@ -894,8 +944,8 @@ export class InstanceSceneView {
     if (known !== undefined) return known;
     if (this.groundRays >= GROUND_RAYS_PER_FRAME) return null;
     this.groundRays += 1;
-    const hit = this.cast(root, serverToThree([x, y, z]), DOWN, PARTICLE_GROUND_DEPTH);
-    const height = hit ? threeToServer(hit.point)[2] : null;
+    const below = this.cast(root, [x, y, z], SERVER_DOWN, PARTICLE_GROUND_DEPTH);
+    const height = below === null ? null : z - below;
     this.groundHeights.set(key, height);
     return height;
   }
@@ -905,37 +955,67 @@ export class InstanceSceneView {
   private intersect(from: Point3, to: Point3): number | null {
     const root = this.shown;
     if (!root) return null;
-    const start = serverToThree(from);
-    const end = serverToThree(to);
-    const length = start.distanceTo(end);
+    const length = Math.hypot(to[0] - from[0], to[1] - from[1], to[2] - from[2]);
     if (length <= 0) return null;
-    const hit = this.cast(root, start, end.sub(start).normalize(), length);
-    return hit ? hit.distance / length : null;
+    const hit = this.cast(root, from, to.map((value, axis) => (value - from[axis]) / length) as Point3, length);
+    return hit === null ? null : hit / length;
   }
 
-  // The nearest hit within `far` of a ray from `start` along `direction`, as
-  // solidHit finds them.
-  private cast(root: Object3D, start: Vector3, direction: Vector3, far: number): Intersection | null {
+  // How far along a ray (server coordinates) from `start` along the unit
+  // `direction` it first meets the map's terrain or buildings (not its
+  // instanced props), drawn now, up to `far`; null if it doesn't. Only the
+  // meshes whose box meets the ray's are tested, each through its triangle
+  // grid.
+  private cast(root: Object3D, [ax, ay, az]: Point3, [dx, dy, dz]: Point3, far: number): number | null {
     const startedAt = performance.now();
-    this.raycaster.set(start, direction);
-    this.raycaster.far = far;
-    const hit = this.solidHit(root);
-    this.raycaster.far = Infinity;
+    const bx = ax + dx * far;
+    const by = ay + dy * far;
+    const bz = az + dz * far;
+    const minX = Math.min(ax, bx) - RAY_BOX_MARGIN;
+    const maxX = Math.max(ax, bx) + RAY_BOX_MARGIN;
+    const minY = Math.min(ay, by) - RAY_BOX_MARGIN;
+    const maxY = Math.max(ay, by) + RAY_BOX_MARGIN;
+    const minZ = Math.min(az, bz) - RAY_BOX_MARGIN;
+    const maxZ = Math.max(az, bz) + RAY_BOX_MARGIN;
+    let best = far;
+    let found = false;
+    for (const bounds of this.solidMeshes.get(root) ?? []) {
+      if (bounds.minX > maxX || bounds.maxX < minX || bounds.minY > maxY || bounds.maxY < minY || bounds.minZ > maxZ || bounds.maxZ < minZ) continue;
+      if (!drawnInScene(bounds.mesh)) continue;
+      const { grid, culling } = this.solidGrid(bounds.mesh);
+      const distance = grid.cast(ax, ay, az, dx, dy, dz, best, culling);
+      if (distance !== null && distance <= best) {
+        best = distance;
+        found = true;
+      }
+    }
     this.castCount += 1;
     this.castMs += performance.now() - startedAt;
-    return hit;
+    return found ? best : null;
   }
 
-  // The raycaster's nearest hit on the map's terrain and buildings (not its
-  // props), drawn now.
-  private solidHit(root: Object3D): Intersection | null {
-    for (const hit of this.raycaster.intersectObject(root, true)) {
-      if (hit.object instanceof InstancedMesh) continue;
-      let shown = true;
-      for (let object: Object3D | null = hit.object; object; object = object.parent) shown &&= object.visible;
-      if (shown) return hit;
+  private solidGrid(mesh: Mesh): SolidGrid {
+    let solid = this.solidGrids.get(mesh);
+    if (!solid) {
+      solid = solidGridOf(mesh);
+      this.solidGrids.set(mesh, solid);
     }
-    return null;
+    return solid;
+  }
+
+  // Builds the queued meshes' grids while the page is idle (one at a time
+  // where the browser has no idle callbacks).
+  private buildGridsWhenIdle(): void {
+    if (this.gridsScheduled || !this.gridQueue.length) return;
+    this.gridsScheduled = true;
+    const build = (deadline?: IdleDeadline) => {
+      this.gridsScheduled = false;
+      if (!deadline) this.solidGrid(this.gridQueue.pop()!);
+      while (deadline && this.gridQueue.length && deadline.timeRemaining() > GRID_IDLE_MARGIN_MS) this.solidGrid(this.gridQueue.pop()!);
+      this.buildGridsWhenIdle();
+    };
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(build);
+    else setTimeout(build, GRID_FALLBACK_DELAY_MS);
   }
 
   // Puts bearer areas round their units' feet into the fade block, for the
@@ -1020,6 +1100,10 @@ export class InstanceSceneView {
         bounds.push({ mesh: object, minX, maxX, minY, maxY, minZ, maxZ });
       });
       this.meshBounds.set(root, bounds);
+      const solid = bounds.filter((entry) => !(entry.mesh instanceof InstancedMesh));
+      this.solidMeshes.set(root, solid);
+      this.gridQueue.push(...solid.map((entry) => entry.mesh));
+      this.buildGridsWhenIdle();
       this.roots.set(url, root);
       const interiors = new Map<number, Mesh[]>();
       root.traverse((node) => {
@@ -1198,9 +1282,7 @@ export class InstanceSceneView {
     this.camera.updateMatrixWorld();
     this.raycaster.setFromCamera(new Vector2((x / width) * 2 - 1, 1 - (y / height) * 2), this.camera);
     for (const hit of this.raycaster.intersectObject(root, true)) {
-      let shown = true;
-      for (let object: Object3D | null = hit.object; object; object = object.parent) shown &&= object.visible;
-      if (!shown) continue;
+      if (!drawnInScene(hit.object)) continue;
       const point = threeToServer(hit.point);
       if (isDrawnAt(point, fade)) return point;
     }
