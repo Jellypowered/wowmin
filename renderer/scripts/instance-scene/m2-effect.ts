@@ -28,6 +28,8 @@ import {
   OrthographicCamera,
   Quaternion,
   RepeatWrapping,
+  type Skeleton,
+  SkinnedMesh,
   SrcColorFactor,
   type Texture,
   Vector3,
@@ -250,6 +252,16 @@ export async function loadEffectTemplate(url: string): Promise<EffectTemplate> {
   for (const material of materials) {
     if (/^(p\d+:)?texture\d+$/.test(material.name) && material.map) textures.set(material.name, material.map);
   }
+  // Shared by every instance and its particles, and never disposed: set
+  // up once for scrolling, its matrix left alone (instances whose texture
+  // scrolls draw with a copy of their own).
+  for (const texture of textures.values()) {
+    texture.wrapS = RepeatWrapping;
+    texture.wrapT = RepeatWrapping;
+    texture.matrixAutoUpdate = false;
+    texture.matrix.identity();
+    texture.needsUpdate = true;
+  }
   const particleModels: EffectTemplate[] = [];
   for (const root of [...gltf.scene.children]) {
     const index = root.userData.wowParticleModel;
@@ -268,6 +280,15 @@ export async function loadEffectTemplate(url: string): Promise<EffectTemplate> {
   }
   const animations = gltf.animations.filter((clip) => !/^p\d+:/.test(clip.name));
   return { scene: gltf.scene, animations, effect: effectOf(gltf.scene.children[0]), textures, particleModels };
+}
+
+// A copy of a texture sharing its image. Copying marks the image changed,
+// which would upload it again; it hasn't, so its version is kept.
+function copyTexture(texture: Texture): Texture {
+  const version = texture.source.version;
+  const copy = texture.clone();
+  copy.source.version = version;
+  return copy;
 }
 
 // Batch blend names from the converter (M2_BLEND in unit-model.mjs).
@@ -550,6 +571,8 @@ interface RibbonState {
 
 interface AnimatedMaterial {
   material: MeshBasicMaterial;
+  // Whether its map is its own copy, for its UV tracks to move.
+  ownsMap: boolean;
   color: ExportedTrack | null;
   alpha: ExportedTrack | null;
   weight: ExportedTrack | null;
@@ -776,6 +799,8 @@ export class EffectInstance {
   private readonly everyEmitter: EmitterState[];
   private readonly ribbons: RibbonState[];
   private readonly billboards: Object3D[] = [];
+  // Its copy's skeletons, each with a bone texture to free.
+  private readonly skeletons = new Set<Skeleton>();
   private readonly materials: AnimatedMaterial[] = [];
   private readonly loops: number[];
   private readonly clips: Record<string, number>;
@@ -826,6 +851,7 @@ export class EffectInstance {
         this.billboards.push(object);
       }
       if (object instanceof Mesh) this.adoptMaterial(object);
+      if (object instanceof SkinnedMesh) this.skeletons.add(object.skeleton);
     });
     const emitterState = (def: ExportedEmitter, child: boolean): EmitterState => {
       // A head and a tail for each particle, at most.
@@ -982,10 +1008,9 @@ export class EffectInstance {
       for (const particle of emitter.particles) particle.model?.dispose();
     }
     for (const ribbon of this.ribbons) for (const batch of ribbon.batches) batch.dispose();
-    for (const animated of this.materials) {
-      animated.material.map?.dispose();
-      animated.material.dispose();
-    }
+    // Maps are the template's (or copies sharing its image), so stay.
+    for (const animated of this.materials) animated.material.dispose();
+    for (const skeleton of this.skeletons) skeleton.dispose();
     this.root.removeFromParent();
     this.particles.removeFromParent();
   }
@@ -996,18 +1021,16 @@ export class EffectInstance {
     const source = mesh.material as Material;
     const extras = source.userData;
     const texture = typeof extras.wowTexture === 'string' ? this.template.textures.get(extras.wowTexture) : undefined;
-    const map = texture ? texture.clone() : null;
-    if (map) {
-      map.wrapS = RepeatWrapping;
-      map.wrapT = RepeatWrapping;
-      map.matrixAutoUpdate = false;
-      map.needsUpdate = true;
-    }
+    // A texture that scrolls needs a copy of its own for its matrix; the
+    // copy shares the template's image (and so its GPU texture).
+    const ownsMap = Boolean(texture && (extras.wowUvTranslation || extras.wowUvRotation || extras.wowUvScaling));
+    const map = texture ? (ownsMap ? copyTexture(texture) : texture) : null;
     const material = new MeshBasicMaterial({ map, side: DoubleSide, forceSinglePass: true });
     applyBlend(material, typeof extras.wowBlendMode === 'number' ? materialBlend(extras.wowBlendMode) : geometryBlend(extras.wowBlend));
     mesh.material = material;
     this.materials.push({
       material,
+      ownsMap,
       color: extras.wowColor ?? null,
       alpha: extras.wowAlpha ?? null,
       weight: extras.wowWeight ?? null,
@@ -1025,7 +1048,7 @@ export class EffectInstance {
       const alpha = trackValue(animated.alpha, clock, 1) * trackValue(animated.weight, clock, 1) * tint[3];
       animated.material.opacity = Math.min(1, Math.max(0, alpha));
       const map = animated.material.map;
-      if (!map) continue;
+      if (!map || !animated.ownsMap) continue;
       map.matrix.set(...uvMatrix(evalTrack(animated.uvTranslation, 3, clock, [0, 0, 0]), evalTrack(animated.uvRotation, 4, clock, [0, 0, 0, 1]),
         evalTrack(animated.uvScaling, 3, clock, [1, 1, 1])));
     }
