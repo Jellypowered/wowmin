@@ -107,7 +107,7 @@ test('instant spells streak; no missile without both units; triggered spells onl
   const cues = (triggered.push(update([event({ triggered: true, area: true, radius: 8, missileSpeed: 20 })]), 0),
     triggered.advance(LIVE_RENDER_DELAY_MS, tenYards));
   assert.deepEqual(plain(cues), []);
-  // Its cast art plays as the client's does, without WowMin's glow.
+  // Its cast art plays as the client's does, without WoWMin's glow.
   assert.deepEqual(plain(triggered.casts.map(({ release, glow }) => ({ release, glow }))), [{ release: true, glow: false }]);
   // A triggered spell with a missile (a channel's bolts) flies; one without doesn't.
   assert.equal(triggered.projectiles.length, 1);

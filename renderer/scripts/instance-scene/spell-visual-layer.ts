@@ -1,22 +1,24 @@
 import { type Camera, Group, Quaternion } from 'three';
 
+import { type FlightFrame, MissileFlight } from '../utils/missile-flight';
 import {
   type AreaEffect, type AreaRing, type Beam, type CastGlow, type ChainLink, type CombatEffectStore, type Impact, type Point3, type Projectile,
   schoolColor, type UnitKey,
 } from '../utils/spell-events';
-import { type ChainDraw, ChainLightning } from './chain-ribbons';
+import { type ChainDraw, ChainLightning } from './chain-lightning';
 import { useServerAxes } from './iso-camera';
 import { EffectInstance, type EffectPlacement, type EffectTemplate, EffectTemplateCache, type EffectView, getEffectView, type MissileClips } from './m2-effect';
-import { type FlightFrame, MissileFlight } from '../utils/missile-flight';
 import { WeaponTrails } from './weapon-trails';
 import type { UnitAnchor } from './spell-effects';
 import type { UnitLook } from './unit-models';
 import {
-  AREA_ART_SCALE, areaRain, artForSchool, castKit, type ColorFlash, DEFAULT_ALPHA_FADE_MS, DIRECTED_HAND_ATTACHMENT, flashColor, groundSlot,
-  attachOffset, attachTurn, CREATURE_SPELL_ATTACKABLE, type EffectScales, fadeAlpha, limitScale, unitEffectScale, kitAlpha, kitClips, kitColor, kitColorFlash, kitFade, kitFreeze, kitWeaponTrail, KIT_WAITS_FOR_BOLT,
-  MISSILE_HEIGHT_SHARE, missileAttachment, missileOffset, type ProceduralFade, RAIN_MAX_DELAY_MS, rainPoint,
-  slotAttachment, type SpellVisual, type UnitAnchorRole, type VisualKit, type VisualMissile, type VisualPoints,
+  AREA_ART_SCALE, areaRain, artForSchool, attachOffset, attachTurn, castKit, type ColorFlash, CREATURE_SPELL_ATTACKABLE, DEFAULT_ALPHA_FADE_MS,
+  DIRECTED_HAND_ATTACHMENT, type EffectScales, fadeAlpha, flashColor, groundSlot, KIT_WAITS_FOR_BOLT, kitAlpha, kitClips, kitColor, kitColorFlash,
+  kitFade, kitFreeze, kitWeaponTrail, limitScale, MISSILE_HEIGHT_SHARE, missileAttachment, missileOffset, type ProceduralFade,
+  RAIN_MAX_DELAY_MS, rainPoint, slotAnchor, slotAttachment, type SpellVisual, unitEffectScale, type VisualKit, type VisualMissile,
+  type VisualPoints,
 } from '../utils/spell-kits';
+import { DEGREES } from '../utils/vec3';
 
 // Plays the client's own spell art (level 2) for the combat effect store's
 // casts, missiles, and impacts, from the spell's SpellVisual kits: precast
@@ -57,49 +59,6 @@ export interface UnitInfo {
   effectScales: (unit: UnitKey) => EffectScales | null;
 }
 
-// A missile waits at most this long for its caster's animation to let it go.
-const MAX_RELEASE_WAIT_MS = 2000;
-// A missile following the ground with this flag keeps its height over the
-// target's feet rather than aiming at its point.
-const FOLLOW_TARGET_HEIGHT = 0x8;
-// Without the visual's landing point, a missile lands at the chest, else
-// the base, where the model has them.
-const MISSILE_LANDING_FALLBACKS = [15, 19];
-// A missile that never reaches its target (it fled, say) is ended this long
-// past when the spell landed.
-const MISSILE_OVERRUN_MS = 2000;
-
-// A missile being played: when it is let go, its copies (a motion script
-// can fly several), and its targeting art on the target while they fly.
-interface PlayingMissile {
-  releaseAt: number;
-  copies: Array<{ flight: MissileFlight; effect: PlayingEffect; frame: FlightFrame | null }> | null;
-  targeting: PlayingEffect[];
-}
-
-// Kit slots onto WowMin's estimated points, for units not drawn as models.
-function slotRole(slot: string): UnitAnchorRole {
-  switch (slot) {
-    case 'head': return 'head';
-    case 'breath': return 'breath';
-    case 'base': case 'world': return 'feet';
-    case 'leftHand': case 'leftWeapon': return 'handLeft';
-    case 'rightHand': case 'rightWeapon': return 'handRight';
-    default: return 'chest';
-  }
-}
-
-// The release events a missile leaves from when its visual names no point:
-// the hand or weapon the cast animation throws from.
-const RELEASE_EVENTS = ['$CSR', '$CSL', '$CST'];
-
-// `offset` turned to face `yaw`, from `origin`.
-function offsetFrom(origin: Point3, offset: Point3, yaw: number, up = 0): Point3 {
-  const cos = Math.cos(yaw);
-  const sin = Math.sin(yaw);
-  return [origin[0] + offset[0] * cos - offset[1] * sin, origin[1] + offset[0] * sin + offset[1] * cos, origin[2] + offset[2] + up];
-}
-
 // Animations a unit should play for its spells: a loop while casting or
 // channelling, and a one-off as a spell fires or lands or a cast begins;
 // each the clips to try, in order.
@@ -117,6 +76,14 @@ interface PlayingEffect {
   last: EffectPlacement | null;
 }
 
+// A missile being played: when it is let go, its copies (a motion script
+// can fly several), and its targeting art on the target while they fly.
+interface PlayingMissile {
+  releaseAt: number;
+  copies: Array<{ flight: MissileFlight; effect: PlayingEffect; frame: FlightFrame | null }> | null;
+  targeting: PlayingEffect[];
+}
+
 // A steady area round a unit while an aura lasts (Starfall's reach), drawn
 // on the floor by the scene's own shaders.
 export interface BearerAreaCircle {
@@ -127,12 +94,34 @@ export interface BearerAreaCircle {
 
 // Global particle budget: past it, emitters stop spawning until room frees.
 const PARTICLE_BUDGET = 4000;
-const DEGREES = Math.PI / 180;
-const layerQuaternion = new Quaternion();
-const attachmentQuaternion = new Quaternion();
+// A missile waits at most this long for its caster's animation to let it go.
+const MAX_RELEASE_WAIT_MS = 2000;
+// A missile following the ground with this flag keeps its height over the
+// target's feet rather than aiming at its point.
+const FOLLOW_TARGET_HEIGHT = 0x8;
+// Without the visual's landing point, a missile lands at the chest, else
+// the base, where the model has them.
+const MISSILE_LANDING_FALLBACKS = [15, 19];
+// A missile that never reaches its target (it fled, say) is ended this long
+// past when the spell landed.
+const MISSILE_OVERRUN_MS = 2000;
+// The release events a missile leaves from when its visual names no point:
+// the hand or weapon the cast animation throws from.
+const RELEASE_EVENTS = ['$CSR', '$CSL', '$CST'];
 // The release event a chain leaves its caster from when its visual names no
 // point.
 const CHAIN_RELEASE_EVENT = '$CSL';
+// How tall a unit stands (yards) before the scene says.
+const DEFAULT_UNIT_HEIGHT = 2;
+const layerQuaternion = new Quaternion();
+const attachmentQuaternion = new Quaternion();
+
+// `offset` turned to face `yaw`, from `origin`.
+function offsetFrom(origin: Point3, offset: Point3, yaw: number, up = 0): Point3 {
+  const cos = Math.cos(yaw);
+  const sin = Math.sin(yaw);
+  return [origin[0] + offset[0] * cos - offset[1] * sin, origin[1] + offset[0] * sin + offset[1] * cos, origin[2] + offset[2] + up];
+}
 
 export class SpellVisualLayer {
   readonly group = new Group();
@@ -165,7 +154,7 @@ export class SpellVisualLayer {
   // This frame's units. Effects that follow a unit read it every frame, so
   // they keep up with it (each frame brings new positions).
   private units: UnitInfo = {
-    anchor: () => null, attachment: () => null, isDrawn: () => false, scale: () => 1, height: () => 2, facing: () => 0, ground: (center) => center,
+    anchor: () => null, attachment: () => null, isDrawn: () => false, scale: () => 1, height: () => DEFAULT_UNIT_HEIGHT, facing: () => 0, ground: (center) => center,
     releaseMs: () => null, intersect: () => null, blades: () => [], creatureTypeFlags: () => 0, attachmentTurn: () => null,
     effectScales: () => null,
   };
@@ -240,7 +229,7 @@ export class SpellVisualLayer {
   unitLooks(now: number): Map<UnitKey, UnitLook> {
     const colors = new Map<UnitKey, { color: number; since: number }>();
     const targets = new Map<UnitKey, { alpha: number; fadeMs: number; since: number }>();
-    const freezes = new Map<UnitKey, { atSeconds: number | null; since: number }>();
+    const freezes = new Map<UnitKey, { atMs: number | null; since: number }>();
     const consider = (unit: UnitKey, kit: VisualKit, since: number, harmful: boolean) => {
       const color = kitColor(kit);
       if (color !== null && !this.colorSkips(unit, harmful) && since >= (colors.get(unit)?.since ?? -Infinity)) colors.set(unit, { color, since });
@@ -282,7 +271,7 @@ export class SpellVisualLayer {
       if (alpha === null) this.fades.delete(unit);
       else look(unit).alpha *= alpha;
     }
-    for (const [unit, { atSeconds }] of freezes) look(unit).freeze = { atSeconds };
+    for (const [unit, { atMs }] of freezes) look(unit).freeze = { atMs };
     return looks;
   }
 
@@ -498,7 +487,7 @@ export class SpellVisualLayer {
   // Each of a kit's effects on its body slot of `unit`, following it, and
   // any colour flash it starts there. A slot the unit's model lacks shows
   // nothing, as in the client; a unit not drawn as a model shows each at
-  // WowMin's estimate. The world effect stands at the unit's feet, and
+  // WoWMin's estimate. The world effect stands at the unit's feet, and
   // follows it only for a spell that roots it. A kit's procedures start
   // here too: a colour flash, a weapon trail, a procedural fade.
   private playKit(kit: VisualKit, templates: Array<EffectTemplate | null>, unit: UnitKey, now: number, loop: boolean,
@@ -530,7 +519,7 @@ export class SpellVisualLayer {
       const playing = this.play(template, now, loop, () => {
         const onModel = attachment !== null && this.units.isDrawn(unit);
         const point = fixed ?? (attachment === null ? atFeet() : onModel
-          ? this.units.attachment(unit, attachment, offset) : this.units.anchor(unit, slotRole(effect.slot)));
+          ? this.units.attachment(unit, attachment, offset) : this.units.anchor(unit, slotAnchor(effect.slot)));
         // Riding on an attachment, it turns with it, as the client's does.
         const quaternion = onModel ? this.layerTurn(this.units.attachmentTurn(unit, attachment!, attachmentQuaternion)) : null;
         const scale = unitEffectScale(effect, this.units.scale(unit), this.units.effectScales(unit), attachment === null);
@@ -760,11 +749,11 @@ export class SpellVisualLayer {
     playing.copies = Array.from({ length: count }, (_, index) => {
       const flight = new MissileFlight({
         launch, casterAt, releaseAt: now, castAt: projectile.startAt, arriveAt: projectile.startAt + projectile.travelMs,
-        speed: projectile.speed,
+        speed: projectile.missileSpeed,
         index, count, spellId: projectile.spellId, motion: missile.motion, followGround: missile.followGround, trajectory: missile.trajectory,
         intersect: this.units.intersect,
       }, target);
-      const clips: MissileClips = { rate: flyMs && flight.initialYards > 0 ? (flyMs * flight.currentSpeed * 0.001) / flight.initialYards : 1 };
+      const clips: MissileClips = { rate: flyMs && flight.initialYards > 0 ? (flyMs * flight.currentSpeed / 1000) / flight.initialYards : 1 };
       const copy = { flight, effect: null as unknown as PlayingEffect, frame: null as FlightFrame | null };
       copy.effect = this.play(template, now, true, (time) => {
         const to = this.missileTarget(missile, projectile.target);

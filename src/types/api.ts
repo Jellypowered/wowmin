@@ -513,7 +513,7 @@ export interface CreatureInfo {
   flagsExtra: number;
   npcFlags: number;
   creatureType: number;
-  typeFlags?: number;
+  typeFlags: number;
 }
 
 export interface StreamPathUpdate {

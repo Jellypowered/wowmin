@@ -9,7 +9,7 @@
 import path from 'node:path';
 
 import { readDbc } from './dbc.mjs';
-import { loadM2 } from './m2.mjs';
+import { findM2Events, loadM2, M2_EVENT_BONE, M2_EVENT_POSITION } from './m2.mjs';
 import { loadSkinnedM2 } from './m2-skinned.mjs';
 import { decodeBlp, drawImage, encodeRgba } from './textures.mjs';
 
@@ -71,10 +71,6 @@ const HELMET_HIDES = ['hair', 'facial1', 'facial2', 'facial3', 'ears'];
 
 const M2_ATTACHMENTS_OFFSET = 240;
 const M2_ATTACHMENT_SIZE = 40;
-// The header's events (sounds, footsteps, a spell's release): four-letter
-// ID, data, bone, unused, position, then when it fires.
-const M2_EVENTS_OFFSET = 256;
-const M2_EVENT_SIZE = 36;
 
 // The skeleton's attachment points: { id, bone, position }. Not exposed by
 // @wowserhq/format, so read from the header directly.
@@ -98,22 +94,11 @@ export function readM2Attachments(buffer) {
 // The skeleton's events with these IDs ('$CSL'): { name, bone, position },
 // read from the header like the attachments.
 export function readM2Events(buffer, names) {
-  if (!buffer || buffer.length < M2_EVENTS_OFFSET + 8) return [];
-  const count = buffer.readUInt32LE(M2_EVENTS_OFFSET);
-  const offset = buffer.readUInt32LE(M2_EVENTS_OFFSET + 4);
-  if (offset + count * M2_EVENT_SIZE > buffer.length) return [];
-  const events = [];
-  for (let index = 0; index < count; index += 1) {
-    const base = offset + index * M2_EVENT_SIZE;
-    const name = buffer.toString('latin1', base, base + 4);
-    if (!names.includes(name)) continue;
-    events.push({
-      name,
-      bone: buffer.readUInt16LE(base + 8),
-      position: [buffer.readFloatLE(base + 12), buffer.readFloatLE(base + 16), buffer.readFloatLE(base + 20)],
-    });
-  }
-  return events;
+  return findM2Events(buffer, names).map(({ name, base }) => ({
+    name,
+    bone: buffer.readUInt16LE(base + M2_EVENT_BONE),
+    position: [0, 1, 2].map((axis) => buffer.readFloatLE(base + M2_EVENT_POSITION + axis * 4)),
+  }));
 }
 
 // Geoset group values (section ID = group * 100 + value; group 0 is hair,

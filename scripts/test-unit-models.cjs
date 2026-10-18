@@ -540,9 +540,8 @@ test('reads how the client sizes a model\'s spell effects: its world and attache
   header.writeUInt32LE(strings.length, 16);
   const files = { 'DBFilesClient\\CreatureModelData.dbc': Buffer.concat([header, record, strings]) };
   const data = new UnitData((name) => files[name] ?? null);
-  const model = Buffer.alloc(200);
-  [-2, -5, 0, 2, 5, 6].forEach((value, index) => model.writeFloatLE(value, 160 + index * 4));
-  const scales = data.modelEffectScales('Creature\\Ogre\\Ogre.m2', model);
+  // The model's bounding box: min x, y, z, max x, y, z.
+  const scales = data.modelEffectScales('Creature\\Ogre\\Ogre.m2', [-2, -5, 0, 2, 5, 6]);
   assert.equal(scales.world, 0.5);
   assert.equal(scales.attached, 1.5);
   near(scales.footprint, 1.2, 'footprint');

@@ -9,7 +9,6 @@ const M2_PARTICLES_OFFSET = 296;
 export const PARTICLE_SIZE = 476;
 export const RIBBON_SIZE = 176;
 const FIXED16_ONE = 32767;
-// Gravity keys hold a packed direction and magnitude rather than a float.
 
 const reader = (width, read) => ({ width, read });
 export const FLOAT = reader(4, (buffer, at) => buffer.readFloatLE(at));
@@ -103,7 +102,7 @@ export function parseParticleEmitter(buffer, at) {
     speedVariation: readTrack(buffer, at + 0x48, FLOAT),
     verticalRange: readTrack(buffer, at + 0x5C, FLOAT),
     horizontalRange: readTrack(buffer, at + 0x70, FLOAT),
-    // As vectors (x, y, z) per key, decompressed if packed.
+    // As vectors (x, y, z) per key, pointing down Z.
     gravity: readGravity(buffer, at + 0x84),
     lifespan: readTrack(buffer, at + 0x98, FLOAT),
     lifespanVariation: buffer.readFloatLE(at + 0xAC),

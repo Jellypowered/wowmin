@@ -36,6 +36,13 @@ const AURA_MOD_ROOT = 26;
 // Targets round the caster (TARGET_SRC_CASTER), as a triggered area is.
 const TARGET_AREA_AROUND_CASTER = 22;
 const RADIUS_FIELD = 1;
+// Spell.dbc's target flags, and the implicit targets at an enemy, for
+// telling a harmful spell (the client skips some of its colours on some
+// creatures).
+const SPELL_TARGET_FLAGS = 16;
+const TARGET_FLAG_HELPFUL = 0x100;
+const TARGET_FLAG_HARMFUL = 0x80;
+const HARMFUL_TARGETS = new Set([2, 6, 15, 16, 24, 28, 53, 54, 93]);
 // A wand's Shoot has no art of its own: the client picks a bolt by the
 // wand's damage school. These visuals are the wand set (all share precast
 // kit 372, AnimationData 111, and nothing in Spell.dbc names them); which
@@ -57,6 +64,9 @@ const VISUAL_MISSILE_MODEL = 8;
 const VISUAL_MISSILE_DESTINATION_ATTACHMENT = 10;
 const VISUAL_FLAGS = 13;
 const VISUAL_FLAG_RAW_ATTACHMENTS = 0x200;
+const VISUAL_MISSILE_ATTACHMENT = 16;
+const VISUAL_MISSILE_CAST_OFFSET = 26;
+const VISUAL_MISSILE_IMPACT_OFFSET = 29;
 // A visual whose missiles leave as the spell fires, not on the cast
 // animation's release.
 const VISUAL_FLAG_RELEASE_AT_ONCE = 0x4;
@@ -75,29 +85,20 @@ const MOTION_COUNT = 4;
 // throws) holds its missiles until the animation releases them.
 const ANIMATION_BEHAVIOR = 6;
 const RELEASING_BEHAVIORS = new Set([2, 32, 33, 53, 54, 46, 49, 107]);
-const VISUAL_MISSILE_ATTACHMENT = 16;
-const VISUAL_MISSILE_CAST_OFFSET = 26;
-const VISUAL_MISSILE_IMPACT_OFFSET = 29;
-// SpellVisualKit: start and loop animation, then an effect per body slot.
-const KIT_START_ANIM = 1;
-const KIT_ANIM = 2;
-// The kit's flags: 0x1 waits for its chain's bolt to reach the unit; 0x4
-// and 0x8 play the animation itself, without falling back.
-const KIT_FLAGS = 37;
-const KIT_RAW_ANIMATION = 0x4 | 0x8;
 // AnimationData: a clip's name, and the clip a model without it plays
 // instead (0 for none; falling back to Stand is left to the unit).
 const ANIMATION_NAME = 1;
 const ANIMATION_FALLBACK = 5;
-// Spell.dbc's target flags and implicit targets, for telling a harmful
-// spell (the client skips some of its colours on some creatures).
-const SPELL_TARGET_FLAGS = 16;
-const TARGET_FLAG_HELPFUL = 0x100;
-const TARGET_FLAG_HARMFUL = 0x80;
-const HARMFUL_TARGETS = new Set([2, 6, 15, 16, 24, 28, 53, 54, 93]);
+// SpellVisualKit: start and loop animation, then an effect per body slot.
+const KIT_START_ANIM = 1;
+const KIT_ANIM = 2;
 const KIT_SLOTS = ['head', 'chest', 'base', 'leftHand', 'rightHand', 'breath', 'leftWeapon', 'rightWeapon',
   'special1', 'special2', 'special3', 'world'];
 const KIT_FIRST_SLOT = 3;
+// The kit's flags: 0x1 waits for its chain's bolt to reach the unit; 0x4
+// and 0x8 play the animation itself, without falling back.
+const KIT_FLAGS = 37;
+const KIT_RAW_ANIMATION = 0x4 | 0x8;
 // SpellVisualKitModelAttach: further effects a kit plays (parent kit,
 // effect, M2 attachment or -1 to stand at the unit's feet, offset, yaw,
 // pitch, roll), in table order.
@@ -127,13 +128,6 @@ const CHAIN_BYTES = { alpha: 156, red: 157, green: 158, blue: 159, blendMode: 16
 // A chain's combo names up to twelve more chains drawn with it, each a
 // 4-byte ID packed so it holds no zero byte.
 const MAX_CHAIN_COMBO = 12;
-export function decodeChainId(packed) {
-  const bits = (packed & 0xFEFEFEFE) >>> 0;
-  let high = (bits >>> 7) & 0x200000;
-  high = (((high | (bits & 0x20000000)) >>> 3) | (bits & 0x2000000)) >>> 0;
-  high = ((((high >>> 4) | (bits & 0x40000000)) >>> 3) | (bits & 0x4000000)) >>> 0;
-  return ((high >>> 11) | ((((bits >>> 4) & 0xFF800000) | bits) & 0xFFFFFF)) >>> 0;
-}
 // Procedure 9 rains models over a lasting area (Blizzard's ice, Rain of
 // Fire's fire): its first parameter is the row of SpellVisualKitAreaModel,
 // counted from 0, whose model falls, the first row when there is no such
@@ -149,18 +143,36 @@ const EFFECT_SCALE = 4;
 const EFFECT_MIN_SCALE = 5;
 const EFFECT_MAX_SCALE = 6;
 
+// A chain ID from a combo's packed form, which keeps every byte non-zero.
+export function decodeChainId(packed) {
+  const bits = (packed & 0xFEFEFEFE) >>> 0;
+  let high = (bits >>> 7) & 0x200000;
+  high = (((high | (bits & 0x20000000)) >>> 3) | (bits & 0x2000000)) >>> 0;
+  high = ((((high >>> 4) | (bits & 0x40000000)) >>> 3) | (bits & 0x4000000)) >>> 0;
+  return ((high >>> 11) | ((((bits >>> 4) & 0xFF800000) | bits) & 0xFFFFFF)) >>> 0;
+}
+
 export class SpellVisuals {
   constructor(readFile) {
     this.readFile = readFile;
+    this.files = new Map();
     this.tables = new Map();
     this.present = new Map();
   }
 
-  table(name) {
-    if (!this.tables.has(name)) {
+  // A table as read (readDbc), for its records by position; null if the
+  // client lacks it.
+  dbc(name) {
+    if (!this.files.has(name)) {
       const buffer = this.readFile(`DBFilesClient\\${name}.dbc`);
-      this.tables.set(name, buffer ? readDbc(buffer).byId() : new Map());
+      this.files.set(name, buffer ? readDbc(buffer) : null);
     }
+    return this.files.get(name);
+  }
+
+  // A table's records by ID.
+  table(name) {
+    if (!this.tables.has(name)) this.tables.set(name, this.dbc(name)?.byId() ?? new Map());
     return this.tables.get(name);
   }
 
@@ -196,8 +208,10 @@ export class SpellVisuals {
   // The model procedure 9 rains for its first parameter, or null if the
   // client lacks it.
   areaModel(index) {
-    const rows = [...this.table('SpellVisualKitAreaModel').values()];
-    const file = (rows[index] ?? rows[0])?.string(AREA_MODEL_FILE);
+    const table = this.dbc('SpellVisualKitAreaModel');
+    if (!table?.recordCount) return null;
+    const row = table.record(Number.isInteger(index) && index >= 0 && index < table.recordCount ? index : 0);
+    const file = row.string(AREA_MODEL_FILE);
     if (!file) return null;
     const modelName = file.replace(/\.md[xl]$/i, '.m2');
     return this.hasFile(modelName) ? modelName : null;
@@ -415,13 +429,14 @@ export class SpellVisuals {
       approach: Math.min(1, Math.max(0, visual.float(VISUAL_FOLLOW_GROUND.approach) / 1000)),
       flags: followFlags,
     } : null;
-    const motionRow = this.table('SpellMissileMotion').get(visual.uint(VISUAL_MISSILE_MOTION));
+    const motionId = visual.uint(VISUAL_MISSILE_MOTION);
+    const motionRow = this.table('SpellMissileMotion').get(motionId);
     let motion = null;
     if (motionRow) {
       try {
         motion = { count: Math.max(1, motionRow.uint(MOTION_COUNT)), script: parseMotionScript(motionRow.string(MOTION_SCRIPT)) };
-      } catch {
-        motion = null;
+      } catch (error) {
+        console.warn(`Could not read missile motion ${motionId} for spell visual ${visual.uint(0)}: ${error instanceof Error ? error.message : error}`);
       }
     }
     return { waitsForRelease, ...(followGround ? { followGround } : {}), ...(motion ? { motion } : {}) };
@@ -431,7 +446,7 @@ export class SpellVisuals {
   // and speed ranges it is launched at.
   trajectory(spell) {
     const row = this.table('SpellMissile').get(spell.uint(SPELL_MISSILE_FIELD));
-    if (!row || !(row.int(MISSILE_FIELDS.flags) & MISSILE_FLAG_TRAJECTORY)) return null;
+    if (!row || !(row.uint(MISSILE_FIELDS.flags) & MISSILE_FLAG_TRAJECTORY)) return null;
     return {
       gravity: row.float(MISSILE_FIELDS.gravity),
       pitch: [row.float(MISSILE_FIELDS.pitchMin), row.float(MISSILE_FIELDS.pitchMax)],

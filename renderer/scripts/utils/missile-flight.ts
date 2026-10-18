@@ -1,5 +1,7 @@
 import { type MissileMotion, type MotionOutputs, runMotionScript } from './missile-motion';
+import type { Random } from './m2-tracks';
 import type { Point3 } from './spell-events';
+import { DEGREES, EPSILON, length3, sub } from './vec3';
 
 // A spell's missile in flight, as the client flies one: from where its
 // caster released it towards its target's landing point, sped up to arrive
@@ -38,7 +40,7 @@ export interface FlightSetup {
   castAt: number;
   index?: number;
   count?: number;
-  random?: () => number;
+  random?: Random;
   spellId?: number;
   motion?: MissileMotion;
   followGround?: FollowGround;
@@ -60,17 +62,11 @@ export interface FlightFrame {
 
 const MAX_SPEED_UP = 2;
 const MIN_SPEED = 0.01;
-const EPSILON = 2.3841858e-7;
-// The script's sideways-and-up offset is by angle in degrees.
-const DEGREES = Math.PI / 180;
 // Ground following: how far ahead and down it looks for the ground.
 const MAX_GROUND_STEP = 50;
 const GROUND_SEARCH_DEPTH = 20;
 const FOLLOW_ALONG_WAY = 0x4;
 const GROUND_SEARCH_STEPS = 4;
-
-const sub = (a: Point3, b: Point3): Point3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-const length3 = (a: Point3): number => Math.hypot(a[0], a[1], a[2]);
 
 // A gravity arc's launch velocity and flight time to `delta` at `pitch`, or
 // null when no arc reaches it.

@@ -62,8 +62,8 @@ export interface UnitLook {
   alpha: number;
   indoor?: IndoorLook;
   // Its animation held still (a kit's freeze): at this time into its loop
-  // (seconds), or where it is when null.
-  freeze?: { atSeconds: number | null } | null;
+  // (ms), or where it is when null.
+  freeze?: { atMs: number | null } | null;
 }
 
 // A unit's light indoors, and how far its light's direction leans from the
@@ -385,6 +385,8 @@ const scratchMatrix = new Matrix4();
 const scratchPosition = new Vector3();
 const scratchScale = new Vector3();
 const ZERO_OFFSET: Point3 = [0, 0, 0];
+const tintColor = new Color();
+const scratchSphere = new Sphere();
 
 // The first of a role's attachments a unit's model has.
 function rolePoint(unit: UnitInstance, role: UnitPointRole): Object3D | undefined {
@@ -394,8 +396,6 @@ function rolePoint(unit: UnitInstance, role: UnitPointRole): Object3D | undefine
   }
   return undefined;
 }
-const tintColor = new Color();
-const scratchSphere = new Sphere();
 
 // Takes a cloned model's bones out of the scene graph (see
 // UnitInstance.skeleton): they go under a holder in the skinned mesh's own
@@ -799,7 +799,6 @@ export class UnitModelLayer {
     skeleton.traverse((object) => {
       if (typeof object.userData.wowAttachment === 'number') unit.effectAttachments.set(object.userData.wowAttachment, object);
       if (typeof object.userData.wowEvent === 'string') unit.effectEvents.set(object.userData.wowEvent, object);
-
     });
     this.pose(unit);
     // The clone gives each skinned part its own copy of the skeleton; parts
@@ -896,10 +895,11 @@ export class UnitModelLayer {
       unit.loop.timeScale = getMoveTimeScale(unit.speed, unit.template.speeds?.[unit.loopName]);
     }
     const fighting = stance === 'melee' || stance === 'ranged' || stance === 'cast';
+    const kitOnce = still && !seated ? pose.kitOnce?.find((name) => clips.has(name)) ?? null : null;
     if (seated) {
       // No swings or casting poses in the saddle or on the ground.
-    } else if (still && pose.kitOnce?.some((name) => clips.has(name))) {
-      this.playStrike(unit, pose.kitOnce.find((name) => clips.has(name))!);
+    } else if (kitOnce) {
+      this.playStrike(unit, kitOnce);
     } else if (pose.strike && (fighting || stance === 'stand')) {
       // A real attack: the clip for what was done, whatever the stance.
       const strike = getStanceClips(pose.strike, pose.weapons, unit.template.clipNames!).strike;
@@ -972,11 +972,11 @@ export class UnitModelLayer {
 
   // Holds a unit's animation still while a kit freezes it, at the kit's
   // time into its loop where it names one.
-  private setFreeze(unit: UnitInstance, freeze: { atSeconds: number | null } | null): void {
+  private setFreeze(unit: UnitInstance, freeze: { atMs: number | null } | null): void {
     if (Boolean(freeze) === unit.frozen) return;
     unit.frozen = Boolean(freeze);
-    if (freeze?.atSeconds !== null && freeze?.atSeconds !== undefined && unit.loop) {
-      unit.loop.time = Math.min(freeze.atSeconds, unit.loop.getClip().duration);
+    if (freeze?.atMs !== null && freeze?.atMs !== undefined && unit.loop) {
+      unit.loop.time = Math.min(freeze.atMs / 1000, unit.loop.getClip().duration);
     }
     unit.mixer.timeScale = unit.frozen ? 0 : 1;
   }

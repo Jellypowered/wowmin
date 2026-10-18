@@ -6,7 +6,9 @@ import path from 'node:path';
 
 import { Document, NodeIO, TextureInfo } from '@gltf-transform/core';
 
-import { IDENTITY_ROTATION, M2_BLEND, M2_MATERIAL_FLAG_TWO_SIDED, M2_TEXTURE_FLAG_WRAP_S, M2_TEXTURE_FLAG_WRAP_T } from './m2.mjs';
+import {
+  IDENTITY_ROTATION, M2_BLEND, M2_MATERIAL_FLAG_TWO_SIDED, M2_TEXTURE_FLAG_WRAP_S, M2_TEXTURE_FLAG_WRAP_T, RELEASE_EVENTS,
+} from './m2.mjs';
 import { loadSkinnedM2 } from './m2-skinned.mjs';
 import {
   CharacterData, creatureWeaponAttachments, loadCharacter, readM2Attachments, readM2Events, SLOT, VISIBLE_SLOTS,
@@ -15,19 +17,14 @@ import { encodeTexture } from './textures.mjs';
 import { readDbc } from './dbc.mjs';
 
 const TEXTURE_TYPE_HARDCODED = 0;
-// The M2 header's bounding box (min x, y, z, max x, y, z), and
-// CreatureModelData's spell effect scales.
-const M2_BOUNDING_BOX = 160;
+const TEXTURE_TYPE_MONSTER_1 = 11;
+// CreatureModelData's spell effect scales, world and attached.
 const MODEL_WORLD_EFFECT_SCALE = 23;
 const MODEL_ATTACHED_EFFECT_SCALE = 24;
-const TEXTURE_TYPE_MONSTER_1 = 11;
+
 // Points spell effects are drawn at: every attachment the skeleton has, by
 // M2 attachment ID (the renderer picks the client's for each kit slot and
-// missile), and the events a spell is released at: $CSL, $CSR, $CST (left
-// hand, right hand, a thrown weapon) and $BWR (a bow or gun).
-export const RELEASE_EVENTS = ['$CSL', '$CSR', '$CST', '$BWR'];
-
-// The effect points of a skeleton's attachments and release events, the
+// missile), and the events a spell is released at (RELEASE_EVENTS), the
 // first of each ID only.
 export function effectPoints(skeletonAttachments, skeletonEvents = []) {
   const attachments = new Map();
@@ -293,8 +290,9 @@ export class UnitData {
   // How the client sizes spell effects on a model (CreatureModelData's
   // world and attached effect scales, by model file; 1 without a row), and
   // its footprint: 0.3 times the smaller of its bounding box's width and
-  // depth (model units), a world effect growing with it past 1.
-  modelEffectScales(modelName, buffer) {
+  // depth (model units; `box` is min x, y, z, max x, y, z), a world effect
+  // growing with it past 1.
+  modelEffectScales(modelName, box) {
     if (!this.modelDataByFile) {
       this.modelDataByFile = new Map();
       for (const row of this.table('CreatureModelData').values()) {
@@ -302,11 +300,7 @@ export class UnitData {
       }
     }
     const row = this.modelDataByFile.get(modelName.toLowerCase());
-    let footprint = 0;
-    if (buffer && buffer.length >= M2_BOUNDING_BOX + 24) {
-      const box = [0, 1, 2, 3, 4, 5].map((index) => buffer.readFloatLE(M2_BOUNDING_BOX + index * 4));
-      footprint = 0.3 * Math.min(box[3] - box[0], box[4] - box[1]);
-    }
+    const footprint = box ? 0.3 * Math.min(box[3] - box[0], box[4] - box[1]) : 0;
     return { world: row?.float(MODEL_WORLD_EFFECT_SCALE) || 1, attached: row?.float(MODEL_ATTACHED_EFFECT_SCALE) || 1, footprint };
   }
 
@@ -356,7 +350,7 @@ async function buildCreatureGlb(unitData, displayId, { weapons = {} } = {}) {
   const points = modelEffectPoints(modelBuffer);
   const document = buildUnitDocument(model, {
     name: `creature-${displayId}`, textureFor, scale: display.scale, alpha: display.alpha, attachments, points,
-    effectScales: unitData.modelEffectScales(display.modelName, modelBuffer),
+    effectScales: unitData.modelEffectScales(display.modelName, model.boundingBox),
   });
   return writeGlb(document);
 }
@@ -397,7 +391,7 @@ async function buildCharacterGlb(unitData, look) {
   const modelBuffer = unitData.characters.readFile(character.modelName);
   const document = buildUnitDocument(character.model, {
     name: 'character', textureFor: character.textureFor, textureMax: 256, attachments: character.attachments,
-    points: modelEffectPoints(modelBuffer), effectScales: unitData.modelEffectScales(character.modelName, modelBuffer),
+    points: modelEffectPoints(modelBuffer), effectScales: unitData.modelEffectScales(character.modelName, character.model.boundingBox),
   });
   return writeGlb(document);
 }

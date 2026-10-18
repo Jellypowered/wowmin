@@ -12,12 +12,15 @@ export function readDbc(buffer) {
   const stringBlockOffset = 20 + recordCount * recordSize;
   if (stringBlockOffset + stringBlockSize > buffer.length) throw new Error('Truncated WDBC file.');
 
-  const stringAt = (offset) => {
-    if (!offset) return '';
+  // A string's bytes, from its offset in the string block to its
+  // terminating zero (or the block's end).
+  const bytesOf = (offset) => {
+    if (!offset) return buffer.subarray(0, 0);
     const start = stringBlockOffset + offset;
     const end = buffer.indexOf(0, start);
-    return buffer.toString('utf8', start, end < 0 ? stringBlockOffset + stringBlockSize : end);
+    return buffer.subarray(start, end < 0 ? stringBlockOffset + stringBlockSize : end);
   };
+  const stringAt = (offset) => bytesOf(offset).toString('utf8');
 
   const record = (index) => {
     const base = 20 + index * recordSize;
@@ -33,12 +36,7 @@ export function readDbc(buffer) {
       floatAt: (offset) => buffer.readFloatLE(base + offset),
       stringAt: (offset) => stringAt(buffer.readUInt32LE(base + offset)),
       // A string's raw bytes, for strings that pack binary (a chain's combo).
-      bytesAt: (offset) => {
-        const start = buffer.readUInt32LE(base + offset);
-        if (!start) return Buffer.alloc(0);
-        const end = buffer.indexOf(0, stringBlockOffset + start);
-        return buffer.subarray(stringBlockOffset + start, end < 0 ? stringBlockOffset + stringBlockSize : end);
-      },
+      bytesAt: (offset) => bytesOf(buffer.readUInt32LE(base + offset)),
     };
   };
 

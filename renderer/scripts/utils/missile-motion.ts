@@ -1,3 +1,5 @@
+import { DEGREES } from './vec3';
+
 // Runs a missile motion script (SpellMissileMotion) from the syntax tree the
 // spell art carries (scripts/scene/missile-motion.mjs), as the client runs
 // the Lua: each frame, from the missile's progress and distances, it gives
@@ -59,7 +61,6 @@ const OUTPUTS: Array<keyof MotionOutputs> = [
 
 type Value = number | boolean | null;
 
-const DEGREES = Math.PI / 180;
 // The client's script functions: sin and cos (and tan) take degrees, as in
 // its interface Lua; math.* as in standard Lua.
 const FUNCTIONS: Record<string, (...args: number[]) => number> = {

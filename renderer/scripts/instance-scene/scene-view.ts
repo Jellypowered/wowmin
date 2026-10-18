@@ -191,47 +191,6 @@ const GROUND_RAYS_PER_FRAME = 64;
 const NO_REACH = 1e9;
 const floorAreaColor = new Color();
 const DOWN = new Vector3(0, -1, 0);
-const SERVER_DOWN: Point3 = [0, 0, -1];
-// How far round a ray's box a mesh's box may lie and still be tested
-// (yards), for meshes whose box only grazes it.
-const RAY_BOX_MARGIN = 0.5;
-const gridVertex = new Vector3();
-// Idle time a grid build leaves unused (ms), and the wait between builds
-// where the browser has no idle callbacks.
-const GRID_IDLE_MARGIN_MS = 4;
-const GRID_FALLBACK_DELAY_MS = 50;
-
-// A solid mesh's triangles in server coordinates, gridded for rays, and
-// which faces its material lets a ray hit, as three.js's raycast decides.
-interface SolidGrid {
-  grid: TriangleGrid;
-  culling: FaceCulling;
-}
-
-function solidGridOf(mesh: Mesh): SolidGrid {
-  const position = mesh.geometry.getAttribute('position');
-  const points = new Float32Array(position.count * 3);
-  for (let index = 0; index < position.count; index += 1) {
-    gridVertex.fromBufferAttribute(position, index).applyMatrix4(mesh.matrixWorld);
-    // Server (x, y, z) is three.js's (x, z, -y).
-    points[index * 3] = gridVertex.x;
-    points[index * 3 + 1] = -gridVertex.z;
-    points[index * 3 + 2] = gridVertex.y;
-  }
-  const indices = mesh.geometry.getIndex();
-  const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
-  const side = (material as Material | undefined)?.side ?? FrontSide;
-  // A mirroring transform turns the triangles' winding over.
-  const mirrored = mesh.matrixWorld.determinant() < 0;
-  const culling: FaceCulling = side === DoubleSide ? 'none' : (side === FrontSide) !== mirrored ? 'back' : 'front';
-  return { grid: TriangleGrid.build(points, indices ? indices.array : null), culling };
-}
-
-// Shown, with every parent shown.
-function drawnInScene(object: Object3D): boolean {
-  for (let node: Object3D | null = object; node; node = node.parent) if (!node.visible) return false;
-  return true;
-}
 const INDOOR_TOWARDS = serverToThree(INDOOR_LIGHT_DIRECTION.map((value) => -value) as Point3).normalize();
 // All fade values live in one uniform buffer shared by every scene material,
 // uploaded once a frame (per-material uniform arrays were re-sent on every
@@ -404,6 +363,51 @@ for (int index = 0; index < WOW_MAX_VOLUMES; index++) {
 }
 if (wowFade <= 0.0 || wowFade < wowBayer4(gl_FragCoord.xy)) discard;
 `;
+
+// Rays against the map's terrain and buildings, tested through a grid of
+// each solid mesh's triangles (built while the page is idle, or when first
+// needed). Straight down, in server coordinates:
+const SERVER_DOWN: Point3 = [0, 0, -1];
+// How far round a ray's box a mesh's box may lie and still be tested
+// (yards), for meshes whose box only grazes it.
+const RAY_BOX_MARGIN = 0.5;
+const gridVertex = new Vector3();
+// Idle time a grid build leaves unused (ms), and the wait between builds
+// where the browser has no idle callbacks.
+const GRID_IDLE_MARGIN_MS = 4;
+const GRID_FALLBACK_DELAY_MS = 50;
+
+// A solid mesh's triangles in server coordinates, gridded for rays, and
+// which faces its material lets a ray hit, as three.js's raycast decides.
+interface SolidGrid {
+  grid: TriangleGrid;
+  culling: FaceCulling;
+}
+
+function solidGridOf(mesh: Mesh): SolidGrid {
+  const position = mesh.geometry.getAttribute('position');
+  const points = new Float32Array(position.count * 3);
+  for (let index = 0; index < position.count; index += 1) {
+    gridVertex.fromBufferAttribute(position, index).applyMatrix4(mesh.matrixWorld);
+    // Server (x, y, z) is three.js's (x, z, -y).
+    points[index * 3] = gridVertex.x;
+    points[index * 3 + 1] = -gridVertex.z;
+    points[index * 3 + 2] = gridVertex.y;
+  }
+  const indices = mesh.geometry.getIndex();
+  const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+  const side = (material as Material | undefined)?.side ?? FrontSide;
+  // A mirroring transform turns the triangles' winding over.
+  const mirrored = mesh.matrixWorld.determinant() < 0;
+  const culling: FaceCulling = side === DoubleSide ? 'none' : (side === FrontSide) !== mirrored ? 'back' : 'front';
+  return { grid: TriangleGrid.build(points, indices ? indices.array : null), culling };
+}
+
+// Shown, with every parent shown.
+function drawnInScene(object: Object3D): boolean {
+  for (let node: Object3D | null = object; node; node = node.parent) if (!node.visible) return false;
+  return true;
+}
 
 // A WMO group's extras sit on its node: the mesh itself, or the group of
 // meshes holding its primitives.
@@ -1214,8 +1218,8 @@ export class InstanceSceneView {
     this.renderer.render(this.scene, this.camera);
     // Exposed for diagnosing slow scenes from the browser's developer tools.
     this.canvas.dataset.drawCalls = String(this.renderer.info.render.calls);
-    this.canvas.dataset.groundRays = String(this.castCount);
-    this.canvas.dataset.groundRayMs = this.castMs.toFixed(3);
+    this.canvas.dataset.rayCasts = String(this.castCount);
+    this.canvas.dataset.rayCastMs = this.castMs.toFixed(3);
     this.castCount = 0;
     this.castMs = 0;
     this.canvas.dataset.triangles = String(this.renderer.info.render.triangles);

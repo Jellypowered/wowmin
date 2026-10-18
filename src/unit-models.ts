@@ -19,10 +19,8 @@ const BUILD_TIMEOUT_MS = 60000;
 // 7: flying mounts' Fly and Hover animations.
 // 8: creature displays' model opacity (a Shadowfiend's see-through look).
 // 9: sitting on the ground (SitGroundDown, SitGround, SitGroundUp).
-// 10: every attachment by M2 ID, and the spell release events ($CSL, $CSR,
-// $CST, $BWR), for the client's own effect and missile points, when each
-// clip releases a missile, more of the clips kits name, drawn weapons'
-// blades for swing trails, and the model's effect scales and footprint.
+// 10: every attachment and release event as an effect point, release times,
+// more kit clips, weapon blades for swing trails, and effect scales.
 export const UNIT_MODEL_CACHE_VERSION = 10;
 // Spell art (effect models and spell lookups) changes more often than unit
 // models, so it has its own version and folder, art-v<version>/, and can be
@@ -37,19 +35,10 @@ export const UNIT_MODEL_CACHE_VERSION = 10;
 // 6: map lights carry their objects' lights (torches, braziers).
 // 7: map lights carry the map's fixed time of day, if it has one.
 // 8: map lights carry their interior WMO groups (building ambient, outdoor-lit).
-// 9: rain models from SpellVisualKitAreaModel (effect/area-<row>.glb), the
-// missile's points and offsets, the missile targeting kit, whether the
-// spell roots (its world effects follow the unit), whether its visual has a
-// chain effect, its chain's full SpellChainEffects record and combo, how its
-// missile flies (release, motion script, ground following, gravity arc),
-// effects' Fly, Impact, and Birth clips and scale limits, and kits' flags
-// and animation clips (with their fallbacks) and whether the spell is
-// harmful; effects' ribbons with each texture pass, plain particle gravity,
-// and the models their particles are drawn as or whose emitters they carry.
-// 10: effect tracks with fewer sequences than a clip's index take the first
-// sequence's keys (a state model's Hold kept its Stand colours and sizes).
-// 11: bone tracks on a loop of no length hold their first key (Fan of
-// Knives' knives flew straight up).
+// 9: the client's own spell art: area rain models, missile points and flight,
+// full chain records, kit flags and clips, and effects' ribbons and particles.
+// 10: effect tracks short of a clip's sequence take the first one's keys.
+// 11: bone tracks on a loop of no length hold their first key.
 export const SPELL_ART_CACHE_VERSION = 11;
 const SPELL_ART_KINDS = new Set<UnitModelRequest['kind']>(['effect', 'visual', 'spell', 'icon', 'gameobject', 'light']);
 const EXTENSIONS: Partial<Record<UnitModelRequest['kind'], string>> = { visual: 'json', spell: 'json', icon: 'png', light: 'json' };

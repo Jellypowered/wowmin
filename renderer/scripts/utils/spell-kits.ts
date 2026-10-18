@@ -29,11 +29,11 @@ export interface VisualEffect {
   roll?: number;
 }
 
-// A model attachment's offset as the client reads it (Y flipped), and its
-// turn: about Z by minus its yaw, then Y by its pitch, then X by its roll.
+// A model attachment's offset as the client reads it (Y flipped, as a
+// missile's), and its turn: about Z by minus its yaw, then Y by its pitch,
+// then X by its roll.
 export function attachOffset(effect: VisualEffect): Point3 {
-  const offset = effect.offset ?? [0, 0, 0];
-  return [offset[0], -offset[1], offset[2]];
+  return missileOffset(effect.offset);
 }
 
 export function attachTurn(effect: VisualEffect): { yaw: number; pitch: number; roll: number } | null {
@@ -162,19 +162,33 @@ export function groundSlot(slot: string): 'ground' | 'caster' | null {
   return slot === 'head' ? 'caster' : null;
 }
 
+// Kit body slots onto the points units have.
+export function slotAnchor(slot: string): UnitAnchorRole {
+  switch (slot) {
+    case 'head': return 'head';
+    case 'breath': return 'breath';
+    case 'base': case 'world': return 'feet';
+    case 'leftHand': case 'leftWeapon': return 'handLeft';
+    case 'rightHand': case 'rightWeapon': return 'handRight';
+    default: return 'chest';
+  }
+}
+
 // The client's table of effect attachments, which missile points index;
 // index 13 means the weapon, here its hand (4).
 const EFFECT_ATTACHMENTS = [20, 34, 19, 21, 22, 17, 23, 24, 25, 15, 16, 37, 38, 22, 47, 48];
 const WEAPON_EFFECT_ATTACHMENT = 13;
+const WEAPON_HAND_EFFECT_ATTACHMENT = 4;
 // With no attachment of its own but an offset, a missile leaves from the
 // directed spell hand (38) when the model has it.
-export const DIRECTED_HAND_ATTACHMENT = EFFECT_ATTACHMENTS[12];
+const DIRECTED_HAND_EFFECT_ATTACHMENT = 12;
+export const DIRECTED_HAND_ATTACHMENT = EFFECT_ATTACHMENTS[DIRECTED_HAND_EFFECT_ATTACHMENT];
 
 // The M2 attachment a missile point names, or null for none.
 export function missileAttachment(point: number | undefined, raw = false): number | null {
   if (point === undefined || point < 0) return null;
   if (raw) return point;
-  return EFFECT_ATTACHMENTS[point === WEAPON_EFFECT_ATTACHMENT ? 4 : point] ?? null;
+  return EFFECT_ATTACHMENTS[point === WEAPON_EFFECT_ATTACHMENT ? WEAPON_HAND_EFFECT_ATTACHMENT : point] ?? null;
 }
 
 // The client reads missile offsets with their Y flipped.
@@ -260,9 +274,9 @@ export function kitWeaponTrail(kit: VisualKit): WeaponTrail | null {
 // or where it is when 0.
 const FREEZE_PROCEDURE = 11;
 
-export function kitFreeze(kit: VisualKit): { atSeconds: number | null } | null {
+export function kitFreeze(kit: VisualKit): { atMs: number | null } | null {
   const proc = kit.procs?.find((candidate) => candidate.code === FREEZE_PROCEDURE);
-  return proc ? { atSeconds: proc.params[0] > 0 ? proc.params[0] : null } : null;
+  return proc ? { atMs: proc.params[0] > 0 ? proc.params[0] * 1000 : null } : null;
 }
 
 // Procedure 15 fades the unit for a moment: to its first parameter times

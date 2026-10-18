@@ -1,4 +1,5 @@
 import {
+  AdditiveBlending,
   type AnimationAction,
   type AnimationClip,
   AnimationMixer,
@@ -10,9 +11,8 @@ import {
   CustomBlending,
   DoubleSide,
   DstColorFactor,
-  Euler,
   DynamicDrawUsage,
-  AdditiveBlending,
+  Euler,
   Group,
   LoopOnce,
   LoopRepeat,
@@ -55,12 +55,13 @@ import {
   signedRandom,
   type SpawnParams,
   spawnParticle,
+  type TrackClock,
   TWINKLE_TABLE,
   twinkleEntry,
-  type TrackClock,
   uvMatrix,
   type Vec3,
 } from '../utils/m2-tracks';
+import { EPSILON } from '../utils/vec3';
 
 // Plays one of the client's spell effect models (built by
 // scripts/scene/effect-model.mjs): its animated geometry, with billboards,
@@ -185,13 +186,20 @@ const FLAG_RANDOM_CELL = 0x10000;
 const FLAG_HEAD = 0x20000;
 const FLAG_TAIL = 0x40000;
 const FLAG_SCALE_XY = 0x80000;
+// Bone billboard flags: facing the camera all round, or about one axis.
+const BILLBOARD_SPHERICAL = 0x8;
+const BILLBOARD_LOCK_X = 0x10;
+const BILLBOARD_LOCK_Y = 0x20;
+const BILLBOARD_LOCK_Z = 0x40;
 // The emitter's frame is its bone's turned a quarter about Z: its +X along
 // the bone's +Y.
 const EMITTER_TURN = new Matrix4().makeRotationZ(Math.PI / 2);
 const MIN_LIFE = 0.001;
 const MIN_SCALE_VARIATION = 0.0001;
-// Inherited velocity is resampled at most this often (seconds).
-const INHERIT_VELOCITY_STEP = 1 / 30;
+// Inherited velocity is the way the emitter moved per step, resampled at
+// most once a step: this many steps a second.
+const INHERIT_VELOCITY_RATE = 30;
+const INHERIT_VELOCITY_STEP = 1 / INHERIT_VELOCITY_RATE;
 // A tail shorter than this on screen (yards, squared) draws as a plain quad.
 const MIN_TAIL_SQUARED = 0.00077160494;
 // Effect models the client turns from how they are authored, by model name
@@ -499,6 +507,13 @@ interface Particle {
   depth: number;
 }
 
+// A particle's twinkle this frame: whether it shows, and the share of its
+// size it is drawn at.
+interface ParticleTwinkle {
+  shown: boolean;
+  scale: number;
+}
+
 interface EmitterState {
   def: ExportedEmitter;
   joint: Object3D | null;
@@ -536,6 +551,8 @@ interface EmitterState {
   child: boolean;
 }
 
+// Whether an emitter's particles move with its frame (FLAG_LOCAL); a child
+// emitter's never do.
 const isLocal = (emitter: EmitterState): boolean => !emitter.child && Boolean(emitter.def.flags & FLAG_LOCAL);
 
 // A ribbon's edge (layer coordinates): its lower and upper points, age, and
@@ -603,9 +620,8 @@ export interface MissileClips {
   rate: number;
 }
 
+// The clips an effect plays through.
 type Phase = 'Birth' | 'Stand' | 'Hold' | 'Decay' | 'Fly' | 'Impact';
-const scriptTurn = new Quaternion();
-const scriptEuler = new Euler();
 
 const tempMatrix = new Matrix4();
 const particleMatrix = new Matrix4();
@@ -625,11 +641,6 @@ const pivotScratch = new Matrix4();
 const facingScratch = new Quaternion();
 const facingLocked = new Quaternion();
 const billboardRight = new Vector3();
-// Bone billboard flags.
-const BILLBOARD_SPHERICAL = 0x8;
-const BILLBOARD_LOCK_X = 0x10;
-const BILLBOARD_LOCK_Y = 0x20;
-const BILLBOARD_LOCK_Z = 0x40;
 const layerQuaternionScratch = new Quaternion();
 const axisX = new Vector3();
 const axisY = new Vector3();
@@ -662,6 +673,12 @@ const addInto = (out: Vec3, a: Vec3, b: Vec3, scale = 1): Vec3 => {
   out[0] = a[0] + b[0] * scale;
   out[1] = a[1] + b[1] * scale;
   out[2] = a[2] + b[2] * scale;
+  return out;
+};
+const copyInto = (out: Vec3, v: Vec3): Vec3 => {
+  out[0] = v[0];
+  out[1] = v[1];
+  out[2] = v[2];
   return out;
 };
 const scaleInto = (out: Vec3, v: Vec3, scale: number): Vec3 => {
@@ -717,11 +734,15 @@ const atScratch: Vec3 = [0, 0, 0];
 const beforeScratch: Vec3 = [0, 0, 0];
 const fromScratch: Vec3 = [0, 0, 0];
 const childMovedScratch: Vec3 = [0, 0, 0];
+const twinkleScratch: ParticleTwinkle = { shown: true, scale: 1 };
 const ribbonScratch = { startBelow: [0, 0, 0] as Vec3, startAbove: [0, 0, 0] as Vec3, endBelow: [0, 0, 0] as Vec3, endAbove: [0, 0, 0] as Vec3,
   startTangent: [0, 0, 0] as Vec3, endTangent: [0, 0, 0] as Vec3 };
 const billboardA = new Vector3();
 const billboardB = new Vector3();
 const billboardC = new Vector3();
+// A missile's scripted turn, as a quaternion and the angles it is made from.
+const scriptTurn = new Quaternion();
+const scriptEuler = new Euler();
 
 // A one-number track's value, or `fallback`.
 const trackValue = (track: ExportedTrack | null, clock: TrackClock, fallback: number): number =>
@@ -740,16 +761,28 @@ function particleColorInto(out: [number, number, number, number], def: ExportedE
   out[3] = Math.min(1, Math.max(0, toByte(alpha * 255) / 255));
   return out;
 }
+// A particle's twinkle at its age, by its emitter's: it shows while the
+// emitter's on-share exceeds its table entry, and is sized between the
+// emitter's twinkle scales by the entry.
+function particleTwinkleInto(out: ParticleTwinkle, def: ExportedEmitter, particle: Particle): ParticleTwinkle {
+  const base = def.twinkleScale?.[0] ?? 1;
+  const span = (def.twinkleScale?.[1] ?? 1) - base;
+  const entry = def.twinklePercent < 1 || span !== 0 ? twinkleEntry(particle.age, def.twinkleSpeed, particle.twinkle) : TWINKLE_TABLE[0];
+  out.shown = !(def.twinklePercent < 1 && def.twinklePercent < entry);
+  out.scale = span * entry + base;
+  return out;
+}
 // How long a particle of the emitter lives (seconds), by its life seed.
 const particleLife = (emitter: EmitterState, lifeSeed: number): number =>
   Math.max(MIN_LIFE, emitter.lifeBase + lifeSeed * emitter.def.lifespanVariation);
-// The most edges a ribbon keeps: as many as it lays in a lifetime, and two.
+// The edges a ribbon lays a second, rounded up.
 const ribbonRate = (def: ExportedRibbon): number => Math.ceil(def.edgesPerSecond);
+// How long a ribbon's edges last (seconds), at least the client's least.
 const ribbonLifetime = (def: ExportedRibbon): number => Math.max(MIN_RIBBON_LIFETIME, def.edgeLifetime);
+// The most edges a ribbon keeps: as many as it lays in a lifetime, and two.
 const ribbonEdgeLimit = (def: ExportedRibbon): number => Math.ceil(ribbonRate(def) * ribbonLifetime(def)) + 2;
 const newPose = (): RibbonPose => ({ position: [0, 0, 0], forward: [0, 0, 0], up: [0, 0, 0] });
 
-// The camera's directions in the layer's coordinates, for billboards.
 // What an emitter's particles are let go into this frame: the share of its
 // rate it lets go for its distance, and the ground.
 interface Surroundings {
@@ -757,6 +790,7 @@ interface Surroundings {
   ground: EffectView['ground'];
 }
 
+// The camera's directions in the layer's coordinates, for billboards.
 export interface EffectView {
   right: Vec3;
   up: Vec3;
@@ -1125,7 +1159,7 @@ export class EffectInstance {
     const lastOrigin = emitter.hasOrigin ? emitter.lastOrigin : origin;
     const moved = emitter.moved;
     for (let axis = 0; axis < 3; axis += 1) moved[axis] = origin[axis] - lastOrigin[axis];
-    scaleInto(emitter.lastOrigin, origin, 1);
+    copyInto(emitter.lastOrigin, origin);
     emitter.hasOrigin = true;
     // The frame's scale along its X.
     const frameScale = Math.hypot(frameLinear.elements[0], frameLinear.elements[1], frameLinear.elements[2]);
@@ -1140,15 +1174,15 @@ export class EffectInstance {
     let share = 0;
     if (flags & FLAG_FOLLOW && seconds > 0) {
       const [speed1, scale1, speed2, scale2] = [def.followSpeed1 ?? 0, def.followScale1 ?? 0, def.followSpeed2 ?? 0, def.followScale2 ?? 0];
-      const slope = Math.abs(speed2 - speed1) < 2.3841858e-7 ? 0 : (scale2 - scale1) / (speed2 - speed1);
-      const intercept = Math.abs(speed2 - speed1) < 2.3841858e-7 ? 0 : scale1 - speed1 * slope;
+      const slope = Math.abs(speed2 - speed1) < EPSILON ? 0 : (scale2 - scale1) / (speed2 - speed1);
+      const intercept = Math.abs(speed2 - speed1) < EPSILON ? 0 : scale1 - speed1 * slope;
       share = Math.min(1, Math.max(0, (length(moved) / seconds) * slope + intercept));
     }
     if (flags & FLAG_INHERIT_VELOCITY) {
       emitter.inheritTimer += seconds;
       if (emitter.inheritTimer > INHERIT_VELOCITY_STEP) {
-        const scale = emitter.particles.length ? (def.inheritVelocityScale ?? 0) / (emitter.inheritTimer * 30) : 0;
-        for (let axis = 0; axis < 3; axis += 1) emitter.parentVelocity[axis] = moved[axis] * scale;
+        const scale = emitter.particles.length ? (def.inheritVelocityScale ?? 0) / (emitter.inheritTimer * INHERIT_VELOCITY_RATE) : 0;
+        scaleInto(emitter.parentVelocity, moved, scale);
         emitter.inheritTimer = 0;
       }
     }
@@ -1250,7 +1284,7 @@ export class EffectInstance {
         spin: def.baseSpin + signedRandom() * def.baseSpinVariation,
         spinRate: def.spinVariation + signedRandom() * def.spin,
         spinSign: flags & FLAG_RANDOM_SPIN_SIGN && Math.random() < 0.5 ? -1 : 1,
-        twinkle: Math.floor(Math.random() * 128),
+        twinkle: Math.floor(Math.random() * TWINKLE_TABLE.length),
         model: model?.instance ?? null,
         orientation: model?.orientation ?? null,
         tumble: model?.tumble ?? [0, 0, 0],
@@ -1285,9 +1319,7 @@ export class EffectInstance {
       const particle = particles[index];
       const position = particle.position;
       const velocity = particle.velocity;
-      beforeScratch[0] = position[0];
-      beforeScratch[1] = position[1];
-      beforeScratch[2] = position[2];
+      copyInto(beforeScratch, position);
       particle.age += seconds;
       let alive = particle.age < particleLife(emitter, particle.lifeSeed);
       if (alive) {
@@ -1324,7 +1356,7 @@ export class EffectInstance {
         const childFrame = childFrameScratch.copy(frame).setPosition(at[0], at[1], at[2]);
         for (const child of children) {
           if (local) linearInto(child.parentVelocity, emitter.frameLinear, velocity);
-          else scaleInto(child.parentVelocity, velocity, 1);
+          else copyInto(child.parentVelocity, velocity);
           this.spawn(child, this.birthCount(child, seconds, around.thinning), childFrame, childMovedScratch, seconds, around.ground, budget);
         }
       }
@@ -1369,17 +1401,13 @@ export class EffectInstance {
   private drawParticleModels(emitter: EmitterState, frame: Matrix4, frameScale: number, view: EffectView, budget: { left: number }): void {
     const def = emitter.def;
     const flags = def.flags;
-    const local = Boolean(flags & FLAG_LOCAL);
-    const twinkleBase = def.twinkleScale?.[0] ?? 1;
-    const twinkleSpan = (def.twinkleScale?.[1] ?? 1) - twinkleBase;
-    const twinkles = def.twinklePercent < 1 || twinkleSpan !== 0;
+    const local = isLocal(emitter);
     const layer = this.particles.parent ?? this.particles;
     for (const particle of emitter.particles) {
       const model = particle.model;
       const placement = particle.placement;
       if (!model || !particle.orientation || !placement) continue;
-      const entry = twinkles ? twinkleEntry(particle.age, def.twinkleSpeed, particle.twinkle) : TWINKLE_TABLE[0];
-      const shown = !(def.twinklePercent < 1 && def.twinklePercent < entry);
+      const { shown, scale: twinkleScale } = particleTwinkleInto(twinkleScratch, def, particle);
       model.root.visible = shown;
       model.particles.visible = shown;
       if (!shown) continue;
@@ -1387,7 +1415,7 @@ export class EffectInstance {
       const [red, green, blue, alpha] = particleColorInto(colorScratch, def, fraction, Math.floor);
       model.setTint(red, green, blue, alpha);
       const scaled = evalLifeCurveInto(def.scale, 2, fraction, curveScratch);
-      const sizeScale = (twinkleSpan * entry + twinkleBase) * (!local && flags & FLAG_MODEL_SCALE ? frameScale : 1);
+      const sizeScale = twinkleScale * (!local && flags & FLAG_MODEL_SCALE ? frameScale : 1);
       const sx = (scaled ? curveScratch[0] : 1) * sizeScale;
       const sy = (scaled ? curveScratch[1] : 1) * sizeScale;
       particleMatrix.compose(particlePosition.fromArray(particle.position), particle.orientation, particleScale.set(sx, sy, (sx + sy) / 2));
@@ -1407,7 +1435,7 @@ export class EffectInstance {
   private drawParticles(emitter: EmitterState, frame: Matrix4, frameScale: number, view: EffectView): void {
     const def = emitter.def;
     const flags = def.flags;
-    const local = Boolean(flags & FLAG_LOCAL);
+    const local = isLocal(emitter);
     const batch = emitter.batch;
     const head = Boolean(flags & FLAG_HEAD);
     const tail = Boolean(flags & FLAG_TAIL);
@@ -1428,9 +1456,6 @@ export class EffectInstance {
       }
       particles.sort(byDepth);
     }
-    const twinkleBase = def.twinkleScale?.[0] ?? 1;
-    const twinkleSpan = (def.twinkleScale?.[1] ?? 1) - twinkleBase;
-    const twinkles = def.twinklePercent < 1 || twinkleSpan !== 0;
     const spins = def.spin !== 0 || def.spinVariation !== 0;
     // The XY plane: the layer's for particles left in the world, the
     // emitter's (unscaled) for those that move with it.
@@ -1438,12 +1463,12 @@ export class EffectInstance {
     const planeY = local ? normalizeInto(planeYScratch, linearInto(planeYScratch, frameLinear, Y_AXIS)) : Y_AXIS;
     const color = colorScratch;
     for (const particle of particles) {
-      const entry = twinkles ? twinkleEntry(particle.age, def.twinkleSpeed, particle.twinkle) : TWINKLE_TABLE[0];
-      if (def.twinklePercent < 1 && def.twinklePercent < entry) continue;
+      const { shown, scale: twinkleScale } = particleTwinkleInto(twinkleScratch, def, particle);
+      if (!shown) continue;
       const fraction = particle.age / particleLife(emitter, particle.lifeSeed);
       particleColorInto(color, def, fraction, Math.round);
       const scaled = evalLifeCurveInto(def.scale, 2, fraction, curveScratch);
-      const sizeScale = (twinkleSpan * entry + twinkleBase) * (flags & FLAG_MODEL_SCALE ? frameScale : 1);
+      const sizeScale = twinkleScale * (flags & FLAG_MODEL_SCALE ? frameScale : 1);
       const sx = (scaled ? curveScratch[0] : 1) * particle.scaleX * sizeScale;
       const sy = (scaled ? curveScratch[1] : 1) * particle.scaleY * sizeScale;
       const center = local ? transformPointInto(centerScratch, frame, particle.position) : particle.position;
@@ -1455,13 +1480,13 @@ export class EffectInstance {
         let up = viewUp;
         let width = sx;
         const speedSquared = velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2];
-        if (flags & FLAG_VELOCITY_ORIENT && speedSquared > 2.3841858e-7) {
+        if (flags & FLAG_VELOCITY_ORIENT && speedSquared > EPSILON) {
           // Along the way it goes on screen, longer the more of its speed
           // shows there.
           const fx = -(velocity[0] * viewRight[0] + velocity[1] * viewRight[1] + velocity[2] * viewRight[2]);
           const fy = -(velocity[0] * viewUp[0] + velocity[1] * viewUp[1] + velocity[2] * viewUp[2]);
           const flat = Math.hypot(fx, fy);
-          if (flat > 2.3841858e-7) {
+          if (flat > EPSILON) {
             width = (flat / Math.sqrt(speedSquared)) * sx;
             for (let axis = 0; axis < 3; axis += 1) {
               rightScratch[axis] = viewRight[axis] * fx / flat + viewUp[axis] * (fy / flat);

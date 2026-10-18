@@ -5,7 +5,9 @@
 import { M2Model, M2SkinProfile } from '@wowserhq/format';
 
 import { asBytes } from './chunks.mjs';
-import { expandSkinVertices, M2_VERTEX_SIZE, skinFileName, staticBatchColor } from './m2.mjs';
+import {
+  expandSkinVertices, findM2Events, M2_EVENT_TRACK, M2_VERTEX_SIZE, RELEASE_EVENTS, skinFileName, staticBatchColor,
+} from './m2.mjs';
 
 const M2_NO_LOOP = 0xFFFF;
 // Set on sequences whose keyframes are inside the .m2 rather than a .anim file.
@@ -23,31 +25,16 @@ const M2_BONE_TRACKS = { translationTrack: 16, rotationTrack: 36, scaleTrack: 56
 const M2_TRACK_TIMES = 4;
 const M2_TRACK_KEYS = 12;
 const M2_TRACK_INTERPOLATION_NONE = 0;
-// The header's events, each 36 bytes: four-letter ID, data, bone, unused,
-// position, then its track: interpolation, global sequence, and per
-// sequence the times it fires.
-const M2_EVENTS_OFFSET = 256;
-const M2_EVENT_SIZE = 36;
-const M2_EVENT_TRACK = 24;
-// The events a spell's missile is released at: left hand, right hand, a
-// thrown weapon, a bow or gun.
-const RELEASE_EVENTS = new Set(['$CSL', '$CSR', '$CST', '$BWR']);
 
 // When in a sequence (ms) the model first releases a spell's missile, or
 // null if it never does. An external sequence's times are in its .anim
-// file (`animBytes`).
+// file (`animBytes`); the per-sequence entries pointing at them stay in the
+// .m2.
 export function releaseTimeMs(modelBytes, animBytes, sequenceIndex) {
   const model = new DataView(modelBytes.buffer, modelBytes.byteOffset, modelBytes.byteLength);
-  if (model.byteLength < M2_EVENTS_OFFSET + 8) return null;
-  const count = model.getUint32(M2_EVENTS_OFFSET, true);
-  const offset = model.getUint32(M2_EVENTS_OFFSET + 4, true);
-  if (offset + count * M2_EVENT_SIZE > model.byteLength) return null;
   const source = animBytes ? new DataView(animBytes.buffer, animBytes.byteOffset, animBytes.byteLength) : model;
   let first = null;
-  for (let index = 0; index < count; index += 1) {
-    const base = offset + index * M2_EVENT_SIZE;
-    const name = String.fromCharCode(...modelBytes.subarray(base, base + 4));
-    if (!RELEASE_EVENTS.has(name)) continue;
+  for (const { base } of findM2Events(modelBytes, RELEASE_EVENTS)) {
     const track = base + M2_EVENT_TRACK;
     if (model.getInt16(track + 2, true) !== -1) continue;
     const sequences = model.getUint32(track + 4, true);
@@ -309,6 +296,8 @@ export function loadSkinnedM2(modelName, readFile, { showSection = () => true, a
     indices: skin.indices,
     bones,
     clips,
+    // The model's bounding box: min x, y, z, max x, y, z.
+    boundingBox: Array.from(model.bounds.extent),
     textures: model.textures.map((texture) => ({ type: texture.component, filename: texture.filename, flags: texture.flags })),
     batches: skin.batches.flatMap((batch) => {
       if (!showSection(batch.skinSection.id)) return [];

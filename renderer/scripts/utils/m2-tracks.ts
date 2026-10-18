@@ -1,3 +1,5 @@
+import { EPSILON } from './vec3';
+
 // Pure maths for playing the client's spell effect models: animation tracks
 // exported by scripts/scene/effect-model.mjs, particle spawning, and the
 // curves a particle follows over its life, as the client's particle system
@@ -121,13 +123,14 @@ export function cellUvInto(cell: number, rows: number, columns: number, out: [nu
   return out;
 }
 
-// A random number in [-1, 1), and in [0, 1).
+// A source of random numbers in [-1, 1), and the one spawning uses unless
+// given another.
 export type Random = () => number;
 export const signedRandom = (): number => Math.random() * 2 - 1;
 
 export interface SpawnParams {
   emitterType: number;
-  // The width (0xC8) and length (0xDC) tracks: a plane's extent along x
+  // The emission area's width and length tracks: a plane's extent along x
   // and y; a sphere's least and greatest radius; a spline's stretch (0 to 1).
   areaWidth: number;
   areaLength: number;
@@ -152,7 +155,7 @@ export function spawnParticle(params: SpawnParams, random: Random = signedRandom
   const fromSource = (position: Vec3, speed: number): Vec3 => {
     const away: Vec3 = [position[0], position[1], position[2] - zSource];
     const size = Math.hypot(...away);
-    return size > 2.3841858e-7 ? [away[0] / size * speed, away[1] / size * speed, away[2] / size * speed] : [0, 0, 0];
+    return size > EPSILON ? [away[0] / size * speed, away[1] / size * speed, away[2] / size * speed] : [0, 0, 0];
   };
   const speedOf = () => params.speed * (1 + random() * params.speedVariation);
   if (params.emitterType === 2) {
@@ -257,7 +260,7 @@ export const TWINKLE_TABLE: readonly number[] = (() => {
 // The twinkle entry a particle reads at `age`, for one that twinkles at
 // `framesPerSecond` from its own `offset` (0 to 127).
 export function twinkleEntry(age: number, framesPerSecond: number, offset: number): number {
-  return TWINKLE_TABLE[((Math.round(framesPerSecond * age) & 0xff) + offset) & 127];
+  return TWINKLE_TABLE[((Math.round(framesPerSecond * age) & 0xff) + offset) & (TWINKLE_TABLE.length - 1)];
 }
 
 // Particle and ribbon blends as three.js-agnostic modes, by the client's

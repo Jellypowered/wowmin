@@ -364,7 +364,7 @@ function frame(): void {
     attachment: (unit, attachment, offset) => units.attachmentOf(unit, attachment, offset),
     isDrawn: (unit) => units.isDrawn(unit),
     scale: (unit) => units.scaleOf(unit) ?? 1,
-    height: (unit) => units.heightOf(unit) ?? 2,
+    height: (unit) => units.heightOf(unit) ?? DEFAULT_HEIGHT,
     facing: (unit) => facing.get(unit) ?? 0,
     // No scene: falling models land on the preview's flat floor, and the
     // ground is that floor (z 0).
@@ -376,7 +376,8 @@ function frame(): void {
     attachmentTurn: (unit, attachment, out) => units.attachmentTurnOf(unit, attachment, out),
     creatureTypeFlags: () => 0,
   }, camera, currentAuras(virtualNow));
-  glows.update(field('glows').checked ? store : null, virtualNow, anchor, (entry) => visuals.handles(entry));
+  const aids = field('glows').checked;
+  glows.update(store, virtualNow, anchor, (entry) => visuals.handles(entry), { glows: aids, circles: aids });
   renderer.render(scene, camera);
   frameTimes.push(performance.now() - real);
   showStats(real);

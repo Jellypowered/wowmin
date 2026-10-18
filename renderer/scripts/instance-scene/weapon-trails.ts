@@ -17,17 +17,42 @@ const MAX_PAIRS = 128;
 const MIN_ALPHA = 2 / 255;
 const RENDER_ORDER = 4;
 
+// A blade's bottom and top at one moment of its sweep, and when (ms).
+interface SweepPair {
+  at: number;
+  bottom: Point3;
+  top: Point3;
+}
+
 interface Swing {
   trail: WeaponTrail;
   startAt: number;
   lastAt: number;
   alpha: number;
-  // Per blade: its sweep so far, newest last, with when each was taken.
-  sweeps: Array<Array<{ at: number; bottom: Point3; top: Point3 }>>;
+  // Per blade: its sweep so far, newest last.
+  sweeps: SweepPair[][];
   meshes: Array<Mesh<BufferGeometry, MeshBasicMaterial>>;
 }
 
 const vertexColor = new Color();
+
+// An untextured strip with room for a whole sweep, a quad between each pair
+// and the next, coloured per vertex.
+function createTrailMesh(): Mesh<BufferGeometry, MeshBasicMaterial> {
+  const geometry = new BufferGeometry();
+  geometry.setAttribute('position', new BufferAttribute(new Float32Array(MAX_PAIRS * 2 * 3), 3));
+  geometry.setAttribute('color', new BufferAttribute(new Float32Array(MAX_PAIRS * 2 * 4), 4));
+  const quads: number[] = [];
+  for (let pair = 0; pair + 1 < MAX_PAIRS; pair += 1) {
+    const at = pair * 2;
+    quads.push(at, at + 1, at + 2, at + 1, at + 3, at + 2);
+  }
+  geometry.setIndex(quads);
+  const mesh = new Mesh(geometry, new MeshBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, side: DoubleSide }));
+  mesh.renderOrder = RENDER_ORDER;
+  mesh.frustumCulled = false;
+  return mesh;
+}
 
 export class WeaponTrails {
   readonly group = new Group();
@@ -65,21 +90,10 @@ export class WeaponTrails {
     }
   }
 
-  private draw(swing: Swing, index: number, sweep: Swing['sweeps'][number], now: number): void {
+  private draw(swing: Swing, index: number, sweep: SweepPair[], now: number): void {
     let mesh = swing.meshes[index];
     if (!mesh) {
-      const geometry = new BufferGeometry();
-      geometry.setAttribute('position', new BufferAttribute(new Float32Array(MAX_PAIRS * 2 * 3), 3));
-      geometry.setAttribute('color', new BufferAttribute(new Float32Array(MAX_PAIRS * 2 * 4), 4));
-      const quads: number[] = [];
-      for (let pair = 0; pair + 1 < MAX_PAIRS; pair += 1) {
-        const at = pair * 2;
-        quads.push(at, at + 1, at + 2, at + 1, at + 3, at + 2);
-      }
-      geometry.setIndex(quads);
-      mesh = new Mesh(geometry, new MeshBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, side: DoubleSide }));
-      mesh.renderOrder = RENDER_ORDER;
-      mesh.frustumCulled = false;
+      mesh = createTrailMesh();
       swing.meshes[index] = mesh;
       this.group.add(mesh);
     }

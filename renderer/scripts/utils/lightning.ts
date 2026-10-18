@@ -1,4 +1,6 @@
+import type { Random } from './m2-tracks';
 import type { Point3 } from './spell-events';
+import { cross, EPSILON, length3, sub } from './vec3';
 
 // A chain's bolt as the client draws one (SpellChainEffects): a strip of
 // joints from its source to its target, each joint jittered off the line
@@ -81,9 +83,8 @@ const FIXED_WAVE_PHASE = 0x400;
 
 const MAX_JOINTS = 1000;
 const MAX_LENGTH = 10000;
-const EPSILON = 2.3841858e-7;
-
-export type Random = () => number;
+// A strip's normal no longer than this is too short to set its direction.
+const MIN_NORMAL_LENGTH = 0.001;
 
 interface Joint {
   position: Point3;
@@ -103,10 +104,6 @@ export interface BoltStrip {
   count: number;
 }
 
-const sub = (a: Point3, b: Point3): Point3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-const length3 = (a: Point3): number => Math.hypot(a[0], a[1], a[2]);
-const cross = (a: Point3, b: Point3): Point3 => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-
 // Two axes across a direction: one level, one up from it.
 export function acrossAxes(along: Point3): { x: Point3; z: Point3 } {
   let x: Point3;
@@ -119,6 +116,16 @@ export function acrossAxes(along: Point3): { x: Point3; z: Point3 } {
   const scale = 1 / (length3(along) + 1e-8);
   const z = cross(x, along);
   return { x, z: [z[0] * scale, z[1] * scale, z[2] * scale] };
+}
+
+// How far a strip reaches across the line from a joint: `width` along
+// `normal`, or the normal itself times `width` when it is too short to set
+// a direction.
+function across(normal: Point3, width: number): Point3 {
+  const length = length3(normal);
+  return length > MIN_NORMAL_LENGTH
+    ? [normal[0] / length * width, normal[1] / length * width, normal[2] / length * width]
+    : [normal[0] * width, normal[1] * width, normal[2] * width];
 }
 
 // How far the wave and the arc bend the bolt at `t` along it: none at the
@@ -369,11 +376,7 @@ export class LightningBolt {
       let t = step;
       for (let vertex = 0; vertex < vertexCount - 2; vertex += 2) {
         const point = bend(points[(vertex + 2) >> 1], t);
-        const normal = cross(sub(point, previous), viewDirection);
-        const normalLength = length3(normal);
-        const offset: Point3 = normalLength > 0.001
-          ? [normal[0] / normalLength * width, normal[1] / normalLength * width, normal[2] / normalLength * width]
-          : [normal[0] * width, normal[1] * width, normal[2] * width];
+        const offset = across(cross(sub(point, previous), viewDirection), width);
         add(vertex, [(offset[0] + previous[0]) / 2, (offset[1] + previous[1]) / 2, (offset[2] + previous[2]) / 2]);
         add(vertex + 1, [(previous[0] - offset[0]) / 2, (previous[1] - offset[1]) / 2, (previous[2] - offset[2]) / 2]);
         set(vertex + 2, [(offset[0] + point[0]) / 2, (offset[1] + point[1]) / 2, (offset[2] + point[2]) / 2]);
@@ -383,11 +386,7 @@ export class LightningBolt {
       }
     } else {
       // One flat strip across the whole bolt.
-      const normal = cross(beam, viewDirection);
-      const normalLength = length3(normal);
-      const offset: Point3 = normalLength > 0.001
-        ? [normal[0] / normalLength * width, normal[1] / normalLength * width, normal[2] / normalLength * width]
-        : [normal[0] * width, normal[1] * width, normal[2] * width];
+      const offset = across(cross(beam, viewDirection), width);
       let t = 0;
       for (let vertex = 0; vertex < vertexCount; vertex += 2) {
         const point = bend(points[vertex >> 1], t);

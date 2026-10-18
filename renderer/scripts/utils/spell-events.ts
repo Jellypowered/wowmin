@@ -26,7 +26,7 @@ export interface CastGlow {
   release: boolean;
   // A channel, held for its duration, rather than a cast before release.
   channeled: boolean;
-  // Whether WowMin's own glow draws it. The client's cast art plays for
+  // Whether WoWMin's own glow draws it. The client's cast art plays for
   // every cast as it fires, a weapon strike's or a proc's too; the glow
   // only for spells cast on purpose.
   glow: boolean;
@@ -40,8 +40,8 @@ export interface Projectile {
   color: string;
   startAt: number;
   travelMs: number;
-  // The spell's speed (yards a second; 0 for none).
-  speed: number;
+  // The spell's missile speed (yards a second; 0 for none).
+  missileSpeed: number;
   // Instant spells without a missile get a quick streak instead.
   streak: boolean;
   // Arrows and bullets: small and pale.
@@ -73,7 +73,7 @@ export interface Impact {
   // Whether the client's impact art plays for it: not for periodic ticks,
   // nor for a hit whose cast's landing already played it.
   kit: boolean;
-  // Whether WowMin's own glow draws it: not for a cast's landing (a buff),
+  // Whether WoWMin's own glow draws it: not for a cast's landing (a buff),
   // only for hits.
   glow: boolean;
 }
@@ -454,7 +454,7 @@ export class CombatEffectStore {
         travelMs = getTravelMs(yards, event.missileSpeed);
         this.projectileList.push({
           source, target: target!, spellId: event.spellId, schoolMask: event.schoolMask, color, startAt: at,
-          travelMs, speed: event.missileSpeed, streak: event.missileSpeed <= 0, physical,
+          travelMs, missileSpeed: event.missileSpeed, streak: event.missileSpeed <= 0, physical,
         });
       }
     }

@@ -736,8 +736,8 @@ test('kits trail weapons, freeze a unit, and fade it for a moment', () => {
   assert.deepEqual(plain(kitWeaponTrail(kit([{ code: 8, params: [14355216, 20, 1000, 100] }]))),
     { color: 14355216, alpha: 100 / 255, durationMs: 1000 });
   assert.equal(kitWeaponTrail(kit([{ code: 8, params: [14355216, 20, 0, 100] }])), null);
-  assert.deepEqual(plain(kitFreeze(kit([{ code: 11, params: [0.5, 0, 0, 0] }]))), { atSeconds: 0.5 });
-  assert.deepEqual(plain(kitFreeze(kit([{ code: 11, params: [0, 0, 0, 0] }]))), { atSeconds: null });
+  assert.deepEqual(plain(kitFreeze(kit([{ code: 11, params: [0.5, 0, 0, 0] }]))), { atMs: 500 });
+  assert.deepEqual(plain(kitFreeze(kit([{ code: 11, params: [0, 0, 0, 0] }]))), { atMs: null });
   const fade = kitFade(kit([{ code: 15, params: [0.6, 2, 500, 1000] }]));
   assert.deepEqual(plain(fade), { alpha: 0.6, holdMs: 1000, backMs: 500 });
   near(fadeAlpha(fade, 250), 0.8, 'fading out');

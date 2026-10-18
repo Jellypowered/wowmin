@@ -352,7 +352,7 @@ export async function buildEffectGlb(readFile, modelName) {
   const particleModels = [];
   const indexOf = new Map();
   const modelIndex = (filename) => {
-    const file = filename.replace(/\.md[lx]$/i, '.m2');
+    const file = filename.replace(/\.md[xl]$/i, '.m2');
     const key = file.toLowerCase();
     if (!indexOf.has(key)) {
       const model = loadEffectM2(file, readFile);

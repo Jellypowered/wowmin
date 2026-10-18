@@ -1,8 +1,9 @@
 import {
   AdditiveBlending,
+  type BlendingDstFactor,
+  type BlendingSrcFactor,
   BufferAttribute,
   BufferGeometry,
-  type Blending,
   Color,
   CustomBlending,
   DoubleSide,
@@ -49,20 +50,24 @@ interface DrawnBolt {
   capacity: number;
 }
 
-// The client's blend modes as three.js blending.
+// A chain's blend mode as three.js blending, on a material made clear and
+// not writing depth. Its own, not the effect models' blends: its opaque and
+// alpha-keyed modes write no depth, its alpha mode does, none tests alpha
+// but the keyed one (at a half), and it multiplies and adds by colour as
+// they don't.
 function applyBlend(material: MeshBasicMaterial, mode: number): void {
-  const custom = (source: typeof DstColorFactor, destination: typeof SrcColorFactor | typeof OneFactor): Blending => {
+  const custom = (source: BlendingSrcFactor, destination: BlendingDstFactor): void => {
+    material.blending = CustomBlending;
     material.blendSrc = source;
     material.blendDst = destination;
-    return CustomBlending;
   };
   switch (mode) {
     case 0: material.blending = NormalBlending; material.transparent = false; return;
     case 1: material.blending = NormalBlending; material.transparent = false; material.alphaTest = 0.5; return;
     case 2: material.blending = NormalBlending; material.depthWrite = true; return;
     case 4: material.blending = MultiplyBlending; return;
-    case 5: material.blending = custom(DstColorFactor, SrcColorFactor); return;
-    case 6: material.blending = custom(DstColorFactor, OneFactor); return;
+    case 5: custom(DstColorFactor, SrcColorFactor); return;
+    case 6: custom(DstColorFactor, OneFactor); return;
     default: material.blending = AdditiveBlending;
   }
 }

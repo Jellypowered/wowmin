@@ -38,6 +38,15 @@ import type { UnitAnchorRole } from '../utils/spell-kits';
 // A unit's anchor point in server coordinates, or null if it isn't shown.
 export type UnitAnchor = (unit: UnitKey, role: UnitAnchorRole) => Point3 | null;
 
+// WowMin's own spell aids, which aren't the client's art, each shown or
+// not: the glows (casts, beams, missiles, and hits of spells without art),
+// and the floor circles (harmful areas, taunts, and steady areas round an
+// aura's bearer).
+export interface SpellAids {
+  glows: boolean;
+  circles: boolean;
+}
+
 const EFFECT_RENDER_ORDER = 3;
 const RING_LIFT = 0.08;
 // Area rings of one colour at about one height are drawn as one shape: a
@@ -51,15 +60,8 @@ const AREA_EDGE_STRENGTH = 0.5;
 const BEAM_SPACING = 1.2;
 const MAX_BEAM_SPRITES = 40;
 const TRAIL_SPRITES = 3;
-// WowMin's own spell aids, which aren't the client's art, each shown or
-// not: the glows (casts, beams, missiles, and hits of spells without art),
-// and the floor circles (harmful areas, taunts, and steady areas round an
-// aura's bearer).
-export interface SpellAids {
-  glows: boolean;
-  circles: boolean;
-}
 
+// Every aid shown.
 export const ALL_SPELL_AIDS: SpellAids = { glows: true, circles: true };
 
 const NO_EFFECTS: Pick<CombatEffectStore, 'casts' | 'beams' | 'projectiles' | 'impacts' | 'rings'> = {
@@ -208,6 +210,7 @@ export class SpellEffectLayer {
     let drawn = 0;
     const effects = store ?? NO_EFFECTS;
     const glows = aids.glows ? effects : NO_EFFECTS;
+    const areas = aids.circles ? effects : NO_EFFECTS;
 
     for (const cast of glows.casts) {
       if (!cast.glow || cast.startAt > now || skip(cast)) continue;
@@ -289,7 +292,7 @@ export class SpellEffectLayer {
     }
 
     const circles: AreaCircle[] = [];
-    for (const area of aids.circles ? effects.rings : NO_EFFECTS.rings) {
+    for (const area of areas.rings) {
       if (area.startAt > now || skip(area)) continue;
       const center = area.point ?? anchor(area.caster, 'feet');
       // The caster must be shown, even for a ring at a ground point.
