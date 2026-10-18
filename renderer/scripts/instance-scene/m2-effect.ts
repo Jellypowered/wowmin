@@ -921,8 +921,8 @@ export class EffectInstance {
   }
 
   // Ends the effect: a lasting one plays its Decay first, a missile its
-  // Impact; then it stops emitting and hides the model, and particles and
-  // ribbons live out.
+  // Impact; then it stops emitting and hides the model, and particles live
+  // out (a missile's ribbons too).
   stop(now = this.lastAt): void {
     if (this.stopRequested) return;
     this.stopRequested = true;
@@ -940,6 +940,9 @@ export class EffectInstance {
   private finish(): void {
     this.emitting = false;
     this.model.visible = false;
+    // Only a missile's ribbons outlast it; any other effect's go with its
+    // model, as only its particles keep it alive.
+    if (!this.missile) for (const ribbon of this.ribbons) ribbon.edges.length = 0;
   }
 
   get stopped(): boolean {
@@ -989,7 +992,7 @@ export class EffectInstance {
 
     const layerInverse = tempMatrix.copy(layer.matrixWorld).invert();
     for (const emitter of this.emitters) this.updateEmitter(emitter, clock, seconds, layerInverse, view, budget);
-    for (const ribbon of this.ribbons) this.updateRibbon(ribbon, clock, Math.min(0.1, seconds), layerInverse);
+    for (const ribbon of this.ribbons) this.updateRibbon(ribbon, clock, seconds, layerInverse);
   }
 
   // Draws it in this colour and opacity on top of its own.
