@@ -39,7 +39,7 @@ import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.j
 
 import { type FadeSettings, type FadeVolume, getSceneFade, type IsoView, MAX_FADE_VOLUMES } from '../utils/map-projection';
 import {
-  blendLight, type BuildingBatchLight, buildingBatchLight, CLIENT_AMBIENT_GAIN, CLIENT_DIRECT_GAIN, characterAmbientScale, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors,
+  blendLight, type BuildingBatchLight, buildingBatchLight, characterAmbientScale, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors,
   lightAt, type MapLights, nearestObjectLights, scaleAmbient, type Rgb, sunDirection, timeOfDay,
 } from '../utils/map-light';
 import { PARTICLE_GROUND_DEPTH } from '../utils/m2-tracks';
@@ -80,9 +80,9 @@ const WATER_FRAGMENT = `
 #endif
 `;
 
-// WMO interiors carry baked lighting in their vertex colours, which the client
-// brightens; props have no baked light and are drawn slightly dimmed to sit in
-// the same range. Tuned by eye against Azjol-Nerub.
+// Without the map's light, WMO interiors' baked vertex colours are
+// brightened and props, which have no baked light, are drawn slightly dimmed
+// to sit in the same range. Tuned by eye against Azjol-Nerub.
 const VERTEX_LIT_BRIGHTNESS = 2;
 const UNLIT_BRIGHTNESS = 0.75;
 // With the map's light, a building's batches as the client draws them (see
@@ -129,8 +129,10 @@ if (wowClientAmbientPacked.w > 0.5) {
 #endif
 }
 `;
-// The map's props (not a building's) are shaded by the scene's lights, a
-// little dimmed to sit with the buildings' baked light.
+// Without the map's light, the map's props (not a building's) are shaded by
+// the scene's lights, a little dimmed to sit with the buildings' baked light.
+// These dimmings are the neutral look's only: a material carries its factor
+// as WOW_NEUTRAL_SCALE, applied while the map's light is off.
 const PROP_BRIGHTNESS = 0.75;
 
 // How the scene is lit: by the map's own light (Light.dbc, at the view's
@@ -140,7 +142,7 @@ const NEUTRAL_AMBIENT = 2.2;
 const NEUTRAL_SUN = 1.6;
 // With the map's light, models and terrain are lit as the client lights
 // them (see clientLight in unit-models.ts): ambient plus direct times N.L,
-// summed in the client's colour space.
+// summed in the client's colour space, with no gain.
 // Towards the sun, in three.js world space, for the neutral look; the
 // client's moves through the day (sunDirection).
 const NEUTRAL_SUN_TOWARDS = new Vector3(0.4, 1, 0.6).normalize();
@@ -207,9 +209,8 @@ const MAX_FLOOR_AREAS = 8;
 const FLOOR_AREA_OFFSET = FADE_PARAMS_OFFSET + 4;
 const FLOOR_AREA_COLOR_OFFSET = FLOOR_AREA_OFFSET + MAX_FLOOR_AREAS * 4;
 const FLOOR_AREA_COUNT_OFFSET = FLOOR_AREA_COLOR_OFFSET + MAX_FLOOR_AREAS * 4;
-// The sky's raw light for lit scene materials (terrain and the map's props
-// take it at terrain's gains): ambient and direct colours (w 1 while on) and
-// the view-space way to the sun.
+// The sky's light for lit scene materials: ambient and direct colours (w 1
+// while on) and the view-space way to the sun.
 const CLIENT_AMBIENT_OFFSET = FLOOR_AREA_COUNT_OFFSET + 4;
 const CLIENT_DIRECT_OFFSET = CLIENT_AMBIENT_OFFSET + 4;
 const CLIENT_SUN_OFFSET = CLIENT_DIRECT_OFFSET + 4;
@@ -235,9 +236,9 @@ varying vec3 vWowNormal;
 #endif
 #ifdef WOW_PROP_LIGHT
 attribute vec2 wowPropKind;
-attribute vec4 wowPropDirect;
+attribute vec3 wowPropDirect;
 varying vec2 vWowPropKind;
-varying vec4 vWowPropDirect;
+varying vec3 vWowPropDirect;
 #endif
 `;
 const FADE_VERTEX = `
@@ -280,7 +281,7 @@ layout(std140) uniform ${FADE_BLOCK} {
 varying vec3 vWowPosition;
 #ifdef WOW_PROP_LIGHT
 varying vec2 vWowPropKind;
-varying vec4 vWowPropDirect;
+varying vec3 vWowPropDirect;
 #endif
 #ifdef WOW_BUILDING
 varying vec3 vWowNormal;
@@ -324,35 +325,36 @@ float wowVolumeFade(int index) {
 }
 `;
 // Lit scene materials (Lambert: terrain, the map's props) under the map's
-// light, as the client lights them, at terrain's gains. A building's props
-// have their own light (applyPropLight): indoors (kind 0) the sky's raw
-// ambient, which the client gives a prop when it makes it, and the floor's
-// direct light from the indoor light's direction, leaning towards the sky's
-// direct light and the sun by their share; outdoors (1) the map's light as
-// its own props have; with no floor (2) a flat light. At their own
-// brightness.
+// light, as the client lights them: the ambient plus the direct light (each
+// channel at most 1) by N.L, the sum at most 1, in the client's colour
+// space (litColor in map-light.ts). A building's props have their own light
+// (applyPropLight): indoors (kind 0) the sky's ambient, which the client
+// gives a prop when it makes it, and the floor's direct light from the
+// indoor light's direction, leaning towards the sky's direct light and the
+// sun by their share; elsewhere (1) the map's light as its own props have.
 const CLIENT_LIGHT_FRAGMENT = `
 if (wowClientAmbientPacked.w > 0.5) {
-  vec3 wowAmbient = wowClientAmbientPacked.rgb * ${CLIENT_AMBIENT_GAIN.toFixed(4)};
-  vec3 wowDirect = wowClientDirectPacked.rgb * ${CLIENT_DIRECT_GAIN.toFixed(4)};
+  vec3 wowAmbient = wowClientAmbientPacked.rgb;
+  vec3 wowDirect = wowClientDirectPacked.rgb;
   vec3 wowTowards = wowClientSunPacked.xyz;
-  float wowBrightness = 1.0;
 #ifdef WOW_PROP_LIGHT
   if (vWowPropKind.x < 0.5) {
     float wowShare = vWowPropKind.y;
-    wowAmbient = wowClientAmbientPacked.rgb;
-    wowDirect = mix(vWowPropDirect.rgb, wowClientDirectPacked.rgb, wowShare);
+    wowDirect = mix(vWowPropDirect, wowClientDirectPacked.rgb, wowShare);
     wowTowards = mix(wowClientIndoorPacked.xyz, wowClientSunPacked.xyz, wowShare);
     wowTowards = dot(wowTowards, wowTowards) > 1e-6 ? normalize(wowTowards) : wowClientSunPacked.xyz;
-  } else if (vWowPropKind.x > 1.5) {
-    wowAmbient = vec3(1.0);
-    wowDirect = vec3(0.0);
   }
-  wowBrightness = vWowPropDirect.w;
 #endif
-  vec3 wowLight = wowAmbient + wowDirect * saturate(dot(normal, wowTowards));
-  reflectedLight.indirectDiffuse += diffuseColor.rgb * pow(max(wowLight, vec3(0.0)), vec3(2.2)) * wowBrightness;
+  vec3 wowLight = clamp(wowAmbient + min(wowDirect, vec3(1.0)) * saturate(dot(normal, wowTowards)), 0.0, 1.0);
+  reflectedLight.indirectDiffuse += diffuseColor.rgb * pow(wowLight, vec3(2.2));
 }
+`;
+// The neutral look's dimming of a material (see PROP_BRIGHTNESS), after its
+// colour; the client's light draws it at its own colour.
+const NEUTRAL_SCALE_FRAGMENT = `
+#ifdef WOW_NEUTRAL_SCALE
+if (wowClientAmbientPacked.w < 0.5) diffuseColor.rgb *= WOW_NEUTRAL_SCALE;
+#endif
 `;
 const FADE_FRAGMENT = `
 if (any(lessThan(vWowPosition, wowReachMin)) || any(greaterThan(vWowPosition, wowReachMax))) discard;
@@ -418,6 +420,7 @@ function injectPartyFade(shader: WebGLProgramParametersWithUniforms): void {
     .replace('#include <project_vertex>', `#include <project_vertex>\n${FADE_VERTEX}`);
   shader.fragmentShader = FADE_FRAGMENT_DECLARATIONS + shader.fragmentShader
     .replace('#include <clipping_planes_fragment>', `#include <clipping_planes_fragment>\n${FADE_FRAGMENT}`)
+    .replace('#include <color_fragment>', `#include <color_fragment>\n${NEUTRAL_SCALE_FRAGMENT}`)
     .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>\n${CLIENT_LIGHT_FRAGMENT}`)
     .replace('#include <opaque_fragment>', '#include <opaque_fragment>\n#ifdef WOW_FLOOR_AREAS\ngl_FragColor.rgb += wowFloorAreas();\n#endif');
 }
@@ -456,14 +459,13 @@ function propFloors(mesh: Mesh): ArrayLike<number> | null {
 
 // Gives a building's prop its light per instance, on its own copy of the
 // geometry (the buffers are shared): wowPropKind is [kind, share] and
-// wowPropDirect the floor's direct light and the brightness (see
-// CLIENT_LIGHT_FRAGMENT). Worked out once per prop; each primitive gets its
-// own copy, as culling repacks each one's copies (chooseVisible), and keeps
-// the originals for that. Indoors the client's light from the floor (its
-// direct light; Wow.exe FUN_007a0d60 keeps the floor's ambient apart, and the
-// prop's light setup FUN_007c1730 reads the sky ambient it was made with);
-// outdoors the map's light as its own props; with no floor, a flat light as
-// unlit props have. Brightness is relative to the shaded props' colour.
+// wowPropDirect the floor's direct light (see CLIENT_LIGHT_FRAGMENT). Worked
+// out once per prop; each primitive gets its own copy, as culling repacks
+// each one's copies (chooseVisible), and keeps the originals for that.
+// Indoors the client's light from the floor (its direct light; the prop
+// keeps the sky ambient it was made with); outdoors the map's light as its
+// own props; with no floor too, as the client lights a prop it finds no
+// building floor under as outdoors.
 interface PropLight {
   kind: Float32Array;
   direct: Float32Array;
@@ -473,18 +475,14 @@ const propLights = new WeakMap<object, PropLight>();
 function propLight(floors: ArrayLike<number>): PropLight {
   const count = floors.length / 4;
   const kind = new Float32Array(count * 2);
-  const direct = new Float32Array(count * 4);
+  const direct = new Float32Array(count * 3);
   for (let index = 0; index < count; index += 1) {
     const [r, g, b, share] = [floors[index * 4], floors[index * 4 + 1], floors[index * 4 + 2], floors[index * 4 + 3]];
-    if (r === -1) {
+    if (r < 0) {
       kind.set([1, 1], index * 2);
-      direct.set([0, 0, 0, 1], index * 4);
-    } else if (r < 0) {
-      kind.set([2, 0], index * 2);
-      direct.set([0, 0, 0, UNLIT_BRIGHTNESS / PROP_BRIGHTNESS], index * 4);
     } else {
       kind.set([0, share], index * 2);
-      direct.set([...indoorLight([r, g, b]).direct, 1 / PROP_BRIGHTNESS], index * 4);
+      direct.set(indoorLight([r, g, b]).direct, index * 3);
     }
   }
   return { kind, direct };
@@ -503,7 +501,7 @@ function applyPropLight(mesh: Mesh, floors: ArrayLike<number>): void {
   geometry.setDrawRange(source.drawRange.start, source.drawRange.count);
   geometry.userData = source.userData;
   geometry.setAttribute('wowPropKind', new InstancedBufferAttribute(light.kind.slice(), 2));
-  geometry.setAttribute('wowPropDirect', new InstancedBufferAttribute(light.direct.slice(), 4));
+  geometry.setAttribute('wowPropDirect', new InstancedBufferAttribute(light.direct.slice(), 3));
   mesh.userData.wowPropLight = light;
   mesh.geometry = geometry;
 }
@@ -719,9 +717,9 @@ export class InstanceSceneView {
   // outdoor light (on a transition face), with where and in which group it
   // was sampled.
   private readonly indoorLights = new Map<string, { groupId: number; position: Point3; light: LightColors | null; outdoor: number }>();
-  // The sky's raw light (with the zone's character ambient), which the
-  // client blends a unit's indoor light towards on transition faces (Wow.exe
-  // FUN_007c1c40); the light outdoors carries terrain's gains.
+  // The sky's light (with the zone's character ambient): a unit's light
+  // outdoors, and what the client blends its indoor light towards on
+  // transition faces.
   private unitSkyLight: LightColors = { direct: [0, 0, 0], ambient: [0, 0, 0] };
   // Transition faces by batch, as sets (from the light file's lists).
   private readonly transitionSets = new WeakMap<number[], Set<number>>();
@@ -1270,7 +1268,7 @@ export class InstanceSceneView {
       // A building's prop's light follows its copies into their new slots.
       const light = mesh.userData.wowPropLight as PropLight | undefined;
       if (light) {
-        for (const [name, source, size] of [['wowPropKind', light.kind, 2], ['wowPropDirect', light.direct, 4]] as const) {
+        for (const [name, source, size] of [['wowPropKind', light.kind, 2], ['wowPropDirect', light.direct, 3]] as const) {
           const attribute = mesh.geometry.getAttribute(name) as InstancedBufferAttribute;
           const target = attribute.array as Float32Array;
           for (let slot = 0; slot < count; slot += 1) {
@@ -1327,12 +1325,10 @@ export class InstanceSceneView {
     const direct: Rgb = colors?.direct ?? [0, 0, 0];
     this.fadeData.set([...ambient, on], CLIENT_AMBIENT_OFFSET);
     this.fadeData.set([...direct, on], CLIENT_DIRECT_OFFSET);
-    // Units (characters) take the zone's character ambient too, and outdoors
-    // terrain's gains.
+    // Units (characters) take the zone's character ambient too.
     this.unitSkyLight = { ambient: scaleAmbient(ambient, characterAmbientScale(this.mapLights?.ambientMultiplier)), direct };
-    const [ur, ug, ub] = this.unitSkyLight.ambient;
-    clientLight.ambient.set(ur * CLIENT_AMBIENT_GAIN, ug * CLIENT_AMBIENT_GAIN, ub * CLIENT_AMBIENT_GAIN, on);
-    clientLight.direct.set(direct[0] * CLIENT_DIRECT_GAIN, direct[1] * CLIENT_DIRECT_GAIN, direct[2] * CLIENT_DIRECT_GAIN, on);
+    clientLight.ambient.set(...this.unitSkyLight.ambient, on);
+    clientLight.direct.set(...direct, on);
     const nearest = this.objectLightsOn && this.mapLights?.objects
       ? nearestObjectLights(this.mapLights.objects, center, OBJECT_LIGHT_COUNT, OBJECT_LIGHT_REACH) : null;
     // All shown while on (unused ones dark), all hidden while off: shaders
@@ -1452,11 +1448,13 @@ export class InstanceSceneView {
       if (cached) return cached;
       const standard = source as MeshStandardMaterial;
       const MaterialType = shaded ? MeshLambertMaterial : MeshBasicMaterial;
+      // Props are dimmed for the neutral look only (NEUTRAL_SCALE_FRAGMENT).
+      const neutralScale = shaded ? PROP_BRIGHTNESS : vertexLit ? 1 : UNLIT_BRIGHTNESS;
       const material = new MaterialType({
         name: source.name,
         map: standard.map ?? null,
         color: (standard.color ?? new Color(1, 1, 1)).clone()
-          .multiplyScalar(shaded ? PROP_BRIGHTNESS : exteriorLit || building ? 1 : vertexLit ? VERTEX_LIT_BRIGHTNESS : UNLIT_BRIGHTNESS),
+          .multiplyScalar(vertexLit && !exteriorLit && !building ? VERTEX_LIT_BRIGHTNESS : 1),
         opacity: source.opacity,
         vertexColors: vertexLit,
         side: source.side === DoubleSide ? DoubleSide : FrontSide,
@@ -1471,6 +1469,7 @@ export class InstanceSceneView {
         premultipliedAlpha: blend === 'mod' || blend === 'mod2x',
       });
       material.onBeforeCompile = injectPartyFade;
+      if (neutralScale !== 1) material.defines = { ...material.defines, WOW_NEUTRAL_SCALE: neutralScale.toFixed(2) };
       if (propLit) material.defines = { ...material.defines, WOW_PROP_LIGHT: '' };
       if (floor) onGround(material);
       if (building && light) {

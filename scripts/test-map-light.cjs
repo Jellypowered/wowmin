@@ -91,7 +91,7 @@ test('a band\'s colour at a time runs between its keys and wraps past midnight',
   assert.equal(light.timeOfDay(new Date(2026, 9, 12, 12, 0, 0)), 1440);
 });
 
-test('area lights count in full inside their inner radius and fade out to their outer, the default light filling the rest', () => {
+test('area lights count in full inside their inner radius and fade out to their outer, mixed over the default light', () => {
   const area = { id: 2, defaultLight: false, position: [0, 0, 0], inner: 10, outer: 20, direct: [[0, 0xffffff]], ambient: [[0, 0x000000]] };
   const fallback = { id: 1, defaultLight: true, position: null, inner: 0, outer: 0, direct: [[0, 0x000000]], ambient: [[0, 0xffffff]] };
   const map = { mapId: 1, lights: [area, fallback] };
@@ -103,9 +103,25 @@ test('area lights count in full inside their inner radius and fade out to their 
   near(between.direct[0], 0.5, 'direct');
   near(between.ambient[0], 0.5, 'ambient');
   assert.deepEqual(plain(light.lightAt(map, [100, 0, 0], 0)), { direct: [0, 0, 0], ambient: [1, 1, 1] });
-  // Overlapping lights are scaled to add up to one.
-  const twice = light.lightAt({ mapId: 1, lights: [area, { ...area, id: 3 }, fallback] }, [0, 0, 0], 0);
-  assert.deepEqual(plain(twice.direct), [1, 1, 1]);
+  // Overlapping lights are mixed in turn, the farthest first, not averaged:
+  // the nearer light (red, weight 0.5) over the farther (white, in full).
+  const nearer = { ...area, id: 3, position: [8, 0, 0], inner: 1, outer: 5, direct: [[0, 0xff0000]] };
+  const both = light.lightAt({ mapId: 1, lights: [nearer, area, fallback] }, [5, 0, 0], 0);
+  assert.equal(light.lightWeight(nearer, [5, 0, 0]), 0.5);
+  assert.deepEqual(plain(both.direct), [1, 0.5, 0.5]);
+  assert.deepEqual(plain(both.ambient), [0, 0, 0]);
+  // A nearer light in full hides the farther one.
+  const hidden = light.lightAt({ mapId: 1, lights: [area, { ...nearer, inner: 20, outer: 30 }, fallback] }, [5, 0, 0], 0);
+  assert.deepEqual(plain(hidden.direct), [1, 0, 0]);
+});
+
+test('a lit surface takes the ambient plus the direct light by N.L, capped at 1', () => {
+  const colors = { direct: [1, 0.5, 0], ambient: [0.2, 0.3, 0.4] };
+  const lit = light.litColor(colors, 0.5);
+  [0.7, 0.55, 0.4].forEach((expected, channel) => near(lit[channel], expected, `channel ${channel}`));
+  assert.deepEqual(plain(light.litColor(colors, -1)), [0.2, 0.3, 0.4]);
+  assert.deepEqual(plain(light.litColor({ direct: [3, 1, 1], ambient: [0.5, 0.5, 0.5] }, 0.25)), [0.75, 0.75, 0.75]);
+  assert.deepEqual(plain(light.litColor({ direct: [1, 1, 1], ambient: [0.5, 0.9, 1.4] }, 1)), [1, 1, 1]);
 });
 
 test('reads buildings\' and models\' point lights from their own bytes', async () => {

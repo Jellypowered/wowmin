@@ -27,13 +27,16 @@ const CHUNK_SIZE = TILE_SIZE / 16;
 // Ground textures repeat 8 times across a chunk.
 const TEXTURE_REPEAT = CHUNK_SIZE / 8;
 const LAYER_TEXTURE_SIZE = 256;
-// Under the scene's lights, a plain white diffuse is far too bright; this
-// brings the ground to about the client's level. Tuned by eye.
+// Under the neutral look's lights, a plain white diffuse is far too bright;
+// this brings the ground to about the client's level. Tuned by eye; the
+// client's light draws the ground at its own colour.
 const GROUND_BRIGHTNESS = 0.75;
 // Vertex shading stored as bytes (normalized, so 1.0 is 255) is centred on
 // 127 (MCCV_ONE in scripts/scene/terrain.mjs); older scenes stored floats
-// already centred on 1.
+// already centred on 1. The client doubles the bytes' value in its own
+// colour space, so under its light the shading is made linear first.
 export const BYTE_SHADING_SCALE = 255 / 127;
+const CLIENT_BYTE_SHADING_SCALE = 2;
 
 // Packs the map's ground textures into one texture array (resampled to one
 // size), in the order of their layer indices.
@@ -92,9 +95,19 @@ precision highp sampler2DArray;
 uniform sampler2DArray wowTerrainLayers;
 uniform sampler2D wowTerrainAlpha;
 uniform vec2 wowTileOrigin;
+uniform float wowShadingScale;
+uniform float wowClientShadingScale;
 varying vec4 vWowLayers;
 varying vec2 vWowCell;
 varying vec2 vWowServer;
+`;
+
+// The vertex shading, as the neutral look scales it or as the client does.
+const COLOR_FRAGMENT = `
+#ifdef USE_COLOR
+diffuseColor.rgb *= wowClientAmbientPacked.w > 0.5
+  ? pow(vColor.rgb * wowClientShadingScale, vec3(2.2)) : vColor.rgb * wowShadingScale;
+#endif
 `;
 
 const FRAGMENT = `
@@ -131,14 +144,18 @@ export function createTerrainMaterial({
   vertexShaded: boolean;
   // Multiplies the vertex shading: BYTE_SHADING_SCALE for byte colours.
   shadingScale?: number;
+  // Adds the party fade, and the client's light (whose block the shading
+  // reads, as does WOW_NEUTRAL_SCALE).
   partyFade: (shader: WebGLProgramParametersWithUniforms) => void;
 }): MeshLambertMaterial {
-  const brightness = GROUND_BRIGHTNESS * (vertexShaded ? shadingScale : 1);
-  const material = new MeshLambertMaterial({ color: new Color(brightness, brightness, brightness), vertexColors: vertexShaded });
+  const material = new MeshLambertMaterial({ color: new Color(1, 1, 1), vertexColors: vertexShaded });
+  material.defines = { WOW_NEUTRAL_SCALE: GROUND_BRIGHTNESS.toFixed(2) };
   const uniforms = {
     wowTerrainLayers: { value: layers },
     wowTerrainAlpha: { value: alpha },
     wowTileOrigin: { value: new Vector2(origin[0], origin[1]) },
+    wowShadingScale: { value: shadingScale },
+    wowClientShadingScale: { value: shadingScale === BYTE_SHADING_SCALE ? CLIENT_BYTE_SHADING_SCALE : 1 },
   };
   material.onBeforeCompile = (shader) => {
     partyFade(shader);
@@ -146,7 +163,8 @@ export function createTerrainMaterial({
     shader.vertexShader = VERTEX_DECLARATIONS + shader.vertexShader
       .replace('#include <begin_vertex>', `#include <begin_vertex>\n${VERTEX}`);
     shader.fragmentShader = FRAGMENT_DECLARATIONS + shader.fragmentShader
-      .replace('#include <map_fragment>', FRAGMENT);
+      .replace('#include <map_fragment>', FRAGMENT)
+      .replace('#include <color_fragment>', COLOR_FRAGMENT);
   };
   material.customProgramCacheKey = () => 'wow-terrain';
   return material;

@@ -72,8 +72,10 @@ export interface IndoorLook extends LightColors {
   outdoor: number;
 }
 
-// The map's light as the client lights models: ambient plus direct times
-// N.L, summed in the client's (gamma) colour space and then made linear.
+// The map's light as the client lights models: the ambient plus the direct
+// light (each channel at most 1) times N.L, the sum at most 1, in the
+// client's (gamma) colour space and then made linear (litColor in
+// map-light.ts).
 // The scene view sets these each frame; w is 1 while the client's light is
 // in use (else the scene's own three.js lights light the models).
 export const clientLight = {
@@ -100,8 +102,8 @@ const CLIENT_LIGHT_FRAGMENT = `
 if (wowLightAmbient.w > 0.5) {
   vec3 wowTowards = mix(wowLightDirection, wowSunDirection, wowLightDirect.w);
   wowTowards = dot(wowTowards, wowTowards) > 1e-6 ? normalize(wowTowards) : wowLightDirection;
-  vec3 wowLight = wowLightAmbient.rgb + wowLightDirect.rgb * saturate(dot(normal, wowTowards));
-  reflectedLight.indirectDiffuse += diffuseColor.rgb * pow(max(wowLight, vec3(0.0)), vec3(2.2));
+  vec3 wowLight = clamp(wowLightAmbient.rgb + min(wowLightDirect.rgb, vec3(1.0)) * saturate(dot(normal, wowTowards)), 0.0, 1.0);
+  reflectedLight.indirectDiffuse += diffuseColor.rgb * pow(wowLight, vec3(2.2));
 }
 `;
 interface ClientLightUniforms {
