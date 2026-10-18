@@ -31,6 +31,12 @@
     <label><input name="heal" type="checkbox"> Heal (target an ally)</label>
     <label>Speed <input name="rate" type="number" value="1" step="0.05" min="0.05"></label>
     <label><input name="glows" type="checkbox" checked> Level 1 glows</label>
+    <label>Lighting <select name="lighting" title="Neutral: the preview's own white light. Sky: the client's light of the map's sky at noon. Indoor: the client's light from a building's floor (Utgarde Keep's forge)">
+      <option value="neutral">Neutral</option>
+      <option value="sky">Sky at noon</option>
+      <option value="indoor">Indoor (forge floor)</option>
+    </select></label>
+    <label>Sky map <input name="lightMap" type="number" value="529" title="The map whose sky lights the preview, such as 529 for Arathi Basin"></label>
     <button type="submit">Play</button>
     <button type="button" data-preset='{"spell":116,"speed":28,"cast":1500}'>Frostbolt</button>
     <button type="button" data-preset='{"spell":133,"speed":24,"cast":1500}'>Fireball</button>

@@ -9,11 +9,16 @@ import {
 } from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
+import { serverToThree } from './instance-scene/iso-camera';
+import { skyEffectLight } from './instance-scene/m2-effect';
 import { SpellEffectLayer, type UnitAnchorRole } from './instance-scene/spell-effects';
 import { SpellVisualLayer } from './instance-scene/spell-visual-layer';
-import { type UnitModelPose, UnitModelLayer } from './instance-scene/unit-models';
+import { clientLight, type UnitModelPose, UnitModelLayer } from './instance-scene/unit-models';
 import type { StreamCombatEvent } from '../../src/types/api';
 import { PARTICLE_GROUND_DEPTH } from './utils/m2-tracks';
+import {
+  floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors, lightAt, type MapLights, type Rgb, sunDirection,
+} from './utils/map-light';
 import { CombatEffectStore, type Point3, type UnitKey, unitKey } from './utils/spell-events';
 
 // Spell preview (dev tool, /spell-preview): plays one spell on a loop between
@@ -22,7 +27,9 @@ import { CombatEffectStore, type Point3, type UnitKey, unitKey } from './utils/s
 // (ms; a channelled spell instead of a missile), bolt (a spell the channel
 // fires each second, flying at `speed`), area (radius), lasting (ms, a
 // lasting area), ground (the area on the target's ground), aura (ms the
-// spell's aura stays on the target), caster (a creature display), heal.
+// spell's aura stays on the target), caster (a creature display), heal,
+// lighting (neutral, sky: the client's light of lightMap's sky at noon, or
+// indoor: the client's light from Utgarde Keep's forge floor).
 //
 // Stress mode, from the query only: `stress=N` plays N casters, each with
 // its target and ally, on a ring, triple k playing preset k of `presets`
@@ -45,6 +52,12 @@ const STRESS_LOOP_OFFSET_MS = 400;
 const DEFAULT_STRESS_PRESETS = ['Frostbolt', 'Fireball', 'Shadow Bolt', 'Holy Light', 'Arcane Missiles', 'Consecration', 'Flamestrike', 'Immolate',
   'Renew', 'Power Word: Shield'];
 const STATS_INTERVAL_MS = 1000;
+// The client's lights the preview can show units and effects in: noon, and
+// the forge floor's vertex colour (Utgarde Keep, group 22843).
+const NOON = 1440;
+const FORGE_FLOOR: Rgb = [108 / 255, 80 / 255, 56 / 255];
+const NEUTRAL_AMBIENT = 2.2;
+const NEUTRAL_SUN = 1.6;
 
 // What one play of a spell is: the form's fields, or a preset's.
 interface Preset {
@@ -127,13 +140,14 @@ function addTriple(index: number, count: number, preset: Preset | null): void {
   urls.set(triple.ally, () => ALLY_URL);
   triples.push(triple);
 }
-for (const name of [...NUMBER_FIELDS, 'rate']) {
+for (const name of [...NUMBER_FIELDS, 'rate', 'lightMap']) {
   const value = params.get(name);
   if (value !== null) field(name).value = value;
 }
 if (params.has('heal')) field('heal').checked = params.get('heal') !== '0';
 if (params.has('ground')) field('ground').checked = params.get('ground') !== '0';
 if (params.has('glows')) field('glows').checked = params.get('glows') !== '0';
+if (params.has('lighting')) (form.elements.namedItem('lighting') as HTMLSelectElement).value = params.get('lighting')!;
 
 const stress = Math.max(0, Math.floor(Number(params.get('stress')) || 0));
 if (stress > 0) {
@@ -156,8 +170,9 @@ const renderer = new WebGLRenderer({ canvas, antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio || 1);
 const scene = new Scene();
 scene.background = new Color(0x0b1220);
-scene.add(new AmbientLight(0xffffff, 2.2));
-const sun = new DirectionalLight(0xffffff, 1.6);
+const ambientLight = new AmbientLight(0xffffff, NEUTRAL_AMBIENT);
+scene.add(ambientLight);
+const sun = new DirectionalLight(0xffffff, NEUTRAL_SUN);
 sun.position.set(0.4, 1, 0.6);
 scene.add(sun);
 // The ring's reach, for the floor and camera in stress mode.
@@ -327,6 +342,49 @@ function showStats(real: number): void {
   }
 }
 
+// The client's light the Lighting choice asks for, or null for neutral:
+// a map's light at noon at its biggest area light (its default light if it
+// has none), with the sun's way then, or the forge floor's indoor light.
+const mapLights = new Map<number, MapLights | null | 'loading'>();
+function chosenLight(): { colors: LightColors; towards: Point3 } | null {
+  const choice = (form.elements.namedItem('lighting') as HTMLSelectElement).value;
+  if (choice === 'indoor') {
+    return { colors: indoorLight(floorLight(FORGE_FLOOR)), towards: INDOOR_LIGHT_DIRECTION.map((value) => -value) as Point3 };
+  }
+  if (choice !== 'sky') return null;
+  const mapId = Number(field('lightMap').value) || 0;
+  const known = mapLights.get(mapId);
+  if (known === undefined) {
+    mapLights.set(mapId, 'loading');
+    fetch(`assets/models/light/${mapId}.json`).then((response) => (response.ok ? response.json() as Promise<MapLights> : null))
+      .catch(() => null).then((lights) => mapLights.set(mapId, lights));
+  }
+  if (!known || known === 'loading') return null;
+  const area = known.lights.filter((light) => light.position).sort((left, right) => right.outer - left.outer)[0];
+  return { colors: lightAt(known, area?.position ?? [0, 0, 0], NOON), towards: sunDirection(NOON).map((value) => -value) as Point3 };
+}
+
+// Lights units and effects by the choice: the client's light through the
+// models' shared uniforms and the effects' sky light, or the preview's own.
+function applyLighting(): void {
+  const chosen = chosenLight();
+  const on = chosen ? 1 : 0;
+  ambientLight.intensity = chosen ? 0 : NEUTRAL_AMBIENT;
+  sun.intensity = chosen ? 0 : NEUTRAL_SUN;
+  const ambient = chosen?.colors.ambient ?? [0, 0, 0];
+  const direct = chosen?.colors.direct ?? [0, 0, 0];
+  const towards = serverToThree(chosen?.towards ?? [0, 0, 1]).normalize();
+  clientLight.ambient.set(...ambient, on);
+  clientLight.direct.set(...direct, on);
+  skyEffectLight.ambient.set(...ambient, on);
+  skyEffectLight.direct.set(...direct, on);
+  skyEffectLight.upward = Math.max(0, towards.y);
+  towards.transformDirection(camera.matrixWorldInverse);
+  clientLight.sun.copy(towards);
+  clientLight.indoor.copy(towards);
+  skyEffectLight.towards.copy(towards);
+}
+
 function frame(): void {
   const real = performance.now();
   const rate = Math.max(0.05, Number(field('rate').value) || 1);
@@ -379,6 +437,8 @@ function frame(): void {
   }, camera, currentAuras(virtualNow));
   const aids = field('glows').checked;
   glows.update(store, virtualNow, anchor, (entry) => visuals.handles(entry), { glows: aids, circles: aids });
+  camera.updateMatrixWorld();
+  applyLighting();
   renderer.render(scene, camera);
   frameTimes.push(performance.now() - real);
   showStats(real);
