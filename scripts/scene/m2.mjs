@@ -6,6 +6,11 @@ import { M2Model, M2SkinProfile } from '@wowserhq/format';
 import { asBytes } from './chunks.mjs';
 
 export const M2_MATERIAL_FLAG_TWO_SIDED = 0x4;
+// The material flags that change how a batch is drawn (unlit, unfogged,
+// two-sided, no depth test, no depth write), which models carry for the
+// renderer; and the alpha below which an alpha-keyed batch is not drawn.
+export const M2_MATERIAL_FLAGS_DRAWN = 0x1F;
+export const M2_ALPHA_KEY_CUTOFF = 224 / 255;
 export const M2_TEXTURE_FLAG_WRAP_S = 0x1;
 export const M2_TEXTURE_FLAG_WRAP_T = 0x2;
 

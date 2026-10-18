@@ -134,7 +134,7 @@ test('builds a skinned GLB document: joints at pivots, every animated channel in
   };
   const sword = {
     positions: new Float32Array(9), normals: new Float32Array(9), uvs: new Float32Array(6), indices: Uint16Array.of(0, 1, 2),
-    batches: [{ indexStart: 0, indexCount: 3, blend: 0, materialFlags: 0, tint: [1, 1, 1], opacity: 1, textureType: 0, texture: null, textureFlags: 0 }],
+    batches: [{ indexStart: 0, indexCount: 3, blend: 1, materialFlags: 0x25, tint: [1, 1, 1], opacity: 1, textureType: 0, texture: null, textureFlags: 0 }],
   };
   const document = buildUnitDocument(model, {
     name: 'test',
@@ -147,6 +147,13 @@ test('builds a skinned GLB document: joints at pivots, every animated channel in
     points: [{ attachment: 22, bone: 1, position: [0.1, -0.4, 1.2] }, { attachment: 18, bone: 9, position: [0, 0, 2] }],
   });
   const root = document.getRoot();
+  // Materials carry the M2 flags that change how they are drawn (0x25 ->
+  // unlit and two-sided), and alpha keys are cut at the client's 224/255.
+  const [bodyMaterial, swordMaterial] = root.listMaterials();
+  assert.deepEqual(bodyMaterial.getExtras(), { wowBlend: 'opaque', wowMaterialFlags: 0 });
+  assert.deepEqual(swordMaterial.getExtras(), { wowBlend: 'alphaKey', wowMaterialFlags: 0x5 });
+  assert.equal(swordMaterial.getAlphaMode(), 'MASK');
+  near(swordMaterial.getAlphaCutoff(), 224 / 255, 'alpha key');
   const skin = root.listSkins()[0];
   assert.equal(skin.listJoints().length, 2);
   assert.deepEqual(skin.listJoints()[1].getTranslation(), [0, 0, 1.5]);

@@ -14,7 +14,7 @@ import { Document } from '@gltf-transform/core';
 import { M2Model, M2SkinProfile } from '@wowserhq/format';
 
 import { asBytes } from './chunks.mjs';
-import { IDENTITY_ROTATION, M2_BLEND, skinFileName } from './m2.mjs';
+import { IDENTITY_ROTATION, M2_BLEND, M2_MATERIAL_FLAGS_DRAWN, skinFileName } from './m2.mjs';
 import { boneChannelsFrom, expandSkinnedVertices, selectSequences } from './m2-skinned.mjs';
 import { parseParticleEmitters, parseRibbons } from './m2-effects.mjs';
 import { encodeTexture } from './textures.mjs';
@@ -255,8 +255,10 @@ function addEffectTree(document, buffer, effect, { name, textureFor, textureMax,
         .setDoubleSided(true)
         .setExtras({
           wowBlend: M2_BLEND[batch.blend] ?? 'opaque',
-          // The M2 material's blend number, read by the client's table.
+          // The M2 material's blend number, read by the client's table, and
+          // the flags that change how it is drawn.
           wowBlendMode: batch.blend,
+          wowMaterialFlags: batch.materialFlags & M2_MATERIAL_FLAGS_DRAWN,
           wowTexture: textureMaterials[batch.textureIndex] ?? null,
           wowColor: exportTrack(batch.color, effect.clips),
           wowAlpha: exportTrack(batch.alpha, effect.clips),

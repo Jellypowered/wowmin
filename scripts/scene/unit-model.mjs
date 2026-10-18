@@ -7,7 +7,7 @@ import path from 'node:path';
 import { Document, NodeIO, TextureInfo } from '@gltf-transform/core';
 
 import {
-  IDENTITY_ROTATION, M2_BLEND, M2_MATERIAL_FLAG_TWO_SIDED, M2_TEXTURE_FLAG_WRAP_S, M2_TEXTURE_FLAG_WRAP_T, RELEASE_EVENTS,
+  IDENTITY_ROTATION, M2_ALPHA_KEY_CUTOFF, M2_BLEND, M2_MATERIAL_FLAG_TWO_SIDED, M2_MATERIAL_FLAGS_DRAWN, M2_TEXTURE_FLAG_WRAP_S, M2_TEXTURE_FLAG_WRAP_T, RELEASE_EVENTS,
 } from './m2.mjs';
 import { loadSkinnedM2 } from './m2-skinned.mjs';
 import {
@@ -126,8 +126,8 @@ export function buildUnitDocument(model, {
         .setRoughnessFactor(1)
         .setBaseColorFactor([...batch.tint, batch.opacity])
         .setDoubleSided(Boolean(batch.materialFlags & M2_MATERIAL_FLAG_TWO_SIDED))
-        .setExtras({ wowBlend: blend });
-      if (blend === 'alphaKey') material.setAlphaMode('MASK').setAlphaCutoff(0.5);
+        .setExtras({ wowBlend: blend, wowMaterialFlags: batch.materialFlags & M2_MATERIAL_FLAGS_DRAWN });
+      if (blend === 'alphaKey') material.setAlphaMode('MASK').setAlphaCutoff(M2_ALPHA_KEY_CUTOFF);
       else if (blend !== 'opaque' || batch.opacity < 1) material.setAlphaMode('BLEND');
       const image = texture(batch.textureIndex);
       if (image) {
@@ -169,8 +169,8 @@ export function buildUnitDocument(model, {
         .setRoughnessFactor(1)
         .setBaseColorFactor([...batch.tint, batch.opacity])
         .setDoubleSided(Boolean(batch.materialFlags & M2_MATERIAL_FLAG_TWO_SIDED))
-        .setExtras({ wowBlend: blend });
-      if (blend === 'alphaKey') material.setAlphaMode('MASK').setAlphaCutoff(0.5);
+        .setExtras({ wowBlend: blend, wowMaterialFlags: batch.materialFlags & M2_MATERIAL_FLAGS_DRAWN });
+      if (blend === 'alphaKey') material.setAlphaMode('MASK').setAlphaCutoff(M2_ALPHA_KEY_CUTOFF);
       else if (blend !== 'opaque' || batch.opacity < 1) material.setAlphaMode('BLEND');
       const source = attachment.textureFor(batch);
       if (source) {

@@ -298,6 +298,39 @@ export function materialBlend(type: number): EffectBlend {
   }
 }
 
+// An M2 material's flags as the client reads them: 0x1 unlit, 0x2 unfogged,
+// 0x4 two-sided, 0x8 no depth test, 0x10 no depth write.
+export const M2_MATERIAL_UNLIT = 0x1;
+export const M2_MATERIAL_NO_DEPTH_TEST = 0x8;
+export const M2_MATERIAL_NO_DEPTH_WRITE = 0x10;
+
+// How the client draws an M2 batch: lit by the light where its model is
+// unless its material says unlit or it modulates (mod and mod2x never are);
+// mod and mod2x ignore the colour track, drawing white (mod2x at half, as
+// its blend doubles); depth tested and written as its flags say (written
+// only by opaque and alpha-keyed batches).
+export interface M2MaterialLight {
+  lit: boolean;
+  color: number | null;
+  depthTest: boolean;
+  depthWrite: boolean;
+}
+
+export function m2MaterialLight(blend: EffectBlend, flags: number): M2MaterialLight {
+  const modulates = blend === 'mod' || blend === 'mod2x';
+  return {
+    lit: !modulates && !(flags & M2_MATERIAL_UNLIT),
+    color: blend === 'mod' ? 1 : blend === 'mod2x' ? 0.5 : null,
+    depthTest: !(flags & M2_MATERIAL_NO_DEPTH_TEST),
+    depthWrite: (blend === 'opaque' || blend === 'alphaKey') && !(flags & M2_MATERIAL_NO_DEPTH_WRITE),
+  };
+}
+
+// A particle emitter's flag 0x1: its particles are unlit; without it they
+// take the light where their model is.
+const PARTICLE_UNLIT = 0x1;
+export const particlesLit = (flags: number): boolean => !(flags & PARTICLE_UNLIT);
+
 export type Matrix3Elements = [number, number, number, number, number, number, number, number, number];
 
 // A texture's UV transform as the client builds it, row-major for a 3x3

@@ -33,6 +33,8 @@ import {
   SrcColorFactor,
   type Texture,
   Vector3,
+  Vector4,
+  type WebGLProgramParametersWithUniforms,
   ZeroFactor,
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
@@ -49,8 +51,10 @@ import {
   evalTrackInto,
   type ExportedTrack,
   type LifeCurve,
+  m2MaterialLight,
   materialBlend,
   particleBlend,
+  particlesLit,
   particleSteps,
   signedRandom,
   type SpawnParams,
@@ -61,6 +65,7 @@ import {
   uvMatrix,
   type Vec3,
 } from '../utils/m2-tracks';
+import { litColor, type Rgb } from '../utils/map-light';
 import { EPSILON } from '../utils/vec3';
 
 // Plays one of the client's spell effect models (built by
@@ -343,6 +348,56 @@ function applyBlend(material: MeshBasicMaterial, blend: EffectBlend): void {
   }
 }
 
+// The light an effect's lit batches and particles take: its unit's own,
+// or the sky's where it has none (skyEffectLight, which the scene view
+// keeps). Ambient and direct in the client's colour space (ambient's w 1
+// while the client's light is on), the way to the light in view space, and
+// how squarely it shines on a surface facing straight up (particles').
+export interface EffectLight {
+  ambient: Vector4;
+  direct: Vector4;
+  towards: Vector3;
+  upward: number;
+}
+
+export const skyEffectLight: EffectLight = { ambient: new Vector4(), direct: new Vector4(), towards: new Vector3(0, 1, 0), upward: 1 };
+
+// A lit batch (m2MaterialLight) as the client lights it: the ambient plus
+// the direct light by N.L, at most 1, in its colour space, then linear.
+// Effects are skinned, so their view-space normal is to hand.
+const LIT_VERTEX_DECLARATIONS = 'varying vec3 vWowEffectNormal;\n';
+const LIT_VERTEX = `
+#if defined( USE_ENVMAP ) || defined( USE_SKINNING )
+vWowEffectNormal = normalize(transformedNormal);
+#else
+vWowEffectNormal = normalize(normalMatrix * normal);
+#endif
+`;
+const LIT_FRAGMENT_DECLARATIONS = `varying vec3 vWowEffectNormal;
+uniform vec4 wowEffectAmbient;
+uniform vec4 wowEffectDirect;
+uniform vec3 wowEffectTowards;
+`;
+const LIT_FRAGMENT = `
+if (wowEffectAmbient.w > 0.5) {
+  vec3 wowLight = clamp(wowEffectAmbient.rgb
+    + min(wowEffectDirect.rgb, vec3(1.0)) * saturate(dot(normalize(vWowEffectNormal), wowEffectTowards)), 0.0, 1.0);
+  diffuseColor.rgb *= pow(wowLight, vec3(2.2));
+}
+`;
+interface EffectLightUniforms {
+  wowEffectAmbient: { value: Vector4 };
+  wowEffectDirect: { value: Vector4 };
+  wowEffectTowards: { value: Vector3 };
+}
+function injectEffectLight(this: Material, shader: WebGLProgramParametersWithUniforms): void {
+  Object.assign(shader.uniforms, this.userData.wowEffectLight as EffectLightUniforms);
+  shader.vertexShader = LIT_VERTEX_DECLARATIONS + shader.vertexShader
+    .replace('#include <project_vertex>', `#include <project_vertex>\n${LIT_VERTEX}`);
+  shader.fragmentShader = LIT_FRAGMENT_DECLARATIONS + shader.fragmentShader
+    .replace('#include <color_fragment>', `#include <color_fragment>\n${LIT_FRAGMENT}`);
+}
+
 // A dynamic batch of quads: four vertices each, with position, uv, colour.
 // It holds `capacity` quads to start with and grows, up to `maxCapacity`,
 // as `begin` asks.
@@ -590,6 +645,8 @@ interface AnimatedMaterial {
   material: MeshBasicMaterial;
   // Whether its map is its own copy, for its UV tracks to move.
   ownsMap: boolean;
+  // The colour it is drawn in whatever its track says (mod, mod2x), or null.
+  forcedColor: number | null;
   color: ExportedTrack | null;
   alpha: ExportedTrack | null;
   weight: ExportedTrack | null;
@@ -721,6 +778,8 @@ const curveScratch = [0, 0, 0, 0];
 const valueScratch = [0];
 const uvScratch: [number, number, number, number] = [0, 0, 0, 0];
 const colorScratch: [number, number, number, number] = [0, 0, 0, 0];
+const forcedScratch: [number, number, number] = [1, 1, 1];
+const particleLightScratch: Rgb = [1, 1, 1];
 const cornerScratch: Vec3[] = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
 const centerScratch: Vec3 = [0, 0, 0];
 const velocityScratch: Vec3 = [0, 0, 0];
@@ -852,6 +911,14 @@ export class EffectInstance {
   // Colour and opacity it is drawn in on top of its own, as a model
   // particle is by its particle's.
   private readonly tint: [number, number, number, number] = [1, 1, 1, 1];
+  // The light its lit batches and particles take, and its lit batches'
+  // uniforms, which follow it.
+  private light: EffectLight = skyEffectLight;
+  private readonly lightUniforms: EffectLightUniforms = {
+    wowEffectAmbient: { value: skyEffectLight.ambient },
+    wowEffectDirect: { value: skyEffectLight.direct },
+    wowEffectTowards: { value: skyEffectLight.towards },
+  };
 
   constructor(private readonly template: EffectTemplate, now: number, private readonly loop: boolean,
     private readonly missile: MissileClips | null = null, birth = false) {
@@ -1030,6 +1097,14 @@ export class EffectInstance {
   }
 
   // Draws it in this colour and opacity on top of its own.
+  // The light it takes from now on: its unit's, or null for the sky's.
+  setLight(light: EffectLight | null): void {
+    this.light = light ?? skyEffectLight;
+    this.lightUniforms.wowEffectAmbient.value = this.light.ambient;
+    this.lightUniforms.wowEffectDirect.value = this.light.direct;
+    this.lightUniforms.wowEffectTowards.value = this.light.towards;
+  }
+
   setTint(red: number, green: number, blue: number, alpha: number): void {
     const tint = this.tint;
     tint[0] = red;
@@ -1063,11 +1138,24 @@ export class EffectInstance {
     const ownsMap = Boolean(texture && (extras.wowUvTranslation || extras.wowUvRotation || extras.wowUvScaling));
     const map = texture ? (ownsMap ? copyTexture(texture) : texture) : null;
     const material = new MeshBasicMaterial({ map, side: DoubleSide, forceSinglePass: true });
-    applyBlend(material, typeof extras.wowBlendMode === 'number' ? materialBlend(extras.wowBlendMode) : geometryBlend(extras.wowBlend));
+    const blend = typeof extras.wowBlendMode === 'number' ? materialBlend(extras.wowBlendMode) : geometryBlend(extras.wowBlend);
+    applyBlend(material, blend);
+    // Lit, depth and colour as the material's flags say; art built before
+    // materials carried them is all unlit.
+    const flags = extras.wowMaterialFlags as number | undefined;
+    const rule = m2MaterialLight(blend, flags ?? 0);
+    material.depthTest = rule.depthTest;
+    material.depthWrite = rule.depthWrite;
+    if (rule.lit && flags !== undefined) {
+      material.userData.wowEffectLight = this.lightUniforms;
+      material.onBeforeCompile = injectEffectLight;
+      material.customProgramCacheKey = () => 'wow-effect-lit';
+    }
     mesh.material = material;
     this.materials.push({
       material,
       ownsMap,
+      forcedColor: rule.color,
       color: extras.wowColor ?? null,
       alpha: extras.wowAlpha ?? null,
       weight: extras.wowWeight ?? null,
@@ -1080,7 +1168,8 @@ export class EffectInstance {
   private animateMaterials(clock: TrackClock): void {
     const tint = this.tint;
     for (const animated of this.materials) {
-      const color = evalTrackInto(animated.color, 3, clock, curveScratch) ? curveScratch : WHITE;
+      const forced = animated.forcedColor;
+      const color = forced !== null ? forcedScratch.fill(forced) : evalTrackInto(animated.color, 3, clock, curveScratch) ? curveScratch : WHITE;
       animated.material.color.setRGB(color[0] * tint[0], color[1] * tint[1], color[2] * tint[2]);
       const alpha = trackValue(animated.alpha, clock, 1) * trackValue(animated.weight, clock, 1) * tint[3];
       animated.material.opacity = Math.min(1, Math.max(0, alpha));
@@ -1414,6 +1503,7 @@ export class EffectInstance {
       const fraction = particle.age / particleLife(emitter, particle.lifeSeed);
       const [red, green, blue, alpha] = particleColorInto(colorScratch, def, fraction, Math.floor);
       model.setTint(red, green, blue, alpha);
+      model.setLight(this.light === skyEffectLight ? null : this.light);
       const scaled = evalLifeCurveInto(def.scale, 2, fraction, curveScratch);
       const sizeScale = twinkleScale * (!local && flags & FLAG_MODEL_SCALE ? frameScale : 1);
       const sx = (scaled ? curveScratch[0] : 1) * sizeScale;
@@ -1426,6 +1516,19 @@ export class EffectInstance {
       particleScale.toArray(placement.stretch!);
       model.update(this.lastAt, placement, view, layer, budget);
     }
+  }
+
+  // The light a lit emitter's particles take (the client gives them a
+  // normal straight up), or null for an unlit one or while the client's
+  // light is off.
+  private particleLight(flags: number): Rgb | null {
+    const light = this.light;
+    if (!particlesLit(flags) || light.ambient.w < 0.5) return null;
+    const [r, g, b] = litColor({ ambient: [light.ambient.x, light.ambient.y, light.ambient.z], direct: [light.direct.x, light.direct.y, light.direct.z] }, light.upward);
+    particleLightScratch[0] = r;
+    particleLightScratch[1] = g;
+    particleLightScratch[2] = b;
+    return particleLightScratch;
   }
 
   // Each particle as the client builds it: a quad facing the screen (or
@@ -1462,11 +1565,14 @@ export class EffectInstance {
     const planeX = local ? normalizeInto(planeXScratch, linearInto(planeXScratch, frameLinear, X_AXIS)) : X_AXIS;
     const planeY = local ? normalizeInto(planeYScratch, linearInto(planeYScratch, frameLinear, Y_AXIS)) : Y_AXIS;
     const color = colorScratch;
+    // A lit emitter's particles take the light on a surface facing up.
+    const lit = this.particleLight(flags);
     for (const particle of particles) {
       const { shown, scale: twinkleScale } = particleTwinkleInto(twinkleScratch, def, particle);
       if (!shown) continue;
       const fraction = particle.age / particleLife(emitter, particle.lifeSeed);
       particleColorInto(color, def, fraction, Math.round);
+      if (lit) for (let channel = 0; channel < 3; channel += 1) color[channel] *= lit[channel];
       const scaled = evalLifeCurveInto(def.scale, 2, fraction, curveScratch);
       const sizeScale = twinkleScale * (flags & FLAG_MODEL_SCALE ? frameScale : 1);
       const sx = (scaled ? curveScratch[0] : 1) * particle.scaleX * sizeScale;

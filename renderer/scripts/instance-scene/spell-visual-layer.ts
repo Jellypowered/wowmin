@@ -7,7 +7,7 @@ import {
 } from '../utils/spell-events';
 import { type ChainDraw, ChainLightning } from './chain-lightning';
 import { useServerAxes } from './iso-camera';
-import { EffectInstance, type EffectPlacement, type EffectTemplate, EffectTemplateCache, type EffectView, getEffectView, type MissileClips } from './m2-effect';
+import { EffectInstance, type EffectLight, type EffectPlacement, type EffectTemplate, EffectTemplateCache, type EffectView, getEffectView, type MissileClips } from './m2-effect';
 import { WeaponTrails } from './weapon-trails';
 import type { UnitAnchor } from './spell-effects';
 import type { UnitLook } from './unit-models';
@@ -57,6 +57,8 @@ export interface UnitInfo {
   attachmentTurn: (unit: UnitKey, attachment: number, out: Quaternion) => Quaternion | null;
   // How the client sizes spell effects on a drawn unit's model, or null.
   effectScales: (unit: UnitKey) => EffectScales | null;
+  // The light a unit's effects take (its own), or null for the sky's.
+  light: (unit: UnitKey) => EffectLight | null;
 }
 
 // Animations a unit should play for its spells: a loop while casting or
@@ -69,6 +71,8 @@ export interface KitAnimation {
 
 interface PlayingEffect {
   instance: EffectInstance;
+  // The unit it plays on, whose light it takes; null for the sky's.
+  owner: UnitKey | null;
   // Where it is this frame, or null to stay where it was.
   place: (now: number) => EffectPlacement | null;
   // When it stops emitting (ms, delayed clock); null to stop when told.
@@ -157,6 +161,7 @@ export class SpellVisualLayer {
     anchor: () => null, attachment: () => null, isDrawn: () => false, scale: () => 1, height: () => DEFAULT_UNIT_HEIGHT, facing: () => 0, ground: (center) => center,
     releaseMs: () => null, intersect: () => null, blades: () => [], creatureTypeFlags: () => 0, attachmentTurn: () => null,
     effectScales: () => null,
+    light: () => null,
   };
   private readonly chains: ChainLightning;
   private readonly trails = new WeaponTrails();
@@ -378,6 +383,7 @@ export class SpellVisualLayer {
       const placement = effect.place(now) ?? effect.last;
       if (placement) {
         effect.last = placement;
+        effect.instance.setLight(effect.owner === null ? null : this.units.light(effect.owner));
         effect.instance.update(now, placement, view, this.group, budget);
       }
       if (effect.instance.done || (!placement && effect.instance.stopped)) {
@@ -476,10 +482,10 @@ export class SpellVisualLayer {
   }
 
   private play(template: EffectTemplate, now: number, loop: boolean, place: PlayingEffect['place'], missile: MissileClips | null = null,
-    birth = false): PlayingEffect {
+    birth = false, owner: UnitKey | null = null): PlayingEffect {
     const instance = new EffectInstance(template, now, loop, missile, birth);
     this.group.add(instance.root, instance.particles);
-    const effect: PlayingEffect = { instance, place, stopAt: null, last: null };
+    const effect: PlayingEffect = { instance, owner, place, stopAt: null, last: null };
     this.playing.push(effect);
     return effect;
   }
@@ -524,7 +530,7 @@ export class SpellVisualLayer {
         const quaternion = onModel ? this.layerTurn(this.units.attachmentTurn(unit, attachment!, attachmentQuaternion)) : null;
         const scale = unitEffectScale(effect, this.units.scale(unit), this.units.effectScales(unit), attachment === null);
         return point ? { position: point, yaw: this.units.facing(unit), quaternion, turn, scale } : null;
-      });
+      }, null, false, unit);
       if (!loop) playing.stopAt = now + playing.instance.duration;
       return [playing];
     });

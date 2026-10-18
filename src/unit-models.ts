@@ -21,7 +21,8 @@ const BUILD_TIMEOUT_MS = 60000;
 // 9: sitting on the ground (SitGroundDown, SitGround, SitGroundUp).
 // 10: every attachment and release event as an effect point, release times,
 // more kit clips, weapon blades for swing trails, and effect scales.
-export const UNIT_MODEL_CACHE_VERSION = 10;
+// 11: materials carry their M2 flags (unlit, depth), alpha keyed at 224/255.
+export const UNIT_MODEL_CACHE_VERSION = 11;
 // Spell art (effect models and spell lookups) changes more often than unit
 // models, so it has its own version and folder, art-v<version>/, and can be
 // rebuilt without rebuilding every unit.
@@ -40,7 +41,8 @@ export const UNIT_MODEL_CACHE_VERSION = 10;
 // 10: effect tracks short of a clip's sequence take the first one's keys.
 // 11: bone tracks on a loop of no length hold their first key.
 // 12: map lights carry only models' point lights, without fade distances.
-export const SPELL_ART_CACHE_VERSION = 12;
+// 13: effect and game object materials carry their M2 flags (unlit, depth).
+export const SPELL_ART_CACHE_VERSION = 13;
 const SPELL_ART_KINDS = new Set<UnitModelRequest['kind']>(['effect', 'visual', 'spell', 'icon', 'gameobject', 'light']);
 const EXTENSIONS: Partial<Record<UnitModelRequest['kind'], string>> = { visual: 'json', spell: 'json', icon: 'png', light: 'json' };
 // A look that could not be built is not retried for this long.

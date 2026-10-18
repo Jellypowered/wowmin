@@ -11,7 +11,9 @@ import { Document, NodeIO, TextureInfo } from '@gltf-transform/core';
 import { EXTMeshGPUInstancing, EXTMeshoptCompression } from '@gltf-transform/extensions';
 import { MeshoptEncoder } from 'meshoptimizer';
 
-import { loadM2, M2_BLEND, M2_MATERIAL_FLAG_TWO_SIDED, M2_TEXTURE_FLAG_WRAP_S, M2_TEXTURE_FLAG_WRAP_T } from './m2.mjs';
+import {
+  loadM2, M2_ALPHA_KEY_CUTOFF, M2_BLEND, M2_MATERIAL_FLAG_TWO_SIDED, M2_MATERIAL_FLAGS_DRAWN, M2_TEXTURE_FLAG_WRAP_S, M2_TEXTURE_FLAG_WRAP_T,
+} from './m2.mjs';
 import { dedupeByUniqueId, readAdtPlacements, readWdt, rotateByQuaternion } from './placement.mjs';
 import { PNG } from 'pngjs';
 
@@ -344,15 +346,21 @@ class SceneBuilder {
   }
 
   // `mapObjFlags`: a building material's MOMT flags (0x1 unlit, 0x20
-  // window), which choose the light the client draws it with.
-  material(name, { texture, blend, doubleSided, wrapS, wrapT, tint = [1, 1, 1], opacity = 1, mapObjFlags }) {
+  // window), which choose the light the client draws it with; `m2Flags` a
+  // prop's material flags (M2_MATERIAL_FLAGS_DRAWN), which say whether it is
+  // lit and how it takes depth. A prop's alpha key is the client's.
+  material(name, { texture, blend, doubleSided, wrapS, wrapT, tint = [1, 1, 1], opacity = 1, mapObjFlags, m2Flags }) {
     const material = this.document.createMaterial(name)
       .setMetallicFactor(0)
       .setRoughnessFactor(1)
       .setBaseColorFactor([...tint, opacity])
       .setDoubleSided(doubleSided)
-      .setExtras({ wowBlend: blend, ...(mapObjFlags ? { wowMapObjFlags: mapObjFlags } : {}) });
-    if (blend === 'alphaKey') material.setAlphaMode('MASK').setAlphaCutoff(0.5);
+      .setExtras({
+        wowBlend: blend,
+        ...(mapObjFlags ? { wowMapObjFlags: mapObjFlags } : {}),
+        ...(m2Flags === undefined ? {} : { wowMaterialFlags: m2Flags }),
+      });
+    if (blend === 'alphaKey') material.setAlphaMode('MASK').setAlphaCutoff(m2Flags === undefined ? 0.5 : M2_ALPHA_KEY_CUTOFF);
     else if (blend !== 'opaque' || opacity < 1) material.setAlphaMode('BLEND');
     const image = this.texture(texture);
     if (image) {
@@ -436,6 +444,7 @@ class SceneBuilder {
             wrapT: Boolean(batch.textureFlags & M2_TEXTURE_FLAG_WRAP_T),
             tint: batch.tint,
             opacity: batch.opacity,
+            m2Flags: batch.materialFlags & M2_MATERIAL_FLAGS_DRAWN,
           }));
         }
         mesh.addPrimitive(this.document.createPrimitive()

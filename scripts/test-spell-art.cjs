@@ -314,6 +314,17 @@ test('spawns particles as the client\'s emitters do, and counts emission', () =>
   assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 7].map(tracks.particleBlend),
     ['opaque', 'alphaKey', 'alpha', 'addColor', 'add', 'mod', 'mod2x', 'opaque']);
   assert.deepEqual([0, 1, 2, 3, 4, 5, 6].map(tracks.materialBlend), ['opaque', 'alphaKey', 'alpha', 'addColor', 'add', 'mod', 'mod2x']);
+  // Lit unless unlit (0x1) or modulating; mod and mod2x draw white (mod2x
+  // at half) whatever their colour; depth by the flags (0x8, 0x10).
+  const light = (blend, flags) => JSON.parse(JSON.stringify(tracks.m2MaterialLight(tracks.materialBlend(blend), flags)));
+  assert.deepEqual(light(0, 0), { lit: true, color: null, depthTest: true, depthWrite: true });
+  assert.deepEqual(light(0, 0x1), { lit: false, color: null, depthTest: true, depthWrite: true });
+  assert.deepEqual(light(1, 0x10), { lit: true, color: null, depthTest: true, depthWrite: false });
+  assert.deepEqual(light(3, 0), { lit: true, color: null, depthTest: true, depthWrite: false });
+  assert.deepEqual(light(4, 0x8), { lit: true, color: null, depthTest: false, depthWrite: false });
+  assert.deepEqual(light(5, 0), { lit: false, color: 1, depthTest: true, depthWrite: false });
+  assert.deepEqual(light(6, 0), { lit: false, color: 0.5, depthTest: true, depthWrite: false });
+  assert.deepEqual([0, 0x1, 0x8, 0x9].map(tracks.particlesLit), [true, false, true, false]);
   // Twinkle reads a fixed table of 128 numbers in [0, 1).
   assert.equal(tracks.TWINKLE_TABLE.length, 128);
   assert.ok(tracks.TWINKLE_TABLE.every((value) => value >= 0 && value < 1));

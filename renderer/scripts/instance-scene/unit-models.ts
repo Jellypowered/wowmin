@@ -7,7 +7,9 @@ import {
   Box3,
   BufferGeometry,
   Color,
+  CustomBlending,
   DoubleSide,
+  DstColorFactor,
   Float32BufferAttribute,
   FrontSide,
   Group,
@@ -26,17 +28,20 @@ import {
   RingGeometry,
   Skeleton,
   SkinnedMesh,
+  SrcColorFactor,
   Sphere,
   Vector3,
   Vector4,
   type WebGLProgramParametersWithUniforms,
   DetachedBindMode,
+  ZeroFactor,
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 import type { LightColors } from '../utils/map-light';
+import { type EffectBlend, m2MaterialLight } from '../utils/m2-tracks';
 import type { Point3, StrikeKind } from '../utils/spell-events';
 import type { EffectScales } from '../utils/spell-kits';
 import {
@@ -183,14 +188,19 @@ export interface UnitModelPose {
   wmoGroupId?: number;
 }
 
-// A unit's own copy of a shared material, keeping the client's light.
+// A unit's own copy of a shared material, keeping the client's light on
+// a lit one.
 function copyMaterial(material: Material): Material {
   const copy = material.clone();
+  if (!material.userData.wowLight) return copy;
   copy.userData.wowLight = sharedLightUniforms();
   copy.userData.wowOwnLight = { ambient: new Vector4(), direct: new Vector4() };
   copy.onBeforeCompile = injectClientLight;
   return copy;
 }
+
+// The client's alpha key for models.
+const ALPHA_KEY_REFERENCE = 224 / 255;
 
 // The id a rider's mount is drawn under.
 const mountUnitId = (riderId: string): string => `${riderId}#mount`;
@@ -1038,18 +1048,22 @@ export class UnitModelLayer {
       const copies = Array.isArray(object.material) ? object.material : [object.material];
       copies.forEach((copy, index) => {
         const source = originals[index];
-        if (!(copy instanceof MeshLambertMaterial) || !(source instanceof MeshLambertMaterial)) return;
-        // The unit's own light, from the fixed indoor direction leaning
-        // towards the sun's by its share; else the map's, shared.
-        const uniforms = copy.userData.wowLight as ClientLightUniforms;
-        const values = copy.userData.wowOwnLight as { ambient: Vector4; direct: Vector4 };
-        if (own) {
-          values.ambient.set(...own.ambient, 1);
-          values.direct.set(...own.direct, own.outdoor);
+        if (!(copy instanceof MeshLambertMaterial || copy instanceof MeshBasicMaterial)
+          || !(source instanceof MeshLambertMaterial || source instanceof MeshBasicMaterial)) return;
+        // A lit material takes the unit's own light, from the fixed indoor
+        // direction leaning towards the sun's by its share; else the map's,
+        // shared.
+        const uniforms = copy.userData.wowLight as ClientLightUniforms | undefined;
+        if (uniforms) {
+          const values = copy.userData.wowOwnLight as { ambient: Vector4; direct: Vector4 };
+          if (own) {
+            values.ambient.set(...own.ambient, 1);
+            values.direct.set(...own.direct, own.outdoor);
+          }
+          uniforms.wowLightAmbient.value = own ? values.ambient : clientLight.ambient;
+          uniforms.wowLightDirect.value = own ? values.direct : clientLight.direct;
+          uniforms.wowLightDirection.value = own ? clientLight.indoor : clientLight.sun;
         }
-        uniforms.wowLightAmbient.value = own ? values.ambient : clientLight.ambient;
-        uniforms.wowLightDirect.value = own ? values.direct : clientLight.direct;
-        uniforms.wowLightDirection.value = own ? clientLight.indoor : clientLight.sun;
         copy.color.copy(source.color).multiply(tintColor);
         copy.opacity = source.opacity * look.alpha;
         const seeThrough = copy.opacity < 1;
@@ -1062,27 +1076,38 @@ export class UnitModelLayer {
     });
   }
 
-  // Lit, so models keep their shape; the scene itself is unlit.
+  // As the client draws a model's batch (m2MaterialLight): lit by the
+  // client's light, or full bright where its material is unlit or it
+  // modulates the colour behind it (mod, mod2x, in white whatever their
+  // colour). Models built before their materials carried flags are all lit
+  // but the modulating ones.
   private convertMaterial(source: MeshStandardMaterial, modelAlpha = 1): Material {
     const cached = this.materials.get(source.uuid);
     if (cached) return cached;
-    const blend = (source.userData.wowBlend ?? 'opaque') as string;
+    const blend = (source.userData.wowBlend ?? 'opaque') as EffectBlend;
+    const rule = m2MaterialLight(blend, (source.userData.wowMaterialFlags as number | undefined) ?? 0);
     const opacity = source.opacity * modelAlpha;
-    const material = new MeshLambertMaterial({
+    const parameters = {
       name: source.name,
       map: source.map ?? null,
-      color: source.color.clone(),
+      color: rule.color === null ? source.color.clone() : new Color(rule.color, rule.color, rule.color),
       opacity,
       side: source.side === DoubleSide ? DoubleSide : FrontSide,
       // One pass for both faces, as the client draws them (see scene-view.ts).
       forceSinglePass: true,
-      alphaTest: blend === 'alphaKey' ? 0.5 : 0,
+      alphaTest: blend === 'alphaKey' ? ALPHA_KEY_REFERENCE : 0,
       transparent: (blend !== 'opaque' && blend !== 'alphaKey') || opacity < 1,
-      depthWrite: (blend === 'opaque' || blend === 'alphaKey') && opacity >= 1,
-      blending: blend === 'add' ? AdditiveBlending : NormalBlending,
-    });
-    material.userData.wowLight = sharedLightUniforms();
-    material.onBeforeCompile = injectClientLight;
+      depthWrite: rule.depthWrite && opacity >= 1,
+      depthTest: rule.depthTest,
+      blending: blend === 'add' ? AdditiveBlending : blend === 'mod' || blend === 'mod2x' ? CustomBlending : NormalBlending,
+      blendSrc: DstColorFactor,
+      blendDst: blend === 'mod2x' ? SrcColorFactor : ZeroFactor,
+    };
+    const material = rule.lit ? new MeshLambertMaterial(parameters) : new MeshBasicMaterial(parameters);
+    if (rule.lit) {
+      material.userData.wowLight = sharedLightUniforms();
+      material.onBeforeCompile = injectClientLight;
+    }
     this.materials.set(source.uuid, material);
     return material;
   }
