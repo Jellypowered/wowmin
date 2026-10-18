@@ -12,6 +12,7 @@ import { locateDataDir, openClientData } from './client-archives.mjs';
 import { buildMapCatalog } from './map-catalog.mjs';
 import { assertNpmValueOptionsHaveValues, readNpmConfigBoolean, readNpmConfigValue } from './npm-config.mjs';
 import { exportMapScene } from './scene/export-scene.mjs';
+import { loadSettingsEnv } from './settings-env.mjs';
 
 export const SCENE_SCHEMA_VERSION = 1;
 
@@ -23,7 +24,8 @@ Usage:
   npm run extract:scenes --source=/path/to/WoW --all-instances
 
 Options:
-  --source, -s        WoW client root or its Data directory
+  --source, -s        WoW client root or its Data directory (default:
+                      WOWMIN_CLIENT_DATA, from the environment or .env)
   --output, -o        Output directory (default: assets/instances)
   --map, -m           Export only these map IDs (repeatable)
   --all-instances     Export every instance, raid, battleground, and arena from Map.dbc
@@ -34,12 +36,13 @@ Options:
 const NPM_VALUE_OPTIONS = ['source', 'output', 'map', 'scene_texture_max'];
 
 // Arguments after a standalone --, or npm config options (--source=/path)
-// when npm took them itself.
-export function parseSceneArgs(argv) {
+// when npm took them itself; the client data folder falls back to the
+// settings' WOWMIN_CLIENT_DATA (`env`).
+export function parseSceneArgs(argv, env = process.env) {
   assertNpmValueOptionsHaveValues(NPM_VALUE_OPTIONS);
   const npmMaps = readNpmConfigValue('map');
   const options = {
-    source: readNpmConfigValue('source') ?? null,
+    source: readNpmConfigValue('source') ?? (env.WOWMIN_CLIENT_DATA || null),
     output: readNpmConfigValue('output') ?? 'assets/instances',
     mapIds: npmMaps ? npmMaps.split(',').map(Number) : [],
     allInstances: readNpmConfigBoolean('all_instances') ?? false,
@@ -64,7 +67,7 @@ export function parseSceneArgs(argv) {
     }
   }
   if (options.help) return options;
-  if (!options.source) throw new Error('Missing required --source argument.');
+  if (!options.source) throw new Error('Missing required --source argument (or WOWMIN_CLIENT_DATA in .env).');
   if (!options.mapIds.length && !options.allInstances) throw new Error('Pass --map <id> or --all-instances.');
   if (options.mapIds.length && options.allInstances) throw new Error('--map and --all-instances are mutually exclusive.');
   if (options.mapIds.some((mapId) => !Number.isInteger(mapId) || mapId < 0)) {
@@ -89,6 +92,7 @@ export function sceneManifest(map, scene) {
 }
 
 async function main() {
+  loadSettingsEnv();
   const options = parseSceneArgs(process.argv.slice(2));
   if (options.help) {
     console.log(USAGE);
