@@ -38,9 +38,11 @@ import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.j
 
 import { type FadeSettings, type FadeVolume, getSceneFade, type IsoView, MAX_FADE_VOLUMES } from '../utils/map-projection';
 import {
-  blendLight, type BuildingBatchLight, buildingBatchLight, characterAmbientScale, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors,
-  lightAt, type MapLights, nearestObjectLights, type ObjectLight, scaleAmbient, type Rgb, sunDirection, timeOfDay,
+  blendLight, type BuildingBatchLight, buildingBatchLight, characterAmbientScale, DIRECT_SCALE_INDOORS, DIRECT_SCALE_LIT,
+  DIRECT_SCALE_SHADOWED, type EasedLight, easeLight, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors,
+  lightAt, type MapLights, nearestObjectLights, type ObjectLight, scaleAmbient, type Rgb, sunDirection, timeOfDay, transitionDirectScale,
 } from '../utils/map-light';
+import { ATLAS_SIZE, TerrainShadows } from '../utils/terrain-shadow';
 import { PARTICLE_GROUND_DEPTH } from '../utils/m2-tracks';
 import { type FaceCulling, TriangleGrid } from '../utils/triangle-grid';
 import type { CombatEffectStore, Point3, UnitKey } from '../utils/spell-events';
@@ -239,10 +241,10 @@ varying vec3 vWowView;
 varying vec3 vWowNormal;
 #endif
 #ifdef WOW_PROP_LIGHT
-attribute vec2 wowPropKind;
+attribute vec3 wowPropKind;
 attribute vec3 wowPropDirect;
 attribute vec3 wowPropAmbient;
-varying vec2 vWowPropKind;
+varying vec3 vWowPropKind;
 varying vec3 vWowPropDirect;
 varying vec3 vWowPropAmbient;
 #endif
@@ -293,7 +295,7 @@ ${pointLightFunction('wowPointLight', 'wowPointPositionPacked', 'wowPointColorPa
 varying vec3 vWowPosition;
 varying vec3 vWowView;
 #ifdef WOW_PROP_LIGHT
-varying vec2 vWowPropKind;
+varying vec3 vWowPropKind;
 varying vec3 vWowPropDirect;
 varying vec3 vWowPropAmbient;
 #endif
@@ -345,7 +347,8 @@ float wowVolumeFade(int index) {
 // sum. A building's props have their own light (applyPropLight): indoors
 // (kind 0) the floor's direct and ambient light from the indoor light's
 // direction, leaning towards the sky's light and the sun by their share;
-// elsewhere (1) the map's light as its own props have.
+// elsewhere (1) the map's light; the direct light halved for a prop
+// outdoors standing in the ground's baked shadow (the map's props too).
 const CLIENT_LIGHT_FRAGMENT = `
 if (wowClientAmbientPacked.w > 0.5) {
   vec3 wowAmbient = wowClientAmbientPacked.rgb;
@@ -359,6 +362,7 @@ if (wowClientAmbientPacked.w > 0.5) {
     wowTowards = mix(wowClientIndoorPacked.xyz, wowClientSunPacked.xyz, wowShare);
     wowTowards = dot(wowTowards, wowTowards) > 1e-6 ? normalize(wowTowards) : wowClientSunPacked.xyz;
   }
+  wowDirect *= vWowPropKind.z;
 #endif
   vec3 wowLight = clamp(wowAmbient + min(wowDirect, vec3(1.0)) * saturate(dot(normal, wowTowards))
     + wowPointLight(vWowView, normal), 0.0, 1.0);
@@ -474,7 +478,8 @@ function propFloors(mesh: Mesh): ArrayLike<number> | null {
 }
 
 // Gives a building's prop its light per instance, on its own copy of the
-// geometry (the buffers are shared): wowPropKind is [kind, share] and
+// geometry (the buffers are shared): wowPropKind is [kind, share, direct
+// scale] and
 // wowPropDirect and wowPropAmbient the floor's light (see
 // CLIENT_LIGHT_FRAGMENT). Worked out once per prop; each primitive gets its
 // own copy, as culling repacks each one's copies (chooseVisible), and keeps
@@ -491,21 +496,78 @@ const propLights = new WeakMap<object, PropLight>();
 
 function propLight(floors: ArrayLike<number>): PropLight {
   const count = floors.length / 4;
-  const kind = new Float32Array(count * 2);
+  const kind = new Float32Array(count * 3);
   const direct = new Float32Array(count * 3);
   const ambient = new Float32Array(count * 3);
   for (let index = 0; index < count; index += 1) {
     const [r, g, b, share] = [floors[index * 4], floors[index * 4 + 1], floors[index * 4 + 2], floors[index * 4 + 3]];
     if (r < 0) {
-      kind.set([1, 1], index * 2);
+      kind.set([1, 1, 1], index * 3);
     } else {
       const light = indoorLight([r, g, b]);
-      kind.set([0, share], index * 2);
+      kind.set([0, share, 1], index * 3);
       direct.set(light.direct, index * 3);
       ambient.set(light.ambient, index * 3);
     }
   }
   return { kind, direct, ambient };
+}
+
+// The map's own props light as a building's outdoor ones do: one 'outdoor'
+// floor per copy, shared by the node's primitives.
+const outdoorFloors = new WeakMap<Object3D, Float32Array>();
+function worldPropFloors(mesh: Mesh): Float32Array {
+  const node = mesh instanceof InstancedMesh || mesh.userData.kind === 'doodad' ? mesh : mesh.parent ?? mesh;
+  let floors = outdoorFloors.get(node);
+  if (!floors) {
+    const count = mesh instanceof InstancedMesh ? mesh.instanceMatrix.count : 1;
+    floors = new Float32Array(count * 4);
+    for (let index = 0; index < count; index += 1) floors[index * 4] = -1;
+    outdoorFloors.set(node, floors);
+  }
+  return floors;
+}
+
+// Halves the direct light of a scene's outdoor props standing in the
+// ground's baked shadow, as the client fixes it when it places them.
+const propPoint = new Vector3();
+const propMatrix = new Matrix4();
+function shadeProps(root: Object3D, shadows: TerrainShadows): void {
+  root.traverse((object) => {
+    const light = object.userData.wowPropLight as PropLight | undefined;
+    if (!(object instanceof Mesh) || !light) return;
+    const count = light.kind.length / 3;
+    for (let index = 0; index < count; index += 1) {
+      if (light.kind[index * 3] < 0.5) continue;
+      if (object instanceof InstancedMesh) {
+        propMatrix.fromArray(object.instanceMatrix.array, index * 16).premultiply(object.matrixWorld);
+        propPoint.setFromMatrixPosition(propMatrix);
+      } else {
+        propPoint.setFromMatrixPosition(object.matrixWorld);
+      }
+      const [x, y] = threeToServer(propPoint);
+      light.kind[index * 3 + 2] = shadows.isShadowed(x, y) ? DIRECT_SCALE_SHADOWED : 1;
+    }
+    const attribute = object.geometry.getAttribute('wowPropKind') as InstancedBufferAttribute;
+    (attribute.array as Float32Array).set(light.kind);
+    attribute.needsUpdate = true;
+  });
+}
+
+// A tile's alpha atlas's alpha channel, read back from its image.
+function atlasAlpha(texture: Texture): Uint8Array | null {
+  const image = texture.image as CanvasImageSource | undefined;
+  if (!image) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = ATLAS_SIZE;
+  canvas.height = ATLAS_SIZE;
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) return null;
+  context.drawImage(image, 0, 0, ATLAS_SIZE, ATLAS_SIZE);
+  const pixels = context.getImageData(0, 0, ATLAS_SIZE, ATLAS_SIZE).data;
+  const alpha = new Uint8Array(ATLAS_SIZE * ATLAS_SIZE);
+  for (let index = 0; index < alpha.length; index += 1) alpha[index] = pixels[index * 4 + 3];
+  return alpha;
 }
 
 function applyPropLight(mesh: Mesh, floors: ArrayLike<number>): void {
@@ -520,7 +582,7 @@ function applyPropLight(mesh: Mesh, floors: ArrayLike<number>): void {
   geometry.boundingSphere = source.boundingSphere?.clone() ?? null;
   geometry.setDrawRange(source.drawRange.start, source.drawRange.count);
   geometry.userData = source.userData;
-  geometry.setAttribute('wowPropKind', new InstancedBufferAttribute(light.kind.slice(), 2));
+  geometry.setAttribute('wowPropKind', new InstancedBufferAttribute(light.kind.slice(), 3));
   geometry.setAttribute('wowPropDirect', new InstancedBufferAttribute(light.direct.slice(), 3));
   geometry.setAttribute('wowPropAmbient', new InstancedBufferAttribute(light.ambient.slice(), 3));
   mesh.userData.wowPropLight = light;
@@ -740,6 +802,14 @@ export class InstanceSceneView {
   private unitSkyLight: LightColors = { direct: [0, 0, 0], ambient: [0, 0, 0] };
   // Transition faces by batch, as sets (from the light file's lists).
   private readonly transitionSets = new WeakMap<number[], Set<number>>();
+  // Each scene's ground shadow, by position.
+  private readonly shadows = new WeakMap<Object3D, TerrainShadows>();
+  // Where each unit drawn last stands (server coordinates), and its light
+  // as it eases towards the light where it stands, with when it was last
+  // eased (performance.now, ms).
+  private readonly unitPoints = new Map<string, Point3>();
+  private readonly easedLights = new Map<string, EasedLight>();
+  private easedAt = 0;
   // The server point at the centre of the last frame drawn, and the view's
   // frustum, for the units' animation budget.
   private lastViewCentre: Point3 | null = null;
@@ -826,6 +896,14 @@ export class InstanceSceneView {
     return count;
   }
 
+  // Units whose sun the ground's baked shadow halves (or is halving), for
+  // ?debug.
+  get shadowedCount(): number {
+    let count = 0;
+    for (const [id, light] of this.easedLights) if (light.directScale < 1 && !this.indoorLights.get(id)?.light) count += 1;
+    return count;
+  }
+
   // Samples the indoor light of units standing in an interior WMO group (as
   // the client does: the floor's baked colour under them), within a budget
   // a frame and only once they have moved; drops it for the rest.
@@ -833,7 +911,9 @@ export class InstanceSceneView {
     const interiors = this.lighting === 'client' && this.shown ? this.interiors.get(this.shown) : undefined;
     const indoors = new Set<string>();
     let budget = INDOOR_SAMPLES_PER_FRAME;
+    this.unitPoints.clear();
     for (const pose of poses) {
+      this.unitPoints.set(pose.id, [pose.x, pose.y, pose.z]);
       const groupId = pose.wmoGroupId ?? -1;
       const meshes = interiors?.get(groupId);
       const group = this.mapLights?.interiors?.[groupId];
@@ -932,14 +1012,7 @@ export class InstanceSceneView {
     };
     this.spellVisuals.update(store, now, units, this.camera, auras);
     const looks = this.spellVisuals.unitLooks(now);
-    const ambientScale = characterAmbientScale(this.mapLights?.ambientMultiplier);
-    for (const [id, { light, outdoor }] of this.indoorLights) {
-      if (!light) continue;
-      const look: UnitLook = looks.get(id) ?? { color: null, alpha: 1 };
-      const own = { direct: light.direct, ambient: scaleAmbient(light.ambient, ambientScale) };
-      look.indoor = { ...(outdoor > 0 ? blendLight(own, this.unitSkyLight, outdoor) : own), outdoor };
-      looks.set(id, look);
-    }
+    this.lightUnits(looks);
     this.units.setLooks(looks);
     this.effects.update(store, now, anchor,
       (entry) => this.spellVisuals.handles(entry) && !('radius' in entry && isTaunt(entry.spellId)), aids);
@@ -948,6 +1021,48 @@ export class InstanceSceneView {
     // One more frame after the last effect ends, to clear it.
     this.effectsShown = count > 0 || before > 0;
     return count;
+  }
+
+  // Gives units their own light where it is not the map's light every unit
+  // outdoors shares, as the client lights them: indoors the floor's (towards
+  // the sky's on a transition face), outdoors the sky's with the sun halved
+  // in the ground's baked shadow, each easing towards where it should be
+  // (easeLight). A unit seen for the first time starts there.
+  private lightUnits(looks: Map<string, UnitLook>): void {
+    const nowMs = performance.now();
+    const seconds = Math.min(0.25, Math.max(0, (nowMs - this.easedAt) / 1000));
+    this.easedAt = nowMs;
+    if (this.lighting !== 'client' || !this.mapLights) {
+      this.easedLights.clear();
+      return;
+    }
+    const shadows = this.shown ? this.shadows.get(this.shown) : undefined;
+    const ambientScale = characterAmbientScale(this.mapLights.ambientMultiplier);
+    const sky = this.unitSkyLight;
+    for (const [id, [x, y]] of this.unitPoints) {
+      const indoor = this.indoorLights.get(id);
+      let lit: LightColors = sky;
+      let share = 1;
+      let target: EasedLight;
+      if (indoor?.light) {
+        const own = { direct: indoor.light.direct, ambient: scaleAmbient(indoor.light.ambient, ambientScale) };
+        lit = indoor.outdoor > 0 ? blendLight(own, sky, indoor.outdoor) : own;
+        share = indoor.outdoor;
+        target = { ambient: lit.ambient, directScale: indoor.outdoor > 0 ? transitionDirectScale(indoor.outdoor) : DIRECT_SCALE_INDOORS };
+      } else {
+        target = { ambient: sky.ambient, directScale: shadows?.isShadowed(x, y) ? DIRECT_SCALE_SHADOWED : DIRECT_SCALE_LIT };
+      }
+      const known = this.easedLights.get(id);
+      const eased = known ? easeLight(known, target, seconds) : { ambient: target.ambient, directScale: Math.min(1, target.directScale) };
+      this.easedLights.set(id, eased);
+      const shared = !indoor?.light && eased.directScale >= 1
+        && eased.ambient.every((value, channel) => Math.abs(value - sky.ambient[channel]) < 1 / 512);
+      if (shared) continue;
+      const look: UnitLook = looks.get(id) ?? { color: null, alpha: 1 };
+      look.light = { ambient: eased.ambient, direct: lit.direct.map((value) => value * eased.directScale) as Rgb, outdoor: share };
+      looks.set(id, look);
+    }
+    for (const id of this.easedLights.keys()) if (!this.unitPoints.has(id)) this.easedLights.delete(id);
   }
 
   // Where a falling model aimed at `target` lands, searched from `center`:
@@ -1103,6 +1218,13 @@ export class InstanceSceneView {
       const frames = await this.liquidFrames(gltf);
       const liquids: Array<{ material: MeshBasicMaterial; frames: Texture[] }> = [];
       numberBuildingBatches(root);
+      // The ground's baked shadow, from each tile's alpha atlas.
+      const shadows = new TerrainShadows();
+      root.traverse((object) => {
+        const material = object instanceof Mesh ? object.material as Material : null;
+        const alpha = material?.userData.wowTerrain ? terrain?.alphas.get(material.userData.alpha as string) : undefined;
+        if (alpha) shadows.addTile(material!.userData.origin as [number, number], () => atlasAlpha(alpha));
+      });
       root.traverse((object) => {
         if (!(object instanceof Mesh)) return;
         // Interior groups' floors are for indoor light only, never drawn.
@@ -1125,6 +1247,8 @@ export class InstanceSceneView {
       });
       if (liquids.length) this.liquids.set(url, liquids);
       root.updateMatrixWorld(true);
+      this.shadows.set(root, shadows);
+      shadeProps(root, shadows);
       const bounds: MeshBounds[] = [];
       const fitted = new WeakSet<BufferGeometry>();
       root.traverse((object) => {
@@ -1306,7 +1430,7 @@ export class InstanceSceneView {
       // A building's prop's light follows its copies into their new slots.
       const light = mesh.userData.wowPropLight as PropLight | undefined;
       if (light) {
-        for (const [name, source, size] of [['wowPropKind', light.kind, 2], ['wowPropDirect', light.direct, 3], ['wowPropAmbient', light.ambient, 3]] as const) {
+        for (const [name, source, size] of [['wowPropKind', light.kind, 3], ['wowPropDirect', light.direct, 3], ['wowPropAmbient', light.ambient, 3]] as const) {
           const attribute = mesh.geometry.getAttribute(name) as InstancedBufferAttribute;
           const target = attribute.array as Float32Array;
           for (let slot = 0; slot < count; slot += 1) {
@@ -1450,7 +1574,7 @@ export class InstanceSceneView {
     const exteriorLit = vertexLit && isExteriorGroup(mesh);
     const building = vertexLit ? buildingBatch(mesh) : null;
     const inBuilding = building !== null || buildingBatch(mesh) !== null;
-    const floors = vertexLit ? null : propFloors(mesh);
+    const floors = vertexLit ? null : propFloors(mesh) ?? (isWorldProp(mesh) ? worldPropFloors(mesh) : null);
     if (floors && !mesh.geometry.getAttribute('wowPropKind')) applyPropLight(mesh, floors);
     const propLightReady = Boolean(floors);
     const convert = (source: Material): Material => {

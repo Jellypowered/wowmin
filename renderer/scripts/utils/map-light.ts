@@ -206,6 +206,36 @@ export function blendLight(indoor: LightColors, outdoor: LightColors, share: num
   return { direct: mix(indoor.direct, outdoor.direct), ambient: mix(indoor.ambient, outdoor.ambient) };
 }
 
+// How strongly a unit takes its direct light: outdoors the client aims at
+// 2.5 (in effect 1, as the scale never passes 1) or 0.5 where the ground's
+// baked shadow lies under it; indoors 1, or 1 + 1.5 x the floor's alpha on
+// a transition face.
+export const DIRECT_SCALE_LIT = 2.5;
+export const DIRECT_SCALE_SHADOWED = 0.5;
+export const DIRECT_SCALE_INDOORS = 1;
+export const transitionDirectScale = (share: number): number => 1 + 1.5 * share;
+
+// A unit's light eases towards where it should be rather than jumping: its
+// ambient by up to this much a second on each channel (2 x 255 in the
+// client's bytes), its direct scale by this much, never above 1.
+export const AMBIENT_EASE_PER_SECOND = 2;
+export const DIRECT_SCALE_EASE_PER_SECOND = 10 / 3;
+
+export interface EasedLight {
+  ambient: Rgb;
+  directScale: number;
+}
+
+const toward = (from: number, to: number, step: number): number => (from < to ? Math.min(to, from + step) : Math.max(to, from - step));
+
+export function easeLight(current: EasedLight, target: EasedLight, seconds: number): EasedLight {
+  const step = AMBIENT_EASE_PER_SECOND * seconds;
+  return {
+    ambient: current.ambient.map((value, channel) => toward(value, target.ambient[channel], step)) as Rgb,
+    directScale: Math.min(1, toward(current.directScale, target.directScale, DIRECT_SCALE_EASE_PER_SECOND * seconds)),
+  };
+}
+
 export function indoorLight(floor: Rgb): LightColors {
   const brightest = Math.max(floor[0], floor[1], floor[2]) || 1 / 255;
   const scale = (factor: number): Rgb => [floor[0] * factor, floor[1] * factor, floor[2] * factor];

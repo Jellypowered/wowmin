@@ -57,19 +57,22 @@ const PET_OVERSIZED_DISPLAY_SCALE = 2;
 
 // How a unit's spells' kits change its model: a colour it is multiplied by
 // (0xRRGGBB, null for none) and how see-through it is (1 opaque); and its
-// light indoors (the building's on the floor under it; none outdoors).
+// own light, where it is not the map's as every unit outdoors shares it
+// (indoors, the building's on the floor under it; outdoors, in the
+// ground's shadow or still easing towards the map's).
 export interface UnitLook {
   color: number | null;
   alpha: number;
-  indoor?: IndoorLook;
+  light?: UnitLight;
   // Its animation held still (a kit's freeze): at this time into its loop
   // (ms), or where it is when null.
   freeze?: { atMs: number | null } | null;
 }
 
-// A unit's light indoors, and how far its light's direction leans from the
-// indoor light's towards the sun's (0 to 1; on a transition face).
-export interface IndoorLook extends LightColors {
+// A unit's own light, and how far its light's direction leans from the
+// indoor light's towards the sun's (0 to 1: 1 outdoors, between on a
+// transition face).
+export interface UnitLight extends LightColors {
   outdoor: number;
 }
 
@@ -89,7 +92,7 @@ export const clientLight = {
 };
 
 // The client's light on a lit model material: the uniforms come from the
-// material (shared ones, or a unit's own indoors), and the props' point
+// material (shared ones, or a unit's own), and the props' point
 // lights join the sum indoors and out. The scene's three.js ambient and sun
 // are dark while it is on.
 const CLIENT_LIGHT_DECLARATIONS = `
@@ -184,7 +187,7 @@ export interface UnitModelPose {
 function copyMaterial(material: Material): Material {
   const copy = material.clone();
   copy.userData.wowLight = sharedLightUniforms();
-  copy.userData.wowIndoor = { ambient: new Vector4(), direct: new Vector4() };
+  copy.userData.wowOwnLight = { ambient: new Vector4(), direct: new Vector4() };
   copy.onBeforeCompile = injectClientLight;
   return copy;
 }
@@ -1009,9 +1012,9 @@ export class UnitModelLayer {
   // Multiplies the unit's materials by a colour and an opacity, on copies
   // of the shared ones, or puts the shared ones back.
   private setLook(unit: UnitInstance, look: UnitLook | null): void {
-    const plain = !look || (look.color === null && look.alpha >= 1 && !look.indoor);
-    const indoor = look?.indoor ?? null;
-    const key = plain ? '' : `${look.color}|${look.alpha.toFixed(3)}|${indoor ? [...indoor.ambient, ...indoor.direct, indoor.outdoor].map((value) => value.toFixed(2)).join(',') : ''}`;
+    const plain = !look || (look.color === null && look.alpha >= 1 && !look.light);
+    const own = look?.light ?? null;
+    const key = plain ? '' : `${look.color}|${look.alpha.toFixed(3)}|${own ? [...own.ambient, ...own.direct, own.outdoor].map((value) => value.toFixed(3)).join(',') : ''}`;
     if (unit.look === key) return;
     unit.look = key;
     if (plain) {
@@ -1036,18 +1039,17 @@ export class UnitModelLayer {
       copies.forEach((copy, index) => {
         const source = originals[index];
         if (!(copy instanceof MeshLambertMaterial) || !(source instanceof MeshLambertMaterial)) return;
-        // Indoors the unit's own light, from the fixed indoor direction
-        // (leaning towards the sun's by its share); outdoors the map's,
-        // shared.
+        // The unit's own light, from the fixed indoor direction leaning
+        // towards the sun's by its share; else the map's, shared.
         const uniforms = copy.userData.wowLight as ClientLightUniforms;
-        const own = copy.userData.wowIndoor as { ambient: Vector4; direct: Vector4 };
-        if (indoor) {
-          own.ambient.set(...indoor.ambient, 1);
-          own.direct.set(...indoor.direct, indoor.outdoor);
+        const values = copy.userData.wowOwnLight as { ambient: Vector4; direct: Vector4 };
+        if (own) {
+          values.ambient.set(...own.ambient, 1);
+          values.direct.set(...own.direct, own.outdoor);
         }
-        uniforms.wowLightAmbient.value = indoor ? own.ambient : clientLight.ambient;
-        uniforms.wowLightDirect.value = indoor ? own.direct : clientLight.direct;
-        uniforms.wowLightDirection.value = indoor ? clientLight.indoor : clientLight.sun;
+        uniforms.wowLightAmbient.value = own ? values.ambient : clientLight.ambient;
+        uniforms.wowLightDirect.value = own ? values.direct : clientLight.direct;
+        uniforms.wowLightDirection.value = own ? clientLight.indoor : clientLight.sun;
         copy.color.copy(source.color).multiply(tintColor);
         copy.opacity = source.opacity * look.alpha;
         const seeThrough = copy.opacity < 1;

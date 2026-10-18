@@ -31,6 +31,10 @@ const LAYER_TEXTURE_SIZE = 256;
 // this brings the ground to about the client's level. Tuned by eye; the
 // client's light draws the ground at its own colour.
 const GROUND_BRIGHTNESS = 0.75;
+// The atlas's light in baked shadow (SHADOW_LIGHT in scripts/scene/
+// terrain.mjs, out of 255), and how dark the client draws shadowed ground.
+const SHADOW_LIGHT = 150 / 255;
+const CLIENT_SHADOW = 0.7;
 // Vertex shading stored as bytes (normalized, so 1.0 is 255) is centred on
 // 127 (MCCV_ONE in scripts/scene/terrain.mjs); older scenes stored floats
 // already centred on 1. The client doubles the bytes' value in its own
@@ -126,7 +130,12 @@ const FRAGMENT = `
   if (used.y) ground = mix(ground, texture(wowTerrainLayers, vec3(repeatUv, layers.y)).rgb, splat.r);
   if (used.z) ground = mix(ground, texture(wowTerrainLayers, vec3(repeatUv, layers.z)).rgb, splat.g);
   if (used.w) ground = mix(ground, texture(wowTerrainLayers, vec3(repeatUv, layers.w)).rgb, splat.b);
-  diffuseColor.rgb *= ground * splat.a;
+  // The baked shadow: the neutral look darkens by the atlas's light as it
+  // is; the client's light takes 0.7 in shadow and 1 in light, in its own
+  // colour space.
+  float wowLit = clamp((splat.a - ${SHADOW_LIGHT.toFixed(6)}) / ${(1 - SHADOW_LIGHT).toFixed(6)}, 0.0, 1.0);
+  diffuseColor.rgb *= ground * (wowClientAmbientPacked.w > 0.5
+    ? pow(vec3(${CLIENT_SHADOW.toFixed(2)} + ${(1 - CLIENT_SHADOW).toFixed(2)} * wowLit), vec3(2.2)) : vec3(splat.a));
 }
 `;
 
