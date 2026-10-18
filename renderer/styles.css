@@ -3974,6 +3974,32 @@ tbody tr:hover { background: var(--tint-accent-05); }
   pointer-events: none;
 }
 .instance-debug-overlay[hidden] { display: none; }
+/* An older (or newer) scene export than WoWMin's, over the 3D view. */
+.instance-scene-notice {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 32px);
+  padding: 6px 8px 6px 12px;
+  border: 1px solid rgba(251, 191, 36, 0.5);
+  border-radius: 4px;
+  background: rgba(3, 10, 18, 0.85);
+  color: #fde68a;
+  font-size: 12px;
+}
+.instance-scene-notice[hidden] { display: none; }
+.instance-scene-notice button {
+  border: 0;
+  background: none;
+  color: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
 #instance-watch-canvas.panning { cursor: grabbing; }
 .instance-watch-empty {
   position: absolute;

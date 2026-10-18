@@ -1304,6 +1304,10 @@ SELECT * FROM creature_template WHERE entry = 1;" spellcheck="false"></textarea>
           <canvas id="instance-watch-scene" class="instance-watch-scene" hidden></canvas>
           <canvas id="instance-watch-canvas" tabindex="0"></canvas>
           <pre id="instance-debug-overlay" class="instance-debug-overlay" hidden></pre>
+          <div id="instance-scene-notice" class="instance-scene-notice" role="status" hidden>
+            <span id="instance-scene-notice-text"></span>
+            <button type="button" aria-label="Dismiss">&times;</button>
+          </div>
           <div id="instance-view-controls" class="map-zoom-controls instance-view-controls hidden">
             <button id="instance-rotate-left-btn" class="btn btn-tiny" title="Rotate left (Q). Middle-drag or Shift+drag to rotate and tilt freely." aria-label="Rotate view left">⟲</button>
             <button id="instance-rotate-right-btn" class="btn btn-tiny" title="Rotate right (E). Middle-drag or Shift+drag to rotate and tilt freely." aria-label="Rotate view right">⟳</button>

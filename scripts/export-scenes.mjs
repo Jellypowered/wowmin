@@ -14,6 +14,11 @@ import { assertNpmValueOptionsHaveValues, readNpmConfigBoolean, readNpmConfigVal
 import { exportMapScene } from './scene/export-scene.mjs';
 
 export const SCENE_SCHEMA_VERSION = 1;
+// The scenes' contents' version, written into each manifest so WoWMin can
+// tell older and newer exports from its own: SCENE_EXPORT_VERSION in
+// src/scene-export-version.ts (which lists what each changed), kept equal
+// by a test. Bump both when the export changes how a scene is drawn.
+export const SCENE_EXPORT_VERSION = 1;
 
 const USAGE = `WoW Admin 3D scene exporter
 
@@ -80,6 +85,7 @@ export function parseSceneArgs(argv) {
 export function sceneManifest(map, scene) {
   return {
     schemaVersion: SCENE_SCHEMA_VERSION,
+    exportVersion: SCENE_EXPORT_VERSION,
     mapId: map.mapId,
     label: map.label,
     mapType: map.mapType ?? null,

@@ -6,6 +6,7 @@ import * as fs from 'fs';
 import { createServer, IncomingMessage, ServerResponse } from 'http';
 import * as path from 'path';
 import { inspectLocalLogs, readLocalLogTail } from './local-logs';
+import { sceneExportAdvice } from './scene-export-version';
 import { parseUnitModelPath, UnitModels } from './unit-models';
 import { buildContentSecurityPolicy, deriveDungeonClearUrl, normalizeDungeonClearUrl } from './dungeon-clear-config';
 import type { DbConfig, SoapConfig } from './types/api';
@@ -153,6 +154,27 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
     chunks.push(buffer);
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+}
+
+// Says at startup when the 3D scenes on disk come from an older (or newer)
+// export than this WoWMin draws, and what to run.
+async function reportSceneExports(directory: string): Promise<void> {
+  let names: string[];
+  try {
+    names = (await fs.promises.readdir(directory)).filter((name) => /^\d+\.scene\.json$/.test(name));
+  } catch {
+    return;
+  }
+  const versions = await Promise.all(names.map(async (name) => {
+    try {
+      const manifest = JSON.parse(await fs.promises.readFile(path.join(directory, name), 'utf8')) as { exportVersion?: number };
+      return manifest.exportVersion;
+    } catch {
+      return undefined;
+    }
+  }));
+  const advice = sceneExportAdvice(versions);
+  if (advice) console.warn(advice);
 }
 
 function resolveStaticFile(urlPath: string): string | null {
@@ -381,6 +403,7 @@ if (managed) {
 }
 server.listen(port, host, () => {
   console.log(`WoW Admin web service listening on http://${host}:${port}`);
+  void reportSceneExports(path.join(assetsRoot, 'instances'));
 });
 
 let shuttingDown = false;
