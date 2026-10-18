@@ -20,6 +20,7 @@ import { readDbc } from './dbc.mjs';
 import { adtLiquidSurfaces, firstTileType, liquidSurface, liquidTypeInfo, mapLiquidColours, wmoLiquidType } from './liquids.mjs';
 import { encodeTexture } from './textures.mjs';
 import {
+  floorFaces,
   loadWmo,
   propFloor,
   selectDoodadIndices,
@@ -27,6 +28,7 @@ import {
   WMO_MATERIAL_FLAG_WINDOW,
   WMO_ROOT_FLAG_UNIFIED,
   WMO_GROUP_FLAG_EXTERIOR,
+  WMO_GROUP_FLAG_EXTERIOR_LIT,
   WMO_MATERIAL_FLAG_CLAMP_S,
   WMO_MATERIAL_FLAG_CLAMP_T,
   WMO_MATERIAL_FLAG_UNCULLED,
@@ -378,6 +380,8 @@ class SceneBuilder {
       const normal = this.accessor('VEC3', group.normals);
       const uv = this.accessor('VEC2', group.uvs);
       const color = group.colors ? this.accessor('VEC4', bgraToRgba(group.colors), true) : null;
+      const floors = color && !(group.flags & (WMO_GROUP_FLAG_EXTERIOR | WMO_GROUP_FLAG_EXTERIOR_LIT))
+        ? this.wmoFloorMeshes(`${path.basename(rootName)}_${group.index}`, group, position, color) : [];
       for (const batch of group.batches) {
         const primitive = this.document.createPrimitive()
           .setAttribute('POSITION', position)
@@ -388,7 +392,24 @@ class SceneBuilder {
         if (color) primitive.setAttribute('COLOR_0', color);
         mesh.addPrimitive(primitive);
       }
-      return mesh;
+      return { mesh, floors };
+    });
+  }
+
+  // An interior group's floor, which units are lit by: its floor faces
+  // (floorFaces in wmo.mjs) as a mesh of their own, the transition faces as
+  // a second one, sharing the group's positions and vertex colours. Never
+  // drawn.
+  wmoFloorMeshes(name, group, position, color) {
+    const { floor, transition } = floorFaces(group);
+    return [[floor, false], [transition, true]].filter(([faces]) => faces.length).map(([faces, isTransition]) => {
+      const indices = new Uint32Array(faces.length * 3);
+      faces.forEach((triangle, index) => indices.set(group.indices.subarray(triangle * 3, triangle * 3 + 3), index * 3));
+      const mesh = this.document.createMesh(`${name}-floor${isTransition ? '-transition' : ''}`).addPrimitive(this.document.createPrimitive()
+        .setAttribute('POSITION', position)
+        .setAttribute('COLOR_0', color)
+        .setIndices(this.indexAccessor(indices, 0, indices.length)));
+      return { mesh, transition: isTransition };
     });
   }
 
@@ -478,6 +499,10 @@ export async function exportMapScene({
       const bounds = transformBoundingBox(group.boundingBox, placement);
       const exterior = Boolean(group.flags & WMO_GROUP_FLAG_EXTERIOR);
       if (!meshes[index]) return;
+      for (const floor of meshes[index].floors) {
+        wmoNode.addChild(document.createNode(`floor-${group.index}${floor.transition ? '-transition' : ''}`).setMesh(floor.mesh)
+          .setExtras({ kind: 'wmoFloor', wmoGroupId: group.groupId, ...(floor.transition ? { transition: true } : {}) }));
+      }
       groups.push({ wmoGroupId: group.groupId, exterior, ...bounds });
       // How the client lights the group's batches (buildingBatchLight in the
       // renderer): its transition, interior, and exterior batch counts
@@ -486,7 +511,7 @@ export async function exportMapScene({
       // (0xRRGGBB) to its interiors' light; and the group flags.
       const unified = Boolean(wmo.rootFlags & WMO_ROOT_FLAG_UNIFIED);
       wmoNode.addChild(document.createNode(`group-${group.index}`)
-        .setMesh(meshes[index])
+        .setMesh(meshes[index].mesh)
         .setExtras({
           kind: 'wmoGroup', wmoGroupId: group.groupId, exterior, minZ: bounds.minZ, maxZ: bounds.maxZ,
           wmoBatches: [group.transBatchCount, group.intBatchCount, group.extBatchCount],

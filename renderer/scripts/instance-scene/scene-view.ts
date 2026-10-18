@@ -189,6 +189,8 @@ const GROUND_RAYS_PER_FRAME = 64;
 const NO_REACH = 1e9;
 const floorAreaColor = new Color();
 const DOWN = new Vector3(0, -1, 0);
+// Floor meshes are hit from either side, whatever their winding.
+const FLOOR_RAY_MATERIAL = new MeshBasicMaterial({ side: DoubleSide });
 const INDOOR_TOWARDS = serverToThree(INDOOR_LIGHT_DIRECTION.map((value) => -value) as Point3).normalize();
 // All fade values live in one uniform buffer shared by every scene material,
 // uploaded once a frame (per-material uniform arrays were re-sent on every
@@ -239,8 +241,10 @@ varying vec3 vWowNormal;
 #ifdef WOW_PROP_LIGHT
 attribute vec2 wowPropKind;
 attribute vec3 wowPropDirect;
+attribute vec3 wowPropAmbient;
 varying vec2 vWowPropKind;
 varying vec3 vWowPropDirect;
+varying vec3 vWowPropAmbient;
 #endif
 `;
 const FADE_VERTEX = `
@@ -250,6 +254,7 @@ vWowNormal = normalize(normalMatrix * normal);
 #ifdef WOW_PROP_LIGHT
 vWowPropKind = wowPropKind;
 vWowPropDirect = wowPropDirect;
+vWowPropAmbient = wowPropAmbient;
 #endif
 vec4 wowLocal = vec4(transformed, 1.0);
 #ifdef USE_INSTANCING
@@ -290,6 +295,7 @@ varying vec3 vWowView;
 #ifdef WOW_PROP_LIGHT
 varying vec2 vWowPropKind;
 varying vec3 vWowPropDirect;
+varying vec3 vWowPropAmbient;
 #endif
 #ifdef WOW_BUILDING
 varying vec3 vWowNormal;
@@ -336,11 +342,10 @@ float wowVolumeFade(int index) {
 // light, as the client lights them: the ambient plus the direct light (each
 // channel at most 1) by N.L, the sum at most 1, in the client's colour
 // space (litColor in map-light.ts), the props' point lights joining the
-// sum. A building's props have their own light
-// (applyPropLight): indoors (kind 0) the sky's ambient, which the client
-// gives a prop when it makes it, and the floor's direct light from the
-// indoor light's direction, leaning towards the sky's direct light and the
-// sun by their share; elsewhere (1) the map's light as its own props have.
+// sum. A building's props have their own light (applyPropLight): indoors
+// (kind 0) the floor's direct and ambient light from the indoor light's
+// direction, leaning towards the sky's light and the sun by their share;
+// elsewhere (1) the map's light as its own props have.
 const CLIENT_LIGHT_FRAGMENT = `
 if (wowClientAmbientPacked.w > 0.5) {
   vec3 wowAmbient = wowClientAmbientPacked.rgb;
@@ -349,6 +354,7 @@ if (wowClientAmbientPacked.w > 0.5) {
 #ifdef WOW_PROP_LIGHT
   if (vWowPropKind.x < 0.5) {
     float wowShare = vWowPropKind.y;
+    wowAmbient = mix(vWowPropAmbient, wowClientAmbientPacked.rgb, wowShare);
     wowDirect = mix(vWowPropDirect, wowClientDirectPacked.rgb, wowShare);
     wowTowards = mix(wowClientIndoorPacked.xyz, wowClientSunPacked.xyz, wowShare);
     wowTowards = dot(wowTowards, wowTowards) > 1e-6 ? normalize(wowTowards) : wowClientSunPacked.xyz;
@@ -469,16 +475,17 @@ function propFloors(mesh: Mesh): ArrayLike<number> | null {
 
 // Gives a building's prop its light per instance, on its own copy of the
 // geometry (the buffers are shared): wowPropKind is [kind, share] and
-// wowPropDirect the floor's direct light (see CLIENT_LIGHT_FRAGMENT). Worked
-// out once per prop; each primitive gets its own copy, as culling repacks
-// each one's copies (chooseVisible), and keeps the originals for that.
-// Indoors the client's light from the floor (its direct light; the prop
-// keeps the sky ambient it was made with); outdoors the map's light as its
-// own props; with no floor too, as the client lights a prop it finds no
+// wowPropDirect and wowPropAmbient the floor's light (see
+// CLIENT_LIGHT_FRAGMENT). Worked out once per prop; each primitive gets its
+// own copy, as culling repacks each one's copies (chooseVisible), and keeps
+// the originals for that. Indoors the client's light from the floor, as a
+// unit's (without characters' ambient); outdoors the map's light as its own
+// props; with no floor too, as the client lights a prop it finds no
 // building floor under as outdoors.
 interface PropLight {
   kind: Float32Array;
   direct: Float32Array;
+  ambient: Float32Array;
 }
 const propLights = new WeakMap<object, PropLight>();
 
@@ -486,16 +493,19 @@ function propLight(floors: ArrayLike<number>): PropLight {
   const count = floors.length / 4;
   const kind = new Float32Array(count * 2);
   const direct = new Float32Array(count * 3);
+  const ambient = new Float32Array(count * 3);
   for (let index = 0; index < count; index += 1) {
     const [r, g, b, share] = [floors[index * 4], floors[index * 4 + 1], floors[index * 4 + 2], floors[index * 4 + 3]];
     if (r < 0) {
       kind.set([1, 1], index * 2);
     } else {
+      const light = indoorLight([r, g, b]);
       kind.set([0, share], index * 2);
-      direct.set(indoorLight([r, g, b]).direct, index * 3);
+      direct.set(light.direct, index * 3);
+      ambient.set(light.ambient, index * 3);
     }
   }
-  return { kind, direct };
+  return { kind, direct, ambient };
 }
 
 function applyPropLight(mesh: Mesh, floors: ArrayLike<number>): void {
@@ -512,6 +522,7 @@ function applyPropLight(mesh: Mesh, floors: ArrayLike<number>): void {
   geometry.userData = source.userData;
   geometry.setAttribute('wowPropKind', new InstancedBufferAttribute(light.kind.slice(), 2));
   geometry.setAttribute('wowPropDirect', new InstancedBufferAttribute(light.direct.slice(), 3));
+  geometry.setAttribute('wowPropAmbient', new InstancedBufferAttribute(light.ambient.slice(), 3));
   mesh.userData.wowPropLight = light;
   mesh.geometry = geometry;
 }
@@ -834,12 +845,15 @@ export class InstanceSceneView {
       if (fresh || budget <= 0) continue;
       budget -= 1;
       const floor = this.floorColor(meshes, [pose.x, pose.y, pose.z]);
+      // A floor mesh says whether its faces are transition ones; older
+      // scenes' light files list them by render batch.
       const transitions = floor && group?.transitions?.[floor.batch];
+      const onTransition = floor && (floor.transition ?? Boolean(transitions && this.transitionSet(transitions).has(floor.triangle)));
       this.indoorLights.set(pose.id, {
         groupId,
         position: [pose.x, pose.y, pose.z],
         light: floor ? indoorLight(floorLight(floor.color, group?.ambient)) : known?.light ?? null,
-        outdoor: floor ? (transitions && this.transitionSet(transitions).has(floor.triangle) ? floor.alpha : 0) : known?.outdoor ?? 0,
+        outdoor: floor ? (onTransition ? floor.alpha : 0) : known?.outdoor ?? 0,
       });
     }
     for (const id of this.indoorLights.keys()) if (!indoors.has(id)) this.indoorLights.delete(id);
@@ -852,9 +866,11 @@ export class InstanceSceneView {
   }
 
   // The baked vertex colour and alpha of the floor under a point (client
-  // values, 0 to 1), and the render batch and triangle it is on, from a ray
-  // down from a little above it; null if it misses.
-  private floorColor(meshes: Mesh[], [x, y, z]: Point3): { color: Rgb; alpha: number; batch: number; triangle: number } | null {
+  // values, 0 to 1), and the render batch and triangle it is on, or whether
+  // it is a transition face (a floor mesh's), from a ray down from a little
+  // above it; null if it misses.
+  private floorColor(meshes: Mesh[], [x, y, z]: Point3):
+    { color: Rgb; alpha: number; batch: number; triangle: number; transition?: boolean } | null {
     this.raycaster.set(serverToThree([x, y, z + INDOOR_RAY_LIFT]), DOWN);
     const hit = this.raycaster.intersectObjects(meshes, false)[0];
     if (!hit?.face || !hit.barycoord || hit.faceIndex === undefined || hit.faceIndex === null) return null;
@@ -868,6 +884,7 @@ export class InstanceSceneView {
       alpha: colors.itemSize > 3 ? at(3) : 1,
       batch: (hit.object.userData.wowBatch as number | undefined) ?? 0,
       triangle: hit.faceIndex,
+      ...(hit.object.userData.kind === 'wmoFloor' ? { transition: Boolean(hit.object.userData.transition) } : {}),
     };
   }
 
@@ -1088,6 +1105,12 @@ export class InstanceSceneView {
       numberBuildingBatches(root);
       root.traverse((object) => {
         if (!(object instanceof Mesh)) return;
+        // Interior groups' floors are for indoor light only, never drawn.
+        if (object.userData.kind === 'wmoFloor') {
+          object.visible = false;
+          object.material = FLOOR_RAY_MATERIAL;
+          return;
+        }
         const liquid = (object.material as Material).userData?.wowLiquid as LiquidExtras | undefined;
         if (liquid) {
           const material = this.liquidMaterial(liquid, frames);
@@ -1106,7 +1129,7 @@ export class InstanceSceneView {
       const fitted = new WeakSet<BufferGeometry>();
       root.traverse((object) => {
         object.matrixAutoUpdate = false;
-        if (!(object instanceof Mesh)) return;
+        if (!(object instanceof Mesh) || object.userData.kind === 'wmoFloor') return;
         fitBoundsToIndices(object.geometry, fitted);
         if (object instanceof InstancedMesh) {
           const { bounds: instances, union: [minX, maxX, minY, maxY, minZ, maxZ] } = instanceBounds(object);
@@ -1122,13 +1145,21 @@ export class InstanceSceneView {
       this.gridQueue.push(...solid.map((entry) => entry.mesh));
       this.buildGridsWhenIdle();
       this.roots.set(url, root);
+      // Each interior group's floor meshes, or for scenes exported without
+      // them, its render meshes.
       const interiors = new Map<number, Mesh[]>();
+      const floors = new Map<number, Mesh[]>();
       root.traverse((node) => {
+        if (node instanceof Mesh && node.userData.kind === 'wmoFloor') {
+          const id = node.userData.wmoGroupId as number;
+          floors.set(id, [...floors.get(id) ?? [], node]);
+        }
         if (node.userData.kind !== 'wmoGroup' || node.userData.exterior) return;
         const meshes = interiors.get(node.userData.wmoGroupId as number) ?? [];
         node.traverse((child) => { if (child instanceof Mesh && child.geometry.getAttribute('color')) meshes.push(child); });
         if (meshes.length) interiors.set(node.userData.wmoGroupId as number, meshes);
       });
+      for (const [id, meshes] of floors) interiors.set(id, meshes);
       this.interiors.set(root, interiors);
       this.states.set(url, 'ready');
       this.onChange();
@@ -1275,7 +1306,7 @@ export class InstanceSceneView {
       // A building's prop's light follows its copies into their new slots.
       const light = mesh.userData.wowPropLight as PropLight | undefined;
       if (light) {
-        for (const [name, source, size] of [['wowPropKind', light.kind, 2], ['wowPropDirect', light.direct, 3]] as const) {
+        for (const [name, source, size] of [['wowPropKind', light.kind, 2], ['wowPropDirect', light.direct, 3], ['wowPropAmbient', light.ambient, 3]] as const) {
           const attribute = mesh.geometry.getAttribute(name) as InstancedBufferAttribute;
           const target = attribute.array as Float32Array;
           for (let slot = 0; slot < count; slot += 1) {
