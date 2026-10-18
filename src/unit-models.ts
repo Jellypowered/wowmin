@@ -48,7 +48,9 @@ export const UNIT_MODEL_CACHE_VERSION = 10;
 // and the models their particles are drawn as or whose emitters they carry.
 // 10: effect tracks with fewer sequences than a clip's index take the first
 // sequence's keys (a state model's Hold kept its Stand colours and sizes).
-export const SPELL_ART_CACHE_VERSION = 10;
+// 11: bone tracks on a loop of no length hold their first key (Fan of
+// Knives' knives flew straight up).
+export const SPELL_ART_CACHE_VERSION = 11;
 const SPELL_ART_KINDS = new Set<UnitModelRequest['kind']>(['effect', 'visual', 'spell', 'icon', 'gameobject', 'light']);
 const EXTENSIONS: Partial<Record<UnitModelRequest['kind'], string>> = { visual: 'json', spell: 'json', icon: 'png', light: 'json' };
 // A look that could not be built is not retried for this long.

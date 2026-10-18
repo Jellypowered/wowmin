@@ -89,10 +89,18 @@ export function exportRibbon(ribbon, clips) {
 }
 
 // A clip's keys for a bone track, falling back to the first sequence's as
-// exportTrack does.
-const sequenceKeys = (clipIndex) => (track) => {
+// exportTrack does. A track on a loop of no length never leaves its first
+// key, so every clip holds that key (Fan of Knives' knife bones are turned
+// on their side this way).
+const sequenceKeys = (clipIndex, loops) => (track) => {
+  if (track.loopIndex !== M2_NO_LOOP) {
+    const [times, values] = [track.sequenceTimes[0], track.sequenceKeys[0]];
+    return !loops[track.loopIndex] && times?.length && values?.length
+      ? { times: Uint32Array.of(0), values: values.slice(0, values.length / times.length), step: true }
+      : null;
+  }
   const index = clipIndex < track.sequenceTimes.length ? clipIndex : 0;
-  return track.loopIndex === M2_NO_LOOP && track.sequenceTimes[index]
+  return track.sequenceTimes[index]
     ? { times: track.sequenceTimes[index], values: track.sequenceKeys[index], step: track.trackType === M2_TRACK_INTERPOLATION_NONE }
     : null;
 };
@@ -124,7 +132,7 @@ export function loadEffectM2(modelName, readFile) {
       name: clip.name,
       index: clip.index,
       duration: clip.duration,
-      bones: model.bones.map((bone) => boneChannelsFrom(bone, model.bones[bone.parentIndex]?.pivot, sequenceKeys(clip.index))),
+      bones: model.bones.map((bone) => boneChannelsFrom(bone, model.bones[bone.parentIndex]?.pivot, sequenceKeys(clip.index, loops))),
     })),
     globalClips: [...usedLoops].map((loop) => ({
       name: `global${loop}`,
