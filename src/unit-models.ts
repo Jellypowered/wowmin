@@ -39,7 +39,8 @@ export const UNIT_MODEL_CACHE_VERSION = 10;
 // full chain records, kit flags and clips, and effects' ribbons and particles.
 // 10: effect tracks short of a clip's sequence take the first one's keys.
 // 11: bone tracks on a loop of no length hold their first key.
-export const SPELL_ART_CACHE_VERSION = 11;
+// 12: map lights carry only models' point lights, without fade distances.
+export const SPELL_ART_CACHE_VERSION = 12;
 const SPELL_ART_KINDS = new Set<UnitModelRequest['kind']>(['effect', 'visual', 'spell', 'icon', 'gameobject', 'light']);
 const EXTENSIONS: Partial<Record<UnitModelRequest['kind'], string>> = { visual: 'json', spell: 'json', icon: 'png', light: 'json' };
 // A look that could not be built is not retried for this long.

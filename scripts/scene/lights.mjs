@@ -1,8 +1,10 @@
 // A map's light, as the client lights the world: Light.dbc's lights for the
 // map (a default one, and ones covering an area that fade out towards their
 // edge), each with its direct (sun) and ambient colours through the day from
-// LightIntBand; and the lights of the objects on it (buildings' MOLT lights,
-// braziers' and bonfires' model lights), placed in server coordinates.
+// LightIntBand; and the lights of the models on it (braziers', bonfires'
+// and torches' point lights), placed in server coordinates. Buildings' own
+// lights (MOLT) are left out: the client never makes them, as its tools
+// baked them into the buildings' vertex colours.
 // Served on demand as /assets/models/light/<mapId>.json.
 
 import { findChunk, readChunks, readFloats } from './chunks.mjs';
@@ -42,31 +44,20 @@ const MAX_KEYS = 16;
 // Ulduar and two arenas set one.
 const MAP_DIRECTORY = 1;
 const MAP_TIME_OF_DAY_OVERRIDE = 62;
-// MOLT, a WMO's lights (48 bytes each): type (0 omni, 1 spot), BGRA colour,
-// position, intensity, and the distances its light fades out between.
-const MOLT_SIZE = 48;
-const MOLT_TYPE = 0;
-const MOLT_COLOR = 4;
-const MOLT_POSITION = 8;
-const MOLT_INTENSITY = 20;
-const MOLT_START = 40;
-const MOLT_END = 44;
-const MOLT_POINT_TYPES = new Set([0, 1]);
 // An M2's lights (header 0x108, 156 bytes each): type (1 point), position,
 // then tracks; each track is a u16 interpolation, an i16 global sequence,
 // and M2Arrays of per-sequence time and key arrays. The first key of the
-// first sequence is used: diffuse colour and intensity, and the fade-out
-// distances.
+// first sequence is used: diffuse colour and intensity. The client loads
+// the attenuation tracks but never reads them (every point light fades by
+// the same curve), so they are not exported.
 const M2_LIGHTS = 0x108;
 const M2_LIGHT_SIZE = 156;
 const M2_LIGHT_POINT = 1;
 const M2_LIGHT_POSITION = 4;
 const M2_LIGHT_DIFFUSE_COLOR = 56;
 const M2_LIGHT_DIFFUSE_INTENSITY = 76;
-const M2_LIGHT_START = 96;
-const M2_LIGHT_END = 116;
 // AreaTable: parent area, and the ambient multiplier characters' light is
-// scaled by (Wow.exe FUN_007831a0).
+// scaled by.
 const AREA_MAP = 1;
 const AREA_PARENT = 2;
 const AREA_AMBIENT_MULTIPLIER = 34;
@@ -92,23 +83,6 @@ export function placePoint({ position, rotation, scale }, [px, py, pz]) {
 
 const toColor = (rgb) => rgb.reduce((color, channel) => (color << 8) | Math.round(Math.min(1, Math.max(0, channel)) * 255), 0);
 
-// A WMO's point lights, in its own space.
-export function readWmoLights(rootChunks) {
-  const molt = findChunk(rootChunks, 'MOLT');
-  const lights = [];
-  for (let at = 0; molt && at + MOLT_SIZE <= molt.length; at += MOLT_SIZE) {
-    if (!MOLT_POINT_TYPES.has(molt[at + MOLT_TYPE])) continue;
-    lights.push({
-      position: readFloats(molt, at + MOLT_POSITION, 3),
-      color: molt.readUInt32LE(at + MOLT_COLOR) & 0xffffff,
-      intensity: molt.readFloatLE(at + MOLT_INTENSITY),
-      start: molt.readFloatLE(at + MOLT_START),
-      end: molt.readFloatLE(at + MOLT_END),
-    });
-  }
-  return lights;
-}
-
 // An M2's point lights, in its own space.
 export function readM2Lights(buffer) {
   if (!buffer || buffer.length < M2_LIGHTS + 8) return [];
@@ -125,15 +99,8 @@ export function readM2Lights(buffer) {
     if (at + M2_LIGHT_SIZE > buffer.length || buffer.readUInt16LE(at) !== M2_LIGHT_POINT) continue;
     const color = firstKey(at + M2_LIGHT_DIFFUSE_COLOR, VEC3);
     const intensity = firstKey(at + M2_LIGHT_DIFFUSE_INTENSITY, FLOAT)?.[0] ?? 0;
-    const end = firstKey(at + M2_LIGHT_END, FLOAT)?.[0] ?? 0;
-    if (!color || intensity <= 0 || end <= 0) continue;
-    lights.push({
-      position: readFloats(buffer, at + M2_LIGHT_POSITION, 3),
-      color: toColor(color),
-      intensity,
-      start: firstKey(at + M2_LIGHT_START, FLOAT)?.[0] ?? 0,
-      end,
-    });
+    if (!color || intensity <= 0 || color.every((channel) => channel <= 0)) continue;
+    lights.push({ position: readFloats(buffer, at + M2_LIGHT_POSITION, 3), color: toColor(color), intensity });
   }
   return lights;
 }
@@ -204,8 +171,8 @@ export function interiorGroups(readFile, wmoNames) {
   return interiors;
 }
 
-// The lights of the buildings and props on a map, in server coordinates:
-// each building's own, its doodad sets' models', and the map's loose props'.
+// The lights of the props on a map, in server coordinates: its buildings'
+// doodad sets' models' and its loose props'.
 export function objectLights(readFile, { wmos, doodads }) {
   const m2Lights = new Map();
   const modelLights = (name) => {
@@ -215,25 +182,21 @@ export function objectLights(readFile, { wmos, doodads }) {
   const placed = [];
   const add = (lights, ...placements) => {
     for (const light of lights) {
-      const position = placements.reduceRight((point, placement) => placePoint(placement, point), light.position);
-      const scale = placements.reduce((product, placement) => product * placement.scale, 1);
-      placed.push({ ...light, position, start: light.start * scale, end: light.end * scale });
+      placed.push({ ...light, position: placements.reduceRight((point, placement) => placePoint(placement, point), light.position) });
     }
   };
   for (const wmo of wmos) {
     const rootBuffer = readFile(wmo.name);
     if (!rootBuffer) continue;
-    const rootChunks = readChunks(rootBuffer);
-    add(readWmoLights(rootChunks), wmo);
-    const { sets, definitions } = readDoodadDefinitions(rootChunks);
+    const { sets, definitions } = readDoodadDefinitions(readChunks(rootBuffer));
     for (const index of selectDoodadIndices(sets, wmo.doodadSet)) {
       const definition = definitions[index];
       if (definition) add(modelLights(definition.name), wmo, definition);
     }
   }
   for (const doodad of doodads) add(modelLights(doodad.name), doodad);
-  return placed.map(({ position, color, intensity, start, end }) => ({
-    position: position.map((value) => Math.round(value * 100) / 100), color, intensity, start, end,
+  return placed.map(({ position, color, intensity }) => ({
+    position: position.map((value) => Math.round(value * 100) / 100), color, intensity,
   }));
 }
 

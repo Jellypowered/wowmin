@@ -22,14 +22,12 @@ export interface MapLight {
   ambient: LightKeys;
 }
 
-// A light on a building or prop (a torch's, a brazier's): server
-// coordinates, colour, intensity, and the yards its light fades out between.
+// A prop's point light (a torch's, a brazier's): server coordinates, its
+// colour (0xRRGGBB) and intensity, which it shines by together.
 export interface ObjectLight {
   position: Point3;
   color: number;
   intensity: number;
-  start: number;
-  end: number;
 }
 
 // An interior WMO group's part in lighting units on its floor: the
@@ -101,11 +99,11 @@ export function lightWeight(light: MapLight, point: Point3): number {
   return 1 - (distance - light.inner) / (light.outer - light.inner);
 }
 
-// The `count` object lights nearest a point, within `reach` yards of it.
-export function nearestObjectLights(objects: readonly ObjectLight[], point: Point3, count: number, reach: number): ObjectLight[] {
+// The `count` object lights nearest a point, as the client picks a model's
+// lights: by distance alone, with no range.
+export function nearestObjectLights(objects: readonly ObjectLight[], point: Point3, count: number): ObjectLight[] {
   return objects
     .map((light) => ({ light, distance: Math.hypot(light.position[0] - point[0], light.position[1] - point[1], light.position[2] - point[2]) }))
-    .filter(({ distance }) => distance <= reach)
     .sort((left, right) => left.distance - right.distance)
     .slice(0, count)
     .map(({ light }) => light);
@@ -132,6 +130,16 @@ export function lightAt(map: MapLights, point: Point3, time: number): LightColor
     }
   }
   return { direct, ambient };
+}
+
+// Every point light fades with distance (yards) by the same curve, whatever
+// its model asks: 1 / (0.7 d + 0.03 d^2), times how squarely it shines on
+// the surface (`facing`, N.L). Its colour times this joins the lit sum.
+export const POINT_LIGHT_LINEAR = 0.7;
+export const POINT_LIGHT_QUADRATIC = 0.03;
+
+export function pointLightShare(distance: number, facing: number): number {
+  return Math.max(0, facing) / (POINT_LIGHT_LINEAR * distance + POINT_LIGHT_QUADRATIC * distance * distance);
 }
 
 // The light the client gives a lit surface (0 to 1, in its own colour

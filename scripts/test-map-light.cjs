@@ -124,26 +124,8 @@ test('a lit surface takes the ambient plus the direct light by N.L, capped at 1'
   assert.deepEqual(plain(light.litColor({ direct: [1, 1, 1], ambient: [0.5, 0.9, 1.4] }, 1)), [1, 1, 1]);
 });
 
-test('reads buildings\' and models\' point lights from their own bytes', async () => {
-  const { readM2Lights, readWmoLights } = await import(pathToFileURL(path.join(__dirname, 'scene', 'lights.mjs')).href);
-  const { readChunks } = await import(pathToFileURL(path.join(__dirname, 'scene', 'chunks.mjs')).href);
-  // MOLT: an omni light and an ambient one (left out).
-  const molt = Buffer.alloc(96);
-  molt[0] = 0;
-  molt.writeUInt32LE(0xfffda648, 4);
-  [-18.5, 29, 2.75].forEach((value, axis) => molt.writeFloatLE(value, 8 + axis * 4));
-  molt.writeFloatLE(0.9, 20);
-  molt.writeFloatLE(3.5, 40);
-  molt.writeFloatLE(7, 44);
-  molt[48] = 3;
-  const chunk = Buffer.concat([Buffer.from('TLOM'), Buffer.from(Uint32Array.of(molt.length).buffer), molt]);
-  const lights = readWmoLights(readChunks(chunk));
-  assert.equal(lights.length, 1);
-  assert.equal(lights[0].color, 0xfda648);
-  assert.deepEqual(lights[0].position, [-18.5, 29, 2.75]);
-  near(lights[0].intensity, 0.9, 'intensity');
-  assert.deepEqual([lights[0].start, lights[0].end], [3.5, 7]);
-
+test('reads models\' point lights from their own bytes, without fade distances', async () => {
+  const { readM2Lights } = await import(pathToFileURL(path.join(__dirname, 'scene', 'lights.mjs')).href);
   // An M2 with one point light: tracks hold one sequence of one key each.
   const m2 = Buffer.alloc(1024);
   m2.writeUInt32LE(1, 0x108);
@@ -173,7 +155,7 @@ test('reads buildings\' and models\' point lights from their own bytes', async (
   track(light + 76, [2]);
   track(light + 96, [0.5]);
   track(light + 116, [1.5]);
-  assert.deepEqual(JSON.parse(JSON.stringify(readM2Lights(m2))), [{ position: [0, 0.25, 1], color: 0xff8000, intensity: 2, start: 0.5, end: 1.5 }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(readM2Lights(m2))), [{ position: [0, 0.25, 1], color: 0xff8000, intensity: 2 }]);
   assert.deepEqual(readM2Lights(Buffer.alloc(16)), []);
 });
 
@@ -185,11 +167,17 @@ test('places a light by its building\'s turn, scale, and position', async () => 
   [100, 202, 16].forEach((expected, axis) => near(placed[axis], expected, `axis ${axis}`));
 });
 
-test('picks the object lights nearest the view, within reach', () => {
-  const at = (x) => ({ position: [x, 0, 0], color: 0xffffff, intensity: 1, start: 1, end: 5 });
+test('picks the object lights nearest the view', () => {
+  const at = (x) => ({ position: [x, 0, 0], color: 0xffffff, intensity: 1 });
   const lights = [at(50), at(5), at(300), at(20)];
-  assert.deepEqual(plain(light.nearestObjectLights(lights, [0, 0, 0], 2, 100).map((entry) => entry.position[0])), [5, 20]);
-  assert.deepEqual(plain(light.nearestObjectLights(lights, [0, 0, 0], 8, 100).map((entry) => entry.position[0])), [5, 20, 50]);
+  assert.deepEqual(plain(light.nearestObjectLights(lights, [0, 0, 0], 2).map((entry) => entry.position[0])), [5, 20]);
+  assert.deepEqual(plain(light.nearestObjectLights(lights, [0, 0, 0], 8).map((entry) => entry.position[0])), [5, 20, 50, 300]);
+});
+
+test('a point light falls off as the client\'s fixed curve, by how squarely it shines on the surface', () => {
+  near(light.pointLightShare(1, 1), 1 / 0.73, 'one yard, head on');
+  near(light.pointLightShare(10, 0.5), 0.5 / 10, 'ten yards, at 60 degrees');
+  assert.equal(light.pointLightShare(4, -0.5), 0);
 });
 
 test('the sun shines from a fixed bearing, highest at noon and midnight and lowest at six', () => {

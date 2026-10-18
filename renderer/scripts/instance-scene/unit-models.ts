@@ -50,6 +50,7 @@ import {
   type UnitWeapons,
 } from '../utils/unit-animation';
 import { threeToServer, useServerAxes } from './iso-camera';
+import { pointLightFunction, pointLights } from './point-lights';
 
 // A pet's model scale above this is a giant's (see UnitModelPose.pet).
 const PET_OVERSIZED_DISPLAY_SCALE = 2;
@@ -88,21 +89,26 @@ export const clientLight = {
 };
 
 // The client's light on a lit model material: the uniforms come from the
-// material (shared ones, or a unit's own indoors). The scene's three.js
-// ambient and sun are dark while it is on; point lights still add.
+// material (shared ones, or a unit's own indoors), and the props' point
+// lights join the sum indoors and out. The scene's three.js ambient and sun
+// are dark while it is on.
 const CLIENT_LIGHT_DECLARATIONS = `
 uniform vec4 wowLightAmbient;
 uniform vec4 wowLightDirect;
 uniform vec3 wowLightDirection;
 uniform vec3 wowSunDirection;
-`;
+uniform vec4 wowPointPosition[${pointLights.positions.length}];
+uniform vec4 wowPointColor[${pointLights.colors.length}];
+uniform float wowPointCount;
+${pointLightFunction('wowPointLight', 'wowPointPosition', 'wowPointColor', 'wowPointCount')}`;
 // The direct light's w is how far its direction leans towards the sun's
 // (1 outdoors, where they are the same; a unit's own share indoors).
 const CLIENT_LIGHT_FRAGMENT = `
 if (wowLightAmbient.w > 0.5) {
   vec3 wowTowards = mix(wowLightDirection, wowSunDirection, wowLightDirect.w);
   wowTowards = dot(wowTowards, wowTowards) > 1e-6 ? normalize(wowTowards) : wowLightDirection;
-  vec3 wowLight = clamp(wowLightAmbient.rgb + min(wowLightDirect.rgb, vec3(1.0)) * saturate(dot(normal, wowTowards)), 0.0, 1.0);
+  vec3 wowLight = clamp(wowLightAmbient.rgb + min(wowLightDirect.rgb, vec3(1.0)) * saturate(dot(normal, wowTowards))
+    + wowPointLight(-vViewPosition, normal), 0.0, 1.0);
   reflectedLight.indirectDiffuse += diffuseColor.rgb * pow(wowLight, vec3(2.2));
 }
 `;
@@ -111,12 +117,18 @@ interface ClientLightUniforms {
   wowLightDirect: { value: Vector4 };
   wowLightDirection: { value: Vector3 };
   wowSunDirection: { value: Vector3 };
+  wowPointPosition: { value: Vector4[] };
+  wowPointColor: { value: Vector4[] };
+  wowPointCount: { value: number };
 }
 const sharedLightUniforms = (): ClientLightUniforms => ({
   wowLightAmbient: { value: clientLight.ambient },
   wowLightDirect: { value: clientLight.direct },
   wowLightDirection: { value: clientLight.sun },
   wowSunDirection: { value: clientLight.sun },
+  wowPointPosition: { value: pointLights.positions },
+  wowPointColor: { value: pointLights.colors },
+  wowPointCount: pointLights.count,
 });
 function injectClientLight(this: Material, shader: WebGLProgramParametersWithUniforms): void {
   Object.assign(shader.uniforms, this.userData.wowLight as ClientLightUniforms);

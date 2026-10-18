@@ -21,7 +21,6 @@ import {
   NormalBlending,
   Object3D,
   OrthographicCamera,
-  PointLight,
   Raycaster,
   Scene,
   Sphere,
@@ -40,7 +39,7 @@ import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.j
 import { type FadeSettings, type FadeVolume, getSceneFade, type IsoView, MAX_FADE_VOLUMES } from '../utils/map-projection';
 import {
   blendLight, type BuildingBatchLight, buildingBatchLight, characterAmbientScale, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors,
-  lightAt, type MapLights, nearestObjectLights, scaleAmbient, type Rgb, sunDirection, timeOfDay,
+  lightAt, type MapLights, nearestObjectLights, type ObjectLight, scaleAmbient, type Rgb, sunDirection, timeOfDay,
 } from '../utils/map-light';
 import { PARTICLE_GROUND_DEPTH } from '../utils/m2-tracks';
 import { type FaceCulling, TriangleGrid } from '../utils/triangle-grid';
@@ -51,6 +50,7 @@ import { buildLayerArray, BYTE_SHADING_SCALE, createTerrainMaterial, prepareAlph
 import { GameObjectLayer, type GameObjectPose } from './game-objects';
 import { type BearerAreaCircle, SpellVisualLayer, type UnitInfo } from './spell-visual-layer';
 import { clientLight, type UnitLook, type UnitModelPose, UnitModelLayer } from './unit-models';
+import { MAX_POINT_LIGHTS, pointLightFunction, pointLights } from './point-lights';
 
 type WowBlend = 'opaque' | 'alphaKey' | 'alpha' | 'add' | 'mod' | 'mod2x';
 
@@ -90,7 +90,8 @@ const UNLIT_BRIGHTNESS = 0.75;
 // colour space, so made linear here. The colour is the vertex colour (MOCV)
 // lit by the map's ambient and sun on the older render path, or with half
 // of either light added on the newer one (the building's own ambient
-// indoors); transition batches mix the two by the vertex alpha. WOW_BUILDING
+// indoors); the props' point lights join both lights; transition batches
+// mix the two by the vertex alpha. WOW_BUILDING
 // is 0 unlit, 1 own, 2 lit, 3 transition. Without the map's light, the old
 // look: vertex colours doubled, outdoor groups' brightened instead (and the
 // vertex alpha never changes the surface's).
@@ -98,11 +99,13 @@ const BUILDING_LIGHT = { unlit: 0, own: 1, lit: 2, transition: 3 } as const sati
 const BUILDING_LIGHT_FRAGMENT = `
 vec3 wowMocv = vColor.rgb;
 if (wowClientAmbientPacked.w > 0.5) {
-  vec3 wowSky = clamp(wowClientAmbientPacked.rgb
-    + wowClientDirectPacked.rgb * clamp(dot(normalize(vWowNormal), wowClientSunPacked.xyz), 0.0, 1.0), 0.0, 1.0);
+  vec3 wowNormal = normalize(vWowNormal);
+  vec3 wowPoints = wowPointLight(vWowView, wowNormal);
+  vec3 wowSky = clamp(wowClientAmbientPacked.rgb + wowPoints
+    + min(wowClientDirectPacked.rgb, vec3(1.0)) * clamp(dot(wowNormal, wowClientSunPacked.xyz), 0.0, 1.0), 0.0, 1.0);
 #ifdef WOW_BUILDING_UNIFIED
   vec3 wowLit = clamp(wowSky * 0.5 + wowMocv, 0.0, 1.0);
-  vec3 wowOwn = clamp(wowBuildingAmbient * 0.5 + wowMocv, 0.0, 1.0);
+  vec3 wowOwn = clamp(clamp(wowBuildingAmbient + wowPoints, 0.0, 1.0) * 0.5 + wowMocv, 0.0, 1.0);
 #else
   vec3 wowLit = clamp(wowMocv * wowSky, 0.0, 1.0);
   vec3 wowOwn = wowMocv;
@@ -152,13 +155,6 @@ const NEUTRAL_SUN_TOWARDS = new Vector3(0.4, 1, 0.6).normalize();
 const INDOOR_RAY_LIFT = 1.5;
 const INDOOR_RESAMPLE_DISTANCE = 0.75;
 const INDOOR_SAMPLES_PER_FRAME = 6;
-// Object lights (torches, braziers): the nearest this many to the view's
-// centre, within this reach, light what the scene's lights do (terrain,
-// shaded props, units), not the buildings, whose torches are baked into
-// their vertex colours. A fixed number of lights, so shaders compile once.
-const OBJECT_LIGHT_COUNT = 16;
-const OBJECT_LIGHT_REACH = 120;
-const OBJECT_LIGHT_INTENSITY = 6;
 const BACKGROUND = 0x08111d;
 // High-density displays draw at most this many pixels per CSS pixel (before
 // the viewer's render scale), so a 2x screen costs about half the pixels.
@@ -216,7 +212,12 @@ const CLIENT_DIRECT_OFFSET = CLIENT_AMBIENT_OFFSET + 4;
 const CLIENT_SUN_OFFSET = CLIENT_DIRECT_OFFSET + 4;
 // The view-space way to the indoor light, for a building's props.
 const CLIENT_INDOOR_OFFSET = CLIENT_SUN_OFFSET + 4;
-const FADE_BLOCK_FLOATS = CLIENT_INDOOR_OFFSET + 4;
+// The props' point lights (point-lights.ts): view-space positions, colours,
+// and how many are in use.
+const POINT_POSITION_OFFSET = CLIENT_INDOOR_OFFSET + 4;
+const POINT_COLOR_OFFSET = POINT_POSITION_OFFSET + MAX_POINT_LIGHTS * 4;
+const POINT_COUNT_OFFSET = POINT_COLOR_OFFSET + MAX_POINT_LIGHTS * 4;
+const FADE_BLOCK_FLOATS = POINT_COUNT_OFFSET + 4;
 // A floor area paints only surfaces facing up at least this much, within
 // this many yards of its centre's height, so walls, ceilings, and other
 // floors stay clear: a faint fill and a thin, lighter rim.
@@ -231,6 +232,7 @@ const FLOOR_AREA_BLUE = new Color('#60a5fa');
 const FLOOR_AREA_BLUE_SHIFT = 0.35;
 // A building's props carry their own light, per instance (propLight).
 const FADE_VERTEX_DECLARATIONS = `varying vec3 vWowPosition;
+varying vec3 vWowView;
 #ifdef WOW_BUILDING
 varying vec3 vWowNormal;
 #endif
@@ -255,6 +257,7 @@ wowLocal = instanceMatrix * wowLocal;
 #endif
 vec4 wowWorld = modelMatrix * wowLocal;
 vWowPosition = vec3(wowWorld.x, -wowWorld.z, wowWorld.y);
+vWowView = mvPosition.xyz;
 `;
 const FADE_FRAGMENT_DECLARATIONS = `
 #define WOW_MAX_VOLUMES ${MAX_FADE_VOLUMES}
@@ -272,13 +275,18 @@ layout(std140) uniform ${FADE_BLOCK} {
   vec4 wowClientDirectPacked;
   vec4 wowClientSunPacked;
   vec4 wowClientIndoorPacked;
+  vec4 wowPointPositionPacked[${MAX_POINT_LIGHTS}];
+  vec4 wowPointColorPacked[${MAX_POINT_LIGHTS}];
+  vec4 wowPointCountPacked;
 };
+${pointLightFunction('wowPointLight', 'wowPointPositionPacked', 'wowPointColorPacked', 'wowPointCountPacked.x')}
 #define wowReachMin wowReachMinPacked.xyz
 #define wowReachMax wowReachMaxPacked.xyz
 #define wowHeightRange wowFadeParams.x
 #define wowHorizontalRange wowFadeParams.y
 #define wowVolumeCount int(wowFadeParams.z)
 varying vec3 vWowPosition;
+varying vec3 vWowView;
 #ifdef WOW_PROP_LIGHT
 varying vec2 vWowPropKind;
 varying vec3 vWowPropDirect;
@@ -327,7 +335,8 @@ float wowVolumeFade(int index) {
 // Lit scene materials (Lambert: terrain, the map's props) under the map's
 // light, as the client lights them: the ambient plus the direct light (each
 // channel at most 1) by N.L, the sum at most 1, in the client's colour
-// space (litColor in map-light.ts). A building's props have their own light
+// space (litColor in map-light.ts), the props' point lights joining the
+// sum. A building's props have their own light
 // (applyPropLight): indoors (kind 0) the sky's ambient, which the client
 // gives a prop when it makes it, and the floor's direct light from the
 // indoor light's direction, leaning towards the sky's direct light and the
@@ -345,7 +354,8 @@ if (wowClientAmbientPacked.w > 0.5) {
     wowTowards = dot(wowTowards, wowTowards) > 1e-6 ? normalize(wowTowards) : wowClientSunPacked.xyz;
   }
 #endif
-  vec3 wowLight = clamp(wowAmbient + min(wowDirect, vec3(1.0)) * saturate(dot(normal, wowTowards)), 0.0, 1.0);
+  vec3 wowLight = clamp(wowAmbient + min(wowDirect, vec3(1.0)) * saturate(dot(normal, wowTowards))
+    + wowPointLight(vWowView, normal), 0.0, 1.0);
   reflectedLight.indirectDiffuse += diffuseColor.rgb * pow(wowLight, vec3(2.2));
 }
 `;
@@ -661,13 +671,9 @@ export class InstanceSceneView {
     const match = /^(\d{1,2}):(\d{2})$/.exec(new URLSearchParams(window.location.search).get('lightTime') ?? '');
     return match ? (Number(match[1]) * 60 + Number(match[2])) * 2 : null;
   })();
-  private readonly objectLights = Array.from({ length: OBJECT_LIGHT_COUNT }, () => {
-    // No falloff with distance but the fade to `distance`, as the client's
-    // lights fade out between two distances.
-    const light = new PointLight(0xffffff, 0, 1, 0);
-    light.visible = false;
-    return light;
-  });
+  // The props' point lights lighting the scene now (nearest the view's
+  // centre; none while the Lights setting is off or the map's light is).
+  private nearestLights: ObjectLight[] = [];
   private readonly fadeGroup = new UniformsGroup().setName(FADE_BLOCK).add(new Uniform(this.fadeData));
   // Scenes are meshopt-compressed (scripts/scene/export-scene.mjs).
   private readonly loader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
@@ -747,7 +753,7 @@ export class InstanceSceneView {
     this.scene.add(this.spellVisuals.group);
     this.gameObjects = new GameObjectLayer(this.redraw, ground);
     this.scene.add(this.gameObjects.group);
-    this.scene.add(this.ambient, ...this.objectLights);
+    this.scene.add(this.ambient);
     this.sun.position.set(0.4, 1, 0.6);
     this.scene.add(this.sun);
     canvas.addEventListener('webglcontextlost', (event) => {
@@ -1211,6 +1217,7 @@ export class InstanceSceneView {
     clientLight.indoor.copy(INDOOR_TOWARDS).transformDirection(this.camera.matrixWorldInverse);
     this.fadeData.set([clientLight.sun.x, clientLight.sun.y, clientLight.sun.z], CLIENT_SUN_OFFSET);
     this.fadeData.set([clientLight.indoor.x, clientLight.indoor.y, clientLight.indoor.z], CLIENT_INDOOR_OFFSET);
+    this.placePointLights();
     // setUnits has already updated the unit models' matrices this frame.
     for (const child of this.scene.children) if (child !== root && child !== this.units.group) child.updateMatrixWorld();
     this.renderer.render(this.scene, this.camera);
@@ -1329,22 +1336,28 @@ export class InstanceSceneView {
     this.unitSkyLight = { ambient: scaleAmbient(ambient, characterAmbientScale(this.mapLights?.ambientMultiplier)), direct };
     clientLight.ambient.set(...this.unitSkyLight.ambient, on);
     clientLight.direct.set(...direct, on);
-    const nearest = this.objectLightsOn && this.mapLights?.objects
-      ? nearestObjectLights(this.mapLights.objects, center, OBJECT_LIGHT_COUNT, OBJECT_LIGHT_REACH) : null;
-    // All shown while on (unused ones dark), all hidden while off: shaders
-    // compile only when the setting changes.
-    this.objectLights.forEach((light, index) => {
-      light.visible = Boolean(nearest);
-      const object = nearest?.[index];
-      light.intensity = object ? object.intensity * OBJECT_LIGHT_INTENSITY : 0;
-      if (!object) return;
-      light.color.setHex(object.color);
-      light.distance = object.end;
-      light.position.copy(serverToThree(object.position));
-    });
+    this.nearestLights = colors && this.objectLightsOn && this.mapLights?.objects
+      ? nearestObjectLights(this.mapLights.objects, center, MAX_POINT_LIGHTS) : [];
     const colorKey = colors
       ? [...colors.ambient, ...colors.direct, this.sunTowards.x, this.sunTowards.y].map((value) => value.toFixed(3)).join(',') : 'neutral';
-    return `${colorKey}|${nearest ? nearest.map((light) => light.position.join(',')).join(';') : 'off'}`;
+    return `${colorKey}|${this.nearestLights.map((light) => light.position.join(',')).join(';')}`;
+  }
+
+  // Puts the props' point lights in view space, for the scene's materials
+  // (the fade block) and the units'; call once the camera is placed.
+  private placePointLights(): void {
+    const view = this.camera.matrixWorldInverse;
+    this.nearestLights.forEach((light, index) => {
+      const at = serverToThree(light.position).applyMatrix4(view);
+      // In the client's colour space, as the rest of its light.
+      const channel = (shift: number) => (((light.color >> shift) & 0xff) / 255) * light.intensity;
+      pointLights.positions[index].set(at.x, at.y, at.z, 1);
+      pointLights.colors[index].set(channel(16), channel(8), channel(0), 1);
+      this.fadeData.set([at.x, at.y, at.z, 1], POINT_POSITION_OFFSET + index * 4);
+      this.fadeData.set(pointLights.colors[index].toArray(), POINT_COLOR_OFFSET + index * 4);
+    });
+    pointLights.count.value = this.nearestLights.length;
+    this.fadeData[POINT_COUNT_OFFSET] = this.nearestLights.length;
   }
 
   // Binds the fade block to a material whose shader has the party fade.
