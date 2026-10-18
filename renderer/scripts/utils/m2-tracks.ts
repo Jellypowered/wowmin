@@ -48,7 +48,8 @@ export function evalTrackInto(track: ExportedTrack | null | undefined, width: nu
   }
   // No keys for this clip means the default, not another clip's keys: an
   // effect's start (Stand) often fades in or bursts, and its idle (Hold)
-  // must not replay that.
+  // must not replay that. (A clip past the track's last sequence was given
+  // the first sequence's keys when the model was exported.)
   const keys = track.k[clock.clip];
   return keys ? interpolateInto(keys[0], keys[1], width, clock.timeMs, track.s, out) : false;
 }

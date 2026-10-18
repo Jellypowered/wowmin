@@ -49,7 +49,9 @@ export function fromLibraryTrack(track, map = (value) => value) {
 }
 
 // The compact export form for a track, keeping only the clips exported (or
-// the loop's keys for a global track); null when it has no keys at all.
+// the loop's keys for a global track); null when it has no keys at all. A
+// clip past the track's last sequence takes the first sequence's keys, as
+// the client reads them; a sequence with no keys stays the default.
 export function exportTrack(track, clips) {
   if (!track) return null;
   const keys = {};
@@ -58,7 +60,7 @@ export function exportTrack(track, clips) {
     if (sequence?.times.length && sequence.values.length) keys.global = [sequence.times, sequence.values];
   } else {
     for (const clip of clips) {
-      const sequence = track.sequences[clip.index];
+      const sequence = track.sequences[clip.index < track.sequences.length ? clip.index : 0];
       if (sequence?.times.length && sequence.values.length) keys[clip.name] = [sequence.times, sequence.values];
     }
   }
@@ -86,9 +88,14 @@ export function exportRibbon(ribbon, clips) {
   return exported;
 }
 
-const sequenceKeys = (index) => (track) => (track.loopIndex === M2_NO_LOOP && track.sequenceTimes[index]
-  ? { times: track.sequenceTimes[index], values: track.sequenceKeys[index], step: track.trackType === M2_TRACK_INTERPOLATION_NONE }
-  : null);
+// A clip's keys for a bone track, falling back to the first sequence's as
+// exportTrack does.
+const sequenceKeys = (clipIndex) => (track) => {
+  const index = clipIndex < track.sequenceTimes.length ? clipIndex : 0;
+  return track.loopIndex === M2_NO_LOOP && track.sequenceTimes[index]
+    ? { times: track.sequenceTimes[index], values: track.sequenceKeys[index], step: track.trackType === M2_TRACK_INTERPOLATION_NONE }
+    : null;
+};
 const loopKeys = (loop) => (track) => (track.loopIndex === loop && track.sequenceTimes[0]
   ? { times: track.sequenceTimes[0], values: track.sequenceKeys[0], step: track.trackType === M2_TRACK_INTERPOLATION_NONE }
   : null);

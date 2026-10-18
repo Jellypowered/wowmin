@@ -142,7 +142,13 @@ test('reads a ribbon in the 3.3.5 layout', async () => {
 test('exports tracks for the clips kept, or a loop\'s keys', async () => {
   const { exportTrack } = await load('effect-model.mjs');
   const track = { interpolation: 1, globalSequence: -1, sequences: [{ times: [0, 100], values: [1, 2] }, { times: [0], values: [9] }] };
+  // A clip past the track's last sequence takes the first one's keys, as
+  // the client reads them.
   assert.deepEqual(exportTrack(track, [{ name: 'Stand', index: 0 }, { name: 'Death', index: 2 }]),
+    { g: -1, s: false, k: { Stand: [[0, 100], [1, 2]], Death: [[0, 100], [1, 2]] } });
+  // A sequence there but without keys stays the default.
+  const empty = { ...track, sequences: [track.sequences[0], { times: [], values: [] }] };
+  assert.deepEqual(exportTrack(empty, [{ name: 'Stand', index: 0 }, { name: 'Hold', index: 1 }]),
     { g: -1, s: false, k: { Stand: [[0, 100], [1, 2]] } });
   assert.deepEqual(exportTrack({ ...track, globalSequence: 1, interpolation: 0 }, []),
     { g: 1, s: true, k: { global: [[0, 100], [1, 2]] } });
