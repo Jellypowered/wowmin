@@ -333,7 +333,10 @@ float wowBayer4(vec2 position) {
   return (pattern[cell.x + cell.y * 4] + 0.5) / 16.0;
 }
 // Floor areas' light on this surface: none on walls, nor on floors well
-// above or below an area. The rim is about a pixel and a half wide.
+// above or below an area. The rim is about a pixel and a half wide. Only
+// the ground (onGround) takes it, as the client projects such circles onto
+// the ground's triangles alone: props, liquids, and see-through or glowing
+// batches above it are left as they are.
 vec3 wowFloorAreas() {
   int count = int(wowFloorAreaCountPacked.x);
   if (count == 0) return vec3(0.0);
@@ -412,7 +415,13 @@ function injectPartyFade(shader: WebGLProgramParametersWithUniforms): void {
   shader.fragmentShader = FADE_FRAGMENT_DECLARATIONS + shader.fragmentShader
     .replace('#include <clipping_planes_fragment>', `#include <clipping_planes_fragment>\n${FADE_FRAGMENT}`)
     .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>\n${CLIENT_LIGHT_FRAGMENT}`)
-    .replace('#include <opaque_fragment>', '#include <opaque_fragment>\ngl_FragColor.rgb += wowFloorAreas();');
+    .replace('#include <opaque_fragment>', '#include <opaque_fragment>\n#ifdef WOW_FLOOR_AREAS\ngl_FragColor.rgb += wowFloorAreas();\n#endif');
+}
+
+// Marks a material as the ground, which takes the floor areas' light.
+function onGround<T extends Material>(material: T): T {
+  material.defines = { ...material.defines, WOW_FLOOR_AREAS: '' };
+  return material;
 }
 
 // A building batch's material (three.js calls it as the material's): its
@@ -1396,6 +1405,7 @@ export class InstanceSceneView {
     const vertexLit = Boolean(mesh.geometry.getAttribute('color'));
     const exteriorLit = vertexLit && isExteriorGroup(mesh);
     const building = vertexLit ? buildingBatch(mesh) : null;
+    const inBuilding = building !== null || buildingBatch(mesh) !== null;
     const floors = vertexLit ? null : propFloors(mesh);
     if (floors && !mesh.geometry.getAttribute('wowPropKind')) applyPropLight(mesh, floors);
     const propLightReady = Boolean(floors);
@@ -1411,12 +1421,12 @@ export class InstanceSceneView {
             color: new Color(TERRAIN_COLOR).multiplyScalar(vertexLit ? shadingScale : 1), vertexColors: vertexLit,
           });
           plain.onBeforeCompile = injectPartyFade;
-          return this.withFade(plain);
+          return this.withFade(onGround(plain));
         }
-        return this.withFade(createTerrainMaterial({
+        return this.withFade(onGround(createTerrainMaterial({
           layers: terrain.layers, alpha, origin: source.userData.origin as [number, number],
           vertexShaded: vertexLit, shadingScale, partyFade: injectPartyFade,
-        }));
+        })));
       }
       // Instanced props get their own copy: three.js re-derives the shader
       // program whenever a material switches between instanced and plain.
@@ -1424,12 +1434,15 @@ export class InstanceSceneView {
       // The map's own props are shaded by its light, a building's by the
       // floor under them as the client lights them (applyPropLight; scenes
       // exported before have no floors); glowing (blended) parts stay unlit.
+      const solid = (blend === 'opaque' || blend === 'alphaKey') && source.opacity >= 1;
       const opaque = !vertexLit && (blend === 'opaque' || blend === 'alphaKey');
+      // A building's solid batches are its floors as well as its walls.
+      const floor = solid && inBuilding;
       const propLit = opaque && propLightReady;
       const shaded = opaque && (propLit || isWorldProp(mesh));
       const light = building ? buildingBatchLight(building.batch, building.counts, building.unified, building.flags,
         (source.userData.wowMapObjFlags as number | undefined) ?? 0) : null;
-      const key = `${source.uuid}|${vertexLit}|${exteriorLit}|${shaded}|${propLit}|${mesh instanceof InstancedMesh}`
+      const key = `${source.uuid}|${vertexLit}|${exteriorLit}|${shaded}|${propLit}|${floor}|${mesh instanceof InstancedMesh}`
         + (building ? `|${light}|${building.unified ? building.ambient : ''}` : '');
       const cached = this.materials.get(key);
       if (cached) return cached;
@@ -1449,12 +1462,13 @@ export class InstanceSceneView {
         forceSinglePass: true,
         alphaTest: blend === 'alphaKey' ? 0.5 : 0,
         transparent: (blend !== 'opaque' && blend !== 'alphaKey') || source.opacity < 1,
-        depthWrite: (blend === 'opaque' || blend === 'alphaKey') && source.opacity >= 1,
+        depthWrite: solid,
         blending: blend === 'add' ? AdditiveBlending : blend === 'mod' || blend === 'mod2x' ? MultiplyBlending : NormalBlending,
         premultipliedAlpha: blend === 'mod' || blend === 'mod2x',
       });
       material.onBeforeCompile = injectPartyFade;
       if (propLit) material.defines = { ...material.defines, WOW_PROP_LIGHT: '' };
+      if (floor) onGround(material);
       if (building && light) {
         material.defines = {
           ...material.defines,
