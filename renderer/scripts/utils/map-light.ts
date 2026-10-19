@@ -56,6 +56,17 @@ export interface MapLights {
 
 export type Rgb = [number, number, number];
 
+// A map's lights as the server builds them, or null if it has none (or
+// they could not be fetched).
+export async function fetchMapLights(mapId: number): Promise<MapLights | null> {
+  try {
+    const response = await fetch(`assets/models/light/${mapId}.json`);
+    return response.ok ? await response.json() as MapLights : null;
+  } catch {
+    return null;
+  }
+}
+
 // The direct (sun) and ambient colours at a point, 0 to 1 (sRGB).
 export interface LightColors {
   direct: Rgb;

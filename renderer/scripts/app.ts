@@ -4,7 +4,7 @@ import { parseOnlineList, playersFromDatabase } from './utils/online-players';
 import { type ActiveInstanceSession, type DungeonFloor, type DungeonMapFloor, type InstanceCoordinateBounds, type InstanceProjectionViewport, type InstanceViewTransform, applyInstanceViewTransform, getBattlegroundObjectiveLabels, getBattlegroundStatusLabel, getBattlegroundStrategyLabel, getInstanceCoordinateBounds, getInstanceFactionColor, getInstanceMapProfile, getInstanceProjectionViewport, getParticipantDungeonFloor, groupActiveInstanceSessions, parseInstanceSessionKey, zoomInstanceViewAt, INSTANCE_MAX_ZOOM, isSceneryCreature } from './utils/instance-watch';
 import { clampIsoPitch, type CompassPoint, createFlatProjection, createIsoView, DEFAULT_ISO_YAW, type FadeSettings, getCompassDirections, getFadeVolumes, getHeightBand, getIsoPanForCenter, getNextQuarterTurn, ISO_PITCH, type IsoView, type MapProjection, resolveMinimapTileProjection, type SceneBox } from './utils/map-projection';
 import { InstanceSceneView, type SceneLighting } from './instance-scene/scene-view';
-import type { MapLights } from './utils/map-light';
+import { fetchMapLights, type MapLights } from './utils/map-light';
 import type { UnitModelPose } from './instance-scene/unit-models';
 import type { GameObjectPose } from './instance-scene/game-objects';
 import {
@@ -7291,10 +7291,7 @@ async function loadInstanceMapLights(mapId: number): Promise<void> {
   if (instanceMapLights.has(mapId) || instanceMapLightLoads.has(mapId)) return;
   instanceMapLightLoads.add(mapId);
   try {
-    const response = await fetch(`assets/models/light/${mapId}.json`);
-    instanceMapLights.set(mapId, response.ok ? await response.json() as MapLights : null);
-  } catch {
-    instanceMapLights.set(mapId, null);
+    instanceMapLights.set(mapId, await fetchMapLights(mapId));
   } finally {
     instanceMapLightLoads.delete(mapId);
     if (getSelectedInstanceSession()?.mapId === mapId) renderInstanceCanvas();

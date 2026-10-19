@@ -51,7 +51,7 @@ import { ALL_SPELL_AIDS, type SpellAids, SpellEffectLayer, type UnitAnchorRole }
 import { buildLayerArray, BYTE_SHADING_SCALE, createTerrainMaterial, prepareAlphaAtlas } from './terrain-material';
 import { GameObjectLayer, type GameObjectPose } from './game-objects';
 import { type BearerAreaCircle, SpellVisualLayer, type UnitInfo } from './spell-visual-layer';
-import { clientLight, type ModelLight, type UnitLook, type UnitModelPose, UnitModelLayer } from './unit-models';
+import { clientLight, type ModelLight, NEUTRAL_LIGHT, type UnitLook, type UnitModelPose, UnitModelLayer } from './unit-models';
 import {
   LIT_SUM_FUNCTION, MAX_POINT_LIGHTS, MODEL_POINT_LIGHTS, POINT_LIGHT_FRAGMENT_DECLARATIONS, POINT_LIGHT_VERTEX_DECLARATIONS,
   pointLightDefines, pointLightVertex,
@@ -164,14 +164,12 @@ const PROP_BRIGHTNESS = 0.75;
 // How the scene is lit: by the map's own light (Light.dbc, at the view's
 // centre and the time of day), or by a fixed neutral white.
 export type SceneLighting = 'client' | 'neutral';
-const NEUTRAL_AMBIENT = 2.2;
-const NEUTRAL_SUN = 1.6;
 // With the map's light, models and terrain are lit as the client lights
 // them (see clientLight in unit-models.ts): ambient plus direct times N.L,
 // summed in the client's colour space, with no gain.
 // Towards the sun, in three.js world space, for the neutral look; the
 // client's moves through the day (sunDirection).
-const NEUTRAL_SUN_TOWARDS = new Vector3(0.4, 1, 0.6).normalize();
+const NEUTRAL_SUN_TOWARDS = new Vector3(...NEUTRAL_LIGHT.sunPosition).normalize();
 // Indoor light for units in a building: the floor's colour under them,
 // sampled by a ray from this far above their feet; resampled once they
 // move this far, at most this many a frame.
@@ -730,8 +728,8 @@ export class InstanceSceneView {
   private readonly renderer: WebGLRenderer;
   private readonly scene = new Scene();
   private readonly camera = new OrthographicCamera();
-  private readonly ambient = new AmbientLight(0xffffff, NEUTRAL_AMBIENT);
-  private readonly sun = new DirectionalLight(0xffffff, NEUTRAL_SUN);
+  private readonly ambient = new AmbientLight(0xffffff, NEUTRAL_LIGHT.ambient);
+  private readonly sun = new DirectionalLight(0xffffff, NEUTRAL_LIGHT.sun);
   private mapLights: MapLights | null = null;
   private lighting: SceneLighting = 'client';
   private objectLightsOn = true;
@@ -835,7 +833,7 @@ export class InstanceSceneView {
     this.gameObjects = new GameObjectLayer(this.redraw, ground);
     this.scene.add(this.gameObjects.group);
     this.scene.add(this.ambient);
-    this.sun.position.set(0.4, 1, 0.6);
+    this.sun.position.set(...NEUTRAL_LIGHT.sunPosition);
     this.scene.add(this.sun);
     canvas.addEventListener('webglcontextlost', (event) => {
       event.preventDefault();
@@ -1505,8 +1503,8 @@ export class InstanceSceneView {
     else this.sunTowards.copy(NEUTRAL_SUN_TOWARDS);
     // The scene's own lights only for the neutral look; the client's light
     // is drawn by the materials themselves.
-    this.ambient.intensity = colors ? 0 : NEUTRAL_AMBIENT;
-    this.sun.intensity = colors ? 0 : NEUTRAL_SUN;
+    this.ambient.intensity = colors ? 0 : NEUTRAL_LIGHT.ambient;
+    this.sun.intensity = colors ? 0 : NEUTRAL_LIGHT.sun;
     const on = colors ? 1 : 0;
     const ambient: Rgb = colors?.ambient ?? [0, 0, 0];
     const direct: Rgb = colors?.direct ?? [0, 0, 0];

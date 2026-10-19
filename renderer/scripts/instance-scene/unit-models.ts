@@ -84,6 +84,11 @@ export interface ModelLight {
   upward: number;
 }
 
+// The neutral look's own lights, which light models (and the scene's
+// shaded props) while the client's light is off: a white ambient and a sun,
+// their intensities and the sun's place.
+export const NEUTRAL_LIGHT = { ambient: 2.2, sun: 1.6, sunPosition: [0.4, 1, 0.6] as const };
+
 // The map's light as the client lights models: the ambient plus the direct
 // light (each channel at most 1) times N.L, the sum at most 1, in the
 // client's (gamma) colour space and then made linear (litColor in

@@ -13,11 +13,11 @@ import { serverToThree } from './instance-scene/iso-camera';
 import { skyEffectLight } from './instance-scene/m2-effect';
 import { SpellEffectLayer, type UnitAnchorRole } from './instance-scene/spell-effects';
 import { SpellVisualLayer } from './instance-scene/spell-visual-layer';
-import { clientLight, type UnitModelPose, UnitModelLayer } from './instance-scene/unit-models';
+import { clientLight, NEUTRAL_LIGHT, type UnitModelPose, UnitModelLayer } from './instance-scene/unit-models';
 import type { StreamCombatEvent } from '../../src/types/api';
 import { PARTICLE_GROUND_DEPTH } from './utils/m2-tracks';
 import {
-  floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors, lightAt, type MapLights, type Rgb, sunDirection,
+  fetchMapLights, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors, lightAt, type MapLights, type Rgb, sunDirection,
 } from './utils/map-light';
 import { CombatEffectStore, type Point3, type UnitKey, unitKey } from './utils/spell-events';
 
@@ -56,8 +56,6 @@ const STATS_INTERVAL_MS = 1000;
 // the forge floor's vertex colour (Utgarde Keep, group 22843).
 const NOON = 1440;
 const FORGE_FLOOR: Rgb = [108 / 255, 80 / 255, 56 / 255];
-const NEUTRAL_AMBIENT = 2.2;
-const NEUTRAL_SUN = 1.6;
 
 // What one play of a spell is: the form's fields, or a preset's.
 interface Preset {
@@ -170,10 +168,10 @@ const renderer = new WebGLRenderer({ canvas, antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio || 1);
 const scene = new Scene();
 scene.background = new Color(0x0b1220);
-const ambientLight = new AmbientLight(0xffffff, NEUTRAL_AMBIENT);
+const ambientLight = new AmbientLight(0xffffff, NEUTRAL_LIGHT.ambient);
 scene.add(ambientLight);
-const sun = new DirectionalLight(0xffffff, NEUTRAL_SUN);
-sun.position.set(0.4, 1, 0.6);
+const sun = new DirectionalLight(0xffffff, NEUTRAL_LIGHT.sun);
+sun.position.set(...NEUTRAL_LIGHT.sunPosition);
 scene.add(sun);
 // The ring's reach, for the floor and camera in stress mode.
 const reach = stress > 0 ? ringRadius(stress) + TARGET_DISTANCE + 4 : 0;
@@ -356,8 +354,7 @@ function chosenLight(): { colors: LightColors; towards: Point3 } | null {
   const known = mapLights.get(mapId);
   if (known === undefined) {
     mapLights.set(mapId, 'loading');
-    fetch(`assets/models/light/${mapId}.json`).then((response) => (response.ok ? response.json() as Promise<MapLights> : null))
-      .catch(() => null).then((lights) => mapLights.set(mapId, lights));
+    void fetchMapLights(mapId).then((lights) => mapLights.set(mapId, lights));
   }
   if (!known || known === 'loading') return null;
   const area = known.lights.filter((light) => light.position).sort((left, right) => right.outer - left.outer)[0];
@@ -369,8 +366,8 @@ function chosenLight(): { colors: LightColors; towards: Point3 } | null {
 function applyLighting(): void {
   const chosen = chosenLight();
   const on = chosen ? 1 : 0;
-  ambientLight.intensity = chosen ? 0 : NEUTRAL_AMBIENT;
-  sun.intensity = chosen ? 0 : NEUTRAL_SUN;
+  ambientLight.intensity = chosen ? 0 : NEUTRAL_LIGHT.ambient;
+  sun.intensity = chosen ? 0 : NEUTRAL_LIGHT.sun;
   const ambient = chosen?.colors.ambient ?? [0, 0, 0];
   const direct = chosen?.colors.direct ?? [0, 0, 0];
   const towards = serverToThree(chosen?.towards ?? [0, 0, 1]).normalize();
