@@ -235,11 +235,13 @@ varying vec3 vWowNormal;
 #endif
 #ifdef WOW_PROP_LIGHT
 attribute vec3 wowPropKind;
+varying vec3 vWowPropKind;
+#ifdef WOW_PROP_INDOOR
 attribute vec3 wowPropDirect;
 attribute vec3 wowPropAmbient;
-varying vec3 vWowPropKind;
 varying vec3 vWowPropDirect;
 varying vec3 vWowPropAmbient;
+#endif
 #endif
 `;
 const FADE_VERTEX = `
@@ -248,8 +250,10 @@ vWowNormal = normalize(normalMatrix * normal);
 #endif
 #ifdef WOW_PROP_LIGHT
 vWowPropKind = wowPropKind;
+#ifdef WOW_PROP_INDOOR
 vWowPropDirect = wowPropDirect;
 vWowPropAmbient = wowPropAmbient;
+#endif
 #endif
 vec4 wowLocal = vec4(transformed, 1.0);
 #ifdef USE_INSTANCING
@@ -272,8 +276,10 @@ const FADE_FRAGMENT_DECLARATIONS = `${SCENE_BLOCK_DECLARATION}${POINT_LIGHT_FRAG
 varying vec3 vWowPosition;
 #ifdef WOW_PROP_LIGHT
 varying vec3 vWowPropKind;
+#ifdef WOW_PROP_INDOOR
 varying vec3 vWowPropDirect;
 varying vec3 vWowPropAmbient;
+#endif
 #endif
 #ifdef WOW_BUILDING
 varying vec3 vWowNormal;
@@ -331,6 +337,7 @@ if (wowClientAmbientPacked.w > 0.5) {
   vec3 wowDirect = wowClientDirectPacked.rgb;
   vec3 wowTowards = wowClientSunPacked.xyz;
 #ifdef WOW_PROP_LIGHT
+#ifdef WOW_PROP_INDOOR
   if (vWowPropKind.x < 0.5) {
     float wowShare = vWowPropKind.y;
     wowAmbient = mix(vWowPropAmbient, wowClientAmbientPacked.rgb, wowShare);
@@ -338,6 +345,7 @@ if (wowClientAmbientPacked.w > 0.5) {
     wowTowards = mix(wowClientIndoorPacked.xyz, wowClientSunPacked.xyz, wowShare);
     wowTowards = dot(wowTowards, wowTowards) > 1e-6 ? normalize(wowTowards) : wowClientSunPacked.xyz;
   }
+#endif
   wowDirect *= vWowPropKind.z;
 #endif
   vec3 wowLight = wowLitSum(wowAmbient, wowDirect, dot(normal, wowTowards), WOW_POINTS);
@@ -464,8 +472,11 @@ function propFloors(mesh: Mesh): ArrayLike<number> | null {
 // building floor under as outdoors.
 interface PropLight {
   kind: Float32Array;
-  direct: Float32Array;
-  ambient: Float32Array;
+  // The floor's light, only where a copy stands indoors (WOW_PROP_INDOOR):
+  // a prop the client lights by the outdoor light alone carries just its
+  // copies' direct scale.
+  direct: Float32Array | null;
+  ambient: Float32Array | null;
 }
 const propLights = new WeakMap<object, PropLight>();
 // Each per-copy attribute and the PropLight array it is filled from, three
@@ -475,8 +486,10 @@ const PROP_LIGHT_ATTRIBUTES = [['wowPropKind', 'kind'], ['wowPropDirect', 'direc
 function propLight(floors: ArrayLike<number>): PropLight {
   const count = floors.length / 4;
   const kind = new Float32Array(count * 3);
-  const direct = new Float32Array(count * 3);
-  const ambient = new Float32Array(count * 3);
+  let indoors = false;
+  for (let index = 0; index < count; index += 1) indoors ||= floors[index * 4] >= 0;
+  const direct = indoors ? new Float32Array(count * 3) : null;
+  const ambient = indoors ? new Float32Array(count * 3) : null;
   for (let index = 0; index < count; index += 1) {
     const [r, g, b, share] = [floors[index * 4], floors[index * 4 + 1], floors[index * 4 + 2], floors[index * 4 + 3]];
     if (r < 0) {
@@ -484,8 +497,8 @@ function propLight(floors: ArrayLike<number>): PropLight {
     } else {
       const light = indoorLight([r, g, b]);
       kind.set([0, share, 1], index * 3);
-      direct.set(light.direct, index * 3);
-      ambient.set(light.ambient, index * 3);
+      direct!.set(light.direct, index * 3);
+      ambient!.set(light.ambient, index * 3);
     }
   }
   return { kind, direct, ambient };
@@ -569,7 +582,10 @@ function applyPropLight(mesh: Mesh, floors: ArrayLike<number>): void {
   geometry.boundingSphere = source.boundingSphere?.clone() ?? null;
   geometry.setDrawRange(source.drawRange.start, source.drawRange.count);
   geometry.userData = source.userData;
-  for (const [name, field] of PROP_LIGHT_ATTRIBUTES) geometry.setAttribute(name, new InstancedBufferAttribute(light[field].slice(), 3));
+  for (const [name, field] of PROP_LIGHT_ATTRIBUTES) {
+    const values = light[field];
+    if (values) geometry.setAttribute(name, new InstancedBufferAttribute(values.slice(), 3));
+  }
   mesh.userData.wowPropLight = light;
   mesh.geometry = geometry;
 }
@@ -1433,11 +1449,13 @@ export class InstanceSceneView {
       const light = mesh.userData.wowPropLight as PropLight | undefined;
       if (light) {
         for (const [name, field] of PROP_LIGHT_ATTRIBUTES) {
+          const values = light[field];
+          if (!values) continue;
           const attribute = mesh.geometry.getAttribute(name) as InstancedBufferAttribute;
           const target = attribute.array as Float32Array;
           for (let slot = 0; slot < count; slot += 1) {
             const from = instances.shown[slot] * 3;
-            target.set(light[field].subarray(from, from + 3), slot * 3);
+            target.set(values.subarray(from, from + 3), slot * 3);
           }
           attribute.needsUpdate = true;
         }
@@ -1579,6 +1597,7 @@ export class InstanceSceneView {
     const floors = vertexLit ? null : propFloors(mesh) ?? (isWorldProp(mesh) ? worldPropFloors(mesh) : null);
     if (floors && !mesh.geometry.getAttribute('wowPropKind')) applyPropLight(mesh, floors);
     const propLightReady = Boolean(floors);
+    const propIndoors = Boolean((mesh.userData.wowPropLight as PropLight | undefined)?.direct);
     const convert = (source: Material): Material => {
       // Terrain: its texture layers blended through its alpha atlas, lit by
       // the scene's lights (it has no baked lighting), with its vertex
@@ -1617,7 +1636,7 @@ export class InstanceSceneView {
       const shaded = litProp && (propLit || isWorldProp(mesh));
       const light = building ? buildingBatchLight(building.batch, building.counts, building.unified, building.flags,
         (source.userData.wowMapObjFlags as number | undefined) ?? 0) : null;
-      const key = `${source.uuid}|${vertexLit}|${exteriorLit}|${shaded}|${propLit}|${floor}|${mesh instanceof InstancedMesh}|${m2Flags}`
+      const key = `${source.uuid}|${vertexLit}|${exteriorLit}|${shaded}|${propLit}|${propIndoors}|${floor}|${mesh instanceof InstancedMesh}|${m2Flags}`
         + (building ? `|${light}|${building.unified ? building.ambient : ''}` : '');
       const cached = this.materials.get(key);
       if (cached) return cached;
@@ -1652,7 +1671,7 @@ export class InstanceSceneView {
       });
       material.onBeforeCompile = injectPartyFade;
       if (neutralScale !== 1) material.defines = { ...material.defines, WOW_NEUTRAL_SCALE: neutralScale.toFixed(2) };
-      if (propLit) material.defines = { ...material.defines, WOW_PROP_LIGHT: '' };
+      if (propLit) material.defines = { ...material.defines, WOW_PROP_LIGHT: '', ...(propIndoors ? { WOW_PROP_INDOOR: '' } : {}) };
       // Lit props pick their point lights by where they stand.
       if (shaded) material.defines = { ...material.defines, ...pointLightDefines(MODEL_POINT_LIGHTS, true) };
       if (floor) onGround(material);
