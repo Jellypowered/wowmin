@@ -631,8 +631,10 @@ export async function exportMapScene({
         .setAttribute('_CELL', accessor('VEC2', tile.cells))
         .setIndices(accessor('SCALAR', tile.indices))
         .setMaterial(material));
+      // The tile's baked shadow by chunk, which the client shades units and
+      // props by (the atlas carries the same for the ground's look).
       root.addChild(document.createNode(`terrain-${x}-${y}`).setMesh(mesh)
-        .setExtras({ kind: 'terrain', tile: [x, y], minZ: tile.bounds.minZ, maxZ: tile.bounds.maxZ }));
+        .setExtras({ kind: 'terrain', tile: [x, y], minZ: tile.bounds.minZ, maxZ: tile.bounds.maxZ, wowShadows: tile.shadows }));
       terrain.tiles += 1;
       terrain.chunks += tile.chunkCount;
       tileBounds.push(tile.bounds);

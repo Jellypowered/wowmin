@@ -1236,12 +1236,17 @@ export class InstanceSceneView {
       const frames = await this.liquidFrames(gltf);
       const liquids: Array<{ material: MeshBasicMaterial; frames: Texture[] }> = [];
       numberBuildingBatches(root);
-      // The ground's baked shadow, from each tile's alpha atlas.
+      // The ground's baked shadow, by chunk (or for older scenes from each
+      // tile's alpha atlas).
       const shadows = new TerrainShadows();
       root.traverse((object) => {
         const material = object instanceof Mesh ? object.material as Material : null;
-        const alpha = material?.userData.wowTerrain ? terrain?.alphas.get(material.userData.alpha as string) : undefined;
-        if (alpha) shadows.addTile(material!.userData.origin as [number, number], () => atlasAlpha(alpha));
+        if (!material?.userData.wowTerrain) return;
+        const origin = material.userData.origin as [number, number];
+        const chunks = object.userData.wowShadows as Array<string | null> | undefined;
+        const alpha = terrain?.alphas.get(material.userData.alpha as string);
+        if (chunks) shadows.addChunks(origin, chunks);
+        else if (alpha) shadows.addTile(origin, () => atlasAlpha(alpha));
       });
       root.traverse((object) => {
         if (!(object instanceof Mesh)) return;

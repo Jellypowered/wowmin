@@ -376,6 +376,9 @@ test('reads MCSH shadows a bit per texel, least significant first', async () => 
   const [shadow] = readShadows(mcnk);
   assert.equal(shadow[1 * SPLAT_SIZE + 2], 1);
   assert.equal(shadow.reduce((sum, value) => sum + value, 0), 1);
+  // Scenes carry it as the client keeps it: MCSH's own bytes.
+  const { encodeShadow } = await load('terrain.mjs');
+  assert.equal(encodeShadow(shadow), mcsh.subarray(8).toString('base64'));
   header.writeUInt32LE(0, 0x00);
   const noFlag = Buffer.concat([Buffer.from('KNCM', 'ascii'), Buffer.alloc(4), header, mcsh]);
   noFlag.writeUInt32LE(header.length + mcsh.length, 4);

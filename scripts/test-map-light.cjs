@@ -12,7 +12,7 @@ function loadModule(relativePath) {
   const output = esbuild.buildSync({
     entryPoints: [path.join(__dirname, relativePath)], bundle: true, write: false, platform: 'node', format: 'cjs',
   }).outputFiles[0].text;
-  const context = { module: { exports: {} }, Math, Date };
+  const context = { module: { exports: {} }, Math, Date, atob };
   context.exports = context.module.exports;
   vm.runInNewContext(output, context);
   return context.module.exports;
@@ -315,4 +315,17 @@ test('finds the shadow texel under a point as the client does, by its tile\'s co
   assert.equal(tiles.isShadowed(999, 1999), false);
   assert.equal(tiles.isShadowed(5000, 5000), false, 'off the tiles');
   assert.equal(reads, 1, 'read once');
+  // A scene's own chunk shadows: chunk 17 (row 1, column 1), texel (2, 3)
+  // in it.
+  const bytes = new Uint8Array(512);
+  const bit = 2 * 64 + 3;
+  bytes[bit >> 3] |= 1 << (bit & 7);
+  const chunks = new Array(256).fill(null);
+  chunks[17] = Buffer.from(bytes).toString('base64');
+  const byChunk = new shadow.TerrainShadows();
+  byChunk.addChunks(origin, chunks);
+  const texel = chunk / 64;
+  assert.equal(byChunk.isShadowed(1000 - chunk - 2.5 * texel, 2000 - chunk - 3.5 * texel), true);
+  assert.equal(byChunk.isShadowed(1000 - chunk - 2.5 * texel, 2000 - chunk - 4.5 * texel), false);
+  assert.equal(byChunk.isShadowed(999, 1999), false, 'a chunk without shadow');
 });
