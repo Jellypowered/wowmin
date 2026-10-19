@@ -95,6 +95,10 @@ const WATER_FRAGMENT = `
 // to sit in the same range. Tuned by eye against Azjol-Nerub.
 const VERTEX_LIT_BRIGHTNESS = 2;
 const UNLIT_BRIGHTNESS = 0.75;
+// The vertex colour the client gives a building group that has none: 127 on
+// its older render path, 0 on its newer one.
+const NO_MOCV_OLDER = 127 / 255;
+const NO_MOCV_UNIFIED = 0;
 // With the map's light, a building's batches as the client draws them (see
 // buildingBatchLight): texture x 2 x a colour, all in the client's (gamma)
 // colour space, so made linear here. The colour is the vertex colour (MOCV)
@@ -102,12 +106,19 @@ const UNLIT_BRIGHTNESS = 0.75;
 // of either light added on the newer one (the building's own ambient
 // indoors); the props' point lights join both lights; transition batches
 // mix the two by the vertex alpha. WOW_BUILDING
-// is 0 unlit, 1 own, 2 lit, 3 transition. Without the map's light, the old
-// look: vertex colours doubled, outdoor groups' brightened instead (and the
-// vertex alpha never changes the surface's).
+// is 0 unlit, 1 own, 2 lit, 3 transition. A group with no vertex colours
+// takes the constant the client fills them with (WOW_NO_MOCV: half on the
+// older path, black on the newer), so its lit batches light as the ground
+// does. Without the map's light, the old look: vertex colours doubled,
+// outdoor groups' brightened instead (and the vertex alpha never changes the
+// surface's); a group with none, the neutral dimming (WOW_NEUTRAL_SCALE).
 const BUILDING_LIGHT = { unlit: 0, own: 1, lit: 2, transition: 3 } as const satisfies Record<BuildingBatchLight, number>;
 const BUILDING_LIGHT_FRAGMENT = `
+#ifdef WOW_NO_MOCV
+vec3 wowMocv = vec3(WOW_NO_MOCV);
+#else
 vec3 wowMocv = vColor.rgb;
+#endif
 if (wowClientAmbientPacked.w > 0.5) {
   vec3 wowNormal = normalize(vWowNormal);
   vec3 wowPoints = wowPointLight(vWowView, wowNormal);
@@ -135,7 +146,8 @@ if (wowClientAmbientPacked.w > 0.5) {
 #endif
   diffuseColor.rgb *= pow(2.0 * wowColor, vec3(2.2));
 } else {
-#ifdef WOW_EXTERIOR_GROUP
+#if defined(WOW_NO_MOCV)
+#elif defined(WOW_EXTERIOR_GROUP)
   diffuseColor.rgb *= wowMocv + ${UNLIT_BRIGHTNESS.toFixed(2)};
 #else
   diffuseColor.rgb *= wowMocv * ${VERTEX_LIT_BRIGHTNESS.toFixed(1)};
@@ -1610,8 +1622,8 @@ export class InstanceSceneView {
   private convertMaterial(mesh: Mesh, terrain: TerrainTextures | null): Material | Material[] {
     const vertexLit = Boolean(mesh.geometry.getAttribute('color'));
     const exteriorLit = vertexLit && isExteriorGroup(mesh);
-    const building = vertexLit ? buildingBatch(mesh) : null;
-    const inBuilding = building !== null || buildingBatch(mesh) !== null;
+    const building = buildingBatch(mesh);
+    const inBuilding = building !== null;
     const floors = vertexLit ? null : propFloors(mesh) ?? (isWorldProp(mesh) ? worldPropFloors(mesh) : null);
     if (floors && !mesh.geometry.getAttribute('wowPropKind')) applyPropLight(mesh, floors);
     const propLightReady = Boolean(floors);
@@ -1646,7 +1658,7 @@ export class InstanceSceneView {
       const rule = m2Flags === undefined ? null : m2MaterialLight(blend, m2Flags);
       const modulates = !vertexLit && (blend === 'mod' || blend === 'mod2x');
       const solid = (blend === 'opaque' || blend === 'alphaKey') && source.opacity >= 1 && (rule?.depthWrite ?? true);
-      const litProp = !vertexLit && (rule ? rule.lit : blend === 'opaque' || blend === 'alphaKey');
+      const litProp = !vertexLit && !building && (rule ? rule.lit : blend === 'opaque' || blend === 'alphaKey');
       // A building's solid batches are its floors as well as its walls.
       const floor = solid && inBuilding;
       const propLit = litProp && propLightReady;
@@ -1696,6 +1708,7 @@ export class InstanceSceneView {
           WOW_BUILDING: BUILDING_LIGHT[light],
           ...(building.unified ? { WOW_BUILDING_UNIFIED: '' } : {}),
           ...(exteriorLit ? { WOW_EXTERIOR_GROUP: '' } : {}),
+          ...(vertexLit ? {} : { WOW_NO_MOCV: (building.unified ? NO_MOCV_UNIFIED : NO_MOCV_OLDER).toFixed(6) }),
         };
         material.userData.wowBuildingAmbient = new Color(building.ambient);
         material.onBeforeCompile = injectBuildingLight;
