@@ -99,10 +99,13 @@ test('reads the MOGP group ID, flags, and doodad references from a WMO group', a
   const refs = Buffer.alloc(4);
   refs.writeUInt16LE(3, 0);
   refs.writeUInt16LE(9, 2);
-  const group = Buffer.concat([chunk('MVER', Buffer.alloc(4)), chunk('MOGP', Buffer.concat([header, chunk('MODR', refs)]))]);
+  // MOBR, the collision tree's triangles: listed once each, in order.
+  const mobr = Buffer.from(Uint16Array.of(5, 2, 5, 7).buffer);
+  const group = Buffer.concat([chunk('MVER', Buffer.alloc(4)), chunk('MOGP', Buffer.concat([header, chunk('MODR', refs), chunk('MOBR', mobr)]))]);
   assert.deepEqual(readGroupHeader(group), {
     flags: 0x2805,
     polyFlags: null,
+    bspFaces: Uint32Array.of(2, 5, 7),
     renderBatches: [],
     boundingBox: [-1, -2, -3, 4, 5, 6],
     transBatchCount: 3,
@@ -139,6 +142,30 @@ test('lights a building\'s prop by the floor under it, as the client does', asyn
   assert.equal(propFloor(wmo, 2, [0, 0, 0]), 'outdoor');
   assert.equal(propFloor(wmo, 0, [8, 2, 20]), null, 'more than 12 yards above the floor');
   assert.equal(propFloor(wmo, 5, [0, 0, 0]), null, 'listed by no group');
+});
+
+test('finds a prop\'s floor among drawn and detail faces of the collision tree, never collision-only ones', async () => {
+  const { propFloor, floorFaces } = await load('wmo.mjs');
+  // Three squares' first triangles over the same spot: a drawn face at 0
+  // (warm), a collision-only face at 0.5 (grey), and a drawn face at 0.8
+  // the collision tree leaves out.
+  const square = (z) => [0, 0, z, 10, 0, z, 10, 10, z];
+  const positions = Float32Array.from([...square(0), ...square(0.5), ...square(0.8)]);
+  const bgra = (b, g, r) => [b, g, r, 255, b, g, r, 255, b, g, r, 255];
+  const colors = Uint8Array.from([...bgra(28, 40, 54), ...bgra(63, 63, 63), ...bgra(0, 0, 100)]);
+  const group = {
+    flags: 0x2000, doodadRefs: [0], positions, colors,
+    indices: Uint16Array.from([0, 1, 2, 3, 4, 5, 6, 7, 8]),
+    polyFlags: Buffer.from([0x24, 0, 0x08, 0xff, 0x20, 0]),
+    bspFaces: Uint32Array.of(0, 1),
+  };
+  assert.deepEqual(floorFaces(group), { floor: [0], transition: [] });
+  const [r, g, b] = propFloor({ rootFlags: 0, ambient: 0, groups: [group] }, 0, [8, 2, 0.9]);
+  [108 / 255, 80 / 255, 56 / 255].forEach((expected, index) => assert.ok(Math.abs([r, g, b][index] - expected) < 1e-6, `${index}`));
+  // Without a collision tree every face counts, the highest drawn one winning.
+  const noTree = { ...group, bspFaces: null };
+  assert.deepEqual(floorFaces(noTree), { floor: [0, 2], transition: [] });
+  assert.ok(Math.abs(propFloor({ rootFlags: 0, ambient: 0, groups: [noTree] }, 0, [8, 2, 0.9])[0] - 200 / 255) < 1e-6);
 });
 
 test('selects the global doodad set plus the placement set', async () => {
@@ -349,6 +376,9 @@ test('reads MCSH shadows a bit per texel, least significant first', async () => 
   const [shadow] = readShadows(mcnk);
   assert.equal(shadow[1 * SPLAT_SIZE + 2], 1);
   assert.equal(shadow.reduce((sum, value) => sum + value, 0), 1);
+  // Scenes carry it as the client keeps it: MCSH's own bytes.
+  const { encodeShadow } = await load('terrain.mjs');
+  assert.equal(encodeShadow(shadow), mcsh.subarray(8).toString('base64'));
   header.writeUInt32LE(0, 0x00);
   const noFlag = Buffer.concat([Buffer.from('KNCM', 'ascii'), Buffer.alloc(4), header, mcsh]);
   noFlag.writeUInt32LE(header.length + mcsh.length, 4);

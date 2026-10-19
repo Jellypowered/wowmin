@@ -1,7 +1,7 @@
-// A map's light at a point and a time of day, as the client blends it: each
-// area light in full inside its inner radius, fading out to its outer one,
-// and the map's default light making up the rest. Pure, so it can be tested
-// without three.js. The lights come from /assets/models/light/<mapId>.json
+// A map's light at a point and a time of day, as the client blends it: the
+// map's default light, with each area light mixed over it in turn, in full
+// inside its inner radius and fading out to its outer one. Pure, so it can
+// be tested without three.js. The lights come from /assets/models/light/<mapId>.json
 // (scripts/scene/lights.mjs).
 
 import type { Point3 } from './spell-events';
@@ -22,14 +22,12 @@ export interface MapLight {
   ambient: LightKeys;
 }
 
-// A light on a building or prop (a torch's, a brazier's): server
-// coordinates, colour, intensity, and the yards its light fades out between.
+// A prop's point light (a torch's, a brazier's): server coordinates, its
+// colour (0xRRGGBB) and intensity, which it shines by together.
 export interface ObjectLight {
   position: Point3;
   color: number;
   intensity: number;
-  start: number;
-  end: number;
 }
 
 // An interior WMO group's part in lighting units on its floor: the
@@ -58,6 +56,17 @@ export interface MapLights {
 
 export type Rgb = [number, number, number];
 
+// A map's lights as the server builds them, or null if it has none (or
+// they could not be fetched).
+export async function fetchMapLights(mapId: number): Promise<MapLights | null> {
+  try {
+    const response = await fetch(`assets/models/light/${mapId}.json`);
+    return response.ok ? await response.json() as MapLights : null;
+  } catch {
+    return null;
+  }
+}
+
 // The direct (sun) and ambient colours at a point, 0 to 1 (sRGB).
 export interface LightColors {
   direct: Rgb;
@@ -66,21 +75,12 @@ export interface LightColors {
 
 export const HALF_MINUTES_PER_DAY = 2880;
 
-// The map's light as the client draws it on the ground is brighter and less
-// orange than the plain sum of its colours: matched to the user's client
-// screenshot of Arathi Basin against ours at 17:33 (docs/profile/
-// *-reference.png; the client's ground is about 1.3x ours in red, 1.5x in
-// green, 1.6x in blue), the ambient counts this much and the sun this much
-// (with the client's sun, 21 degrees up then; sunDirection).
-export const CLIENT_AMBIENT_GAIN = 1.65;
-export const CLIENT_DIRECT_GAIN = 2.79;
-
 // The time of day in the client's units (half-minutes from midnight).
 export function timeOfDay(date: Date): number {
   return (date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60) * 2;
 }
 
-const toRgb = (color: number): Rgb => [((color >> 16) & 0xff) / 255, ((color >> 8) & 0xff) / 255, (color & 0xff) / 255];
+export const toRgb = (color: number): Rgb => [((color >> 16) & 0xff) / 255, ((color >> 8) & 0xff) / 255, (color & 0xff) / 255];
 
 // A band's colour at a time: between the keys either side, wrapping past
 // midnight; the one colour of a single key; black with none.
@@ -110,46 +110,63 @@ export function lightWeight(light: MapLight, point: Point3): number {
   return 1 - (distance - light.inner) / (light.outer - light.inner);
 }
 
-// The `count` object lights nearest a point, within `reach` yards of it.
-export function nearestObjectLights(objects: readonly ObjectLight[], point: Point3, count: number, reach: number): ObjectLight[] {
+// The `count` object lights nearest a point, as the client picks a model's
+// lights: by distance alone, with no range.
+export function nearestObjectLights(objects: readonly ObjectLight[], point: Point3, count: number): ObjectLight[] {
   return objects
     .map((light) => ({ light, distance: Math.hypot(light.position[0] - point[0], light.position[1] - point[1], light.position[2] - point[2]) }))
-    .filter(({ distance }) => distance <= reach)
     .sort((left, right) => left.distance - right.distance)
     .slice(0, count)
     .map(({ light }) => light);
 }
 
-// The map's light at a point and time: the area lights by weight (scaled
-// down if they add to more than one), the default light for the rest.
+// The map's light at a point and time, as the client mixes it: from the
+// default light's colours, each area light that reaches the point mixed over
+// them by its weight, the farthest first.
 export function lightAt(map: MapLights, point: Point3, time: number): LightColors {
-  const direct: Rgb = [0, 0, 0];
-  const ambient: Rgb = [0, 0, 0];
-  const weighted = map.lights.filter((light) => !light.defaultLight)
-    .map((light) => ({ light, weight: lightWeight(light, point) }))
-    .filter(({ weight }) => weight > 0);
-  const total = weighted.reduce((sum, { weight }) => sum + weight, 0);
-  const scale = total > 1 ? 1 / total : 1;
-  const add = (light: MapLight, weight: number) => {
+  const fallback = map.lights.find((light) => light.defaultLight);
+  const direct = fallback ? keyColor(fallback.direct, time) : [0, 0, 0] as Rgb;
+  const ambient = fallback ? keyColor(fallback.ambient, time) : [0, 0, 0] as Rgb;
+  const reaching = map.lights.filter((light) => !light.defaultLight && light.position)
+    .map((light) => ({ light, weight: lightWeight(light, point), distance: Math.hypot(
+      point[0] - light.position![0], point[1] - light.position![1], point[2] - light.position![2]) }))
+    .filter(({ weight }) => weight > 0)
+    .sort((left, right) => right.distance - left.distance);
+  for (const { light, weight } of reaching) {
     const d = keyColor(light.direct, time);
     const a = keyColor(light.ambient, time);
     for (let channel = 0; channel < 3; channel += 1) {
-      direct[channel] += d[channel] * weight;
-      ambient[channel] += a[channel] * weight;
+      direct[channel] += (d[channel] - direct[channel]) * weight;
+      ambient[channel] += (a[channel] - ambient[channel]) * weight;
     }
-  };
-  for (const { light, weight } of weighted) add(light, weight * scale);
-  const rest = 1 - Math.min(1, total);
-  const fallback = map.lights.find((light) => light.defaultLight);
-  if (rest > 0 && fallback) add(fallback, rest);
+  }
   return { direct, ambient };
 }
 
+// Every point light fades with distance (yards) by the same curve, whatever
+// its model asks: 1 / (0.7 d + 0.03 d^2), times how squarely it shines on
+// the surface (`facing`, N.L). Its colour times this joins the lit sum.
+export const POINT_LIGHT_LINEAR = 0.7;
+export const POINT_LIGHT_QUADRATIC = 0.03;
+
+export function pointLightShare(distance: number, facing: number): number {
+  return Math.max(0, facing) / (POINT_LIGHT_LINEAR * distance + POINT_LIGHT_QUADRATIC * distance * distance);
+}
+
+// The light the client gives a lit surface (0 to 1, in its own colour
+// space): the ambient, plus the direct light (each channel at most 1) by how
+// squarely the surface faces it (`facing`, N.L), the sum at most 1. Point
+// lights join the sum before the cap.
+export function litColor({ direct, ambient }: LightColors, facing: number): Rgb {
+  const share = Math.min(1, Math.max(0, facing));
+  return [0, 1, 2].map((channel) =>
+    Math.min(1, Math.max(0, ambient[channel] + Math.min(1, direct[channel]) * share))) as Rgb;
+}
+
 // The way the sun's light travels at a time (server coordinates, unit
-// length), as the client turns it through the day (Wow.exe FUN_007eea90, its
-// sky's light direction): from a fixed bearing, 225 degrees round from +x,
-// its angle from straight up 127 degrees at midnight and noon and 110 at six,
-// linear between. So the light is highest (37 degrees up) at noon and
+// length), as the client turns its sky's light through the day: from a
+// fixed bearing, 225 degrees round from +x, its angle from straight up 127
+// degrees at midnight and noon and 110 at six, linear between. So the light is highest (37 degrees up) at noon and
 // midnight and lowest (20 degrees) at six in the morning and evening.
 export const SUN_BEARING = (225 * Math.PI) / 180;
 const SUN_POLAR_HIGH = (127 * Math.PI) / 180;
@@ -164,8 +181,8 @@ export function sunDirection(time: number): Point3 {
 }
 
 // Indoors the client lights a unit by the building's baked light on the floor
-// under it, not by the map's sun and sky (Wow.exe: a ray from 1.5 yards above
-// the unit down into its WMO group, the floor's vertex colour at the hit; its
+// under it, not by the map's sun and sky (a ray from 1.5 yards above the
+// unit down into its WMO group, the floor's vertex colour at the hit; its
 // direct light that colour brightened, hue kept, until its brightest channel
 // is at least 168/255, its ambient the colour dimmed until its brightest
 // channel is at most 96/255), shining from a fixed direction.
@@ -175,7 +192,7 @@ export const INDOOR_AMBIENT_CEILING = 96 / 255;
 export const INDOOR_LIGHT_DIRECTION: Point3 = [-0.3082, -0.3082, -0.9];
 
 // The colour the client lights a unit indoors by, from the floor's vertex
-// colour under it (Wow.exe FUN_007c7fe0): doubled, plus the building's
+// colour under it: doubled, plus the building's
 // ambient if it adds one, each channel at most 1.
 export function floorLight(vertex: Rgb, ambient = 0): Rgb {
   const added = toRgb(ambient);
@@ -183,8 +200,7 @@ export function floorLight(vertex: Rgb, ambient = 0): Rgb {
 }
 
 // Characters' ambient is scaled by 1 + 2 x the zone's multiplier, each
-// channel at most 1 (Wow.exe FUN_007831a0, FUN_007c1730; the console
-// setting characterAmbient).
+// channel at most 1 (the client's characterAmbient setting).
 export function characterAmbientScale(multiplier = 0): number {
   return 1 + 2 * multiplier;
 }
@@ -194,11 +210,37 @@ export function scaleAmbient(ambient: Rgb, scale: number): Rgb {
 }
 
 // On a transition face the client mixes a unit's indoor light towards the
-// outdoor light by the floor colour's alpha (Wow.exe FUN_007c1c40); its
-// light direction too, in the unit's shader.
+// outdoor light by the floor colour's alpha; its light direction too, in
+// the unit's shader.
 export function blendLight(indoor: LightColors, outdoor: LightColors, share: number): LightColors {
   const mix = (from: Rgb, to: Rgb): Rgb => [0, 1, 2].map((channel) => from[channel] + (to[channel] - from[channel]) * share) as Rgb;
   return { direct: mix(indoor.direct, outdoor.direct), ambient: mix(indoor.ambient, outdoor.ambient) };
+}
+
+// How strongly a unit outdoors takes its direct light where the ground's
+// baked shadow lies under it; elsewhere 1. (The client aims higher outside
+// shadow and on transition faces, but the scale never passes 1.)
+export const DIRECT_SCALE_SHADOWED = 0.5;
+
+// A unit's light eases towards where it should be rather than jumping: its
+// ambient by up to this much a second on each channel (2 x 255 in the
+// client's bytes), its direct scale by this much, never above 1.
+export const AMBIENT_EASE_PER_SECOND = 2;
+export const DIRECT_SCALE_EASE_PER_SECOND = 10 / 3;
+
+export interface EasedLight {
+  ambient: Rgb;
+  directScale: number;
+}
+
+const toward = (from: number, to: number, step: number): number => (from < to ? Math.min(to, from + step) : Math.max(to, from - step));
+
+export function easeLight(current: EasedLight, target: EasedLight, seconds: number): EasedLight {
+  const step = AMBIENT_EASE_PER_SECOND * seconds;
+  return {
+    ambient: current.ambient.map((value, channel) => toward(value, target.ambient[channel], step)) as Rgb,
+    directScale: Math.min(1, toward(current.directScale, target.directScale, DIRECT_SCALE_EASE_PER_SECOND * seconds)),
+  };
 }
 
 export function indoorLight(floor: Rgb): LightColors {
@@ -210,9 +252,8 @@ export function indoorLight(floor: Rgb): LightColors {
   };
 }
 
-// How the client lights a building's render batch (Wow.exe FUN_007ac9f0,
-// the older render path, and FUN_007a9380, the newer "unified" one, header
-// flag 0x2): 'own' by the batch's own vertex colours (the newer path adds
+// How the client lights a building's render batch, on its older render
+// path or its newer "unified" one (header flag 0x2): 'own' by the batch's own vertex colours (the newer path adds
 // the building's ambient to them), 'lit' by the map's light on them,
 // 'transition' a mix of the two by the vertex alpha, 'unlit' by the vertex
 // colours alone. A group's batches are its transition ones, then its

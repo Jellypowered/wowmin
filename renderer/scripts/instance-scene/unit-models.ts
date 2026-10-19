@@ -1,5 +1,4 @@
 import {
-  AdditiveBlending,
   type AnimationAction,
   type AnimationClip,
   AnimationMixer,
@@ -16,11 +15,11 @@ import {
   type Frustum,
   type Material,
   Matrix4,
+  Quaternion,
   Mesh,
   MeshBasicMaterial,
   MeshLambertMaterial,
   type MeshStandardMaterial,
-  NormalBlending,
   Object3D,
   RingGeometry,
   Skeleton,
@@ -35,8 +34,10 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
-import type { LightColors } from '../utils/map-light';
+import { type EffectBlend, m2MaterialLight } from '../utils/m2-tracks';
+import { blendFactors } from './m2-blend';
 import type { Point3, StrikeKind } from '../utils/spell-events';
+import type { EffectScales } from '../utils/spell-kits';
 import {
   chooseUnitStance,
   getMoveTimeScale,
@@ -48,27 +49,50 @@ import {
   type UnitWeapons,
 } from '../utils/unit-animation';
 import { threeToServer, useServerAxes } from './iso-camera';
+import {
+  LIT_SUM_FUNCTION, MODEL_POINT_LIGHTS, POINT_LIGHT_FRAGMENT_DECLARATIONS, POINT_LIGHT_VERTEX_DECLARATIONS, pointLightDefines,
+  pointLightVertex,
+} from './point-lights';
+import { SCENE_BLOCK_DECLARATION, sceneBlock } from './scene-block';
 
 // A pet's model scale above this is a giant's (see UnitModelPose.pet).
 const PET_OVERSIZED_DISPLAY_SCALE = 2;
 
 // How a unit's spells' kits change its model: a colour it is multiplied by
 // (0xRRGGBB, null for none) and how see-through it is (1 opaque); and its
-// light indoors (the building's on the floor under it; none outdoors).
+// own light, where it is not the map's as every unit outdoors shares it
+// (indoors, the building's on the floor under it; outdoors, in the
+// ground's shadow or still easing towards the map's).
 export interface UnitLook {
   color: number | null;
   alpha: number;
-  indoor?: IndoorLook;
+  light?: ModelLight;
+  // Its animation held still (a kit's freeze): at this time into its loop
+  // (ms), or where it is when null.
+  freeze?: { atMs: number | null } | null;
 }
 
-// A unit's light indoors, and how far its light's direction leans from the
-// indoor light's towards the sun's (0 to 1; on a transition face).
-export interface IndoorLook extends LightColors {
-  outdoor: number;
+// A light a model takes as the client lights it (a unit's own, which its
+// spell effects share, or the sky's): ambient and direct in the client's
+// colour space (ambient's w 1 while the client's light is on), the way to
+// the light in view space, and how squarely it shines on a surface facing
+// straight up (particles'). Its owner updates it in place.
+export interface ModelLight {
+  ambient: Vector4;
+  direct: Vector4;
+  towards: Vector3;
+  upward: number;
 }
 
-// The map's light as the client lights models: ambient plus direct times
-// N.L, summed in the client's (gamma) colour space and then made linear.
+// The neutral look's own lights, which light models (and the scene's
+// shaded props) while the client's light is off: a white ambient and a sun,
+// their intensities and the sun's place.
+export const NEUTRAL_LIGHT = { ambient: 2.2, sun: 1.6, sunPosition: [0.4, 1, 0.6] as const };
+
+// The map's light as the client lights models: the ambient plus the direct
+// light (each channel at most 1) times N.L, the sum at most 1, in the
+// client's (gamma) colour space and then made linear (litColor in
+// map-light.ts).
 // The scene view sets these each frame; w is 1 while the client's light is
 // in use (else the scene's own three.js lights light the models).
 export const clientLight = {
@@ -81,38 +105,44 @@ export const clientLight = {
 };
 
 // The client's light on a lit model material: the uniforms come from the
-// material (shared ones, or a unit's own indoors). The scene's three.js
-// ambient and sun are dark while it is on; point lights still add.
+// material (shared ones, or a unit's own), and the props' point lights
+// (from the scene block, picked by the unit's origin, per vertex) join the
+// sum indoors and out. The scene's three.js ambient and sun are dark while
+// it is on.
+const CLIENT_LIGHT_VERTEX_DECLARATIONS = `${SCENE_BLOCK_DECLARATION}${POINT_LIGHT_VERTEX_DECLARATIONS}`;
 const CLIENT_LIGHT_DECLARATIONS = `
 uniform vec4 wowLightAmbient;
 uniform vec4 wowLightDirect;
 uniform vec3 wowLightDirection;
-uniform vec3 wowSunDirection;
-`;
-// The direct light's w is how far its direction leans towards the sun's
-// (1 outdoors, where they are the same; a unit's own share indoors).
+${POINT_LIGHT_FRAGMENT_DECLARATIONS}${LIT_SUM_FUNCTION}`;
 const CLIENT_LIGHT_FRAGMENT = `
 if (wowLightAmbient.w > 0.5) {
-  vec3 wowTowards = mix(wowLightDirection, wowSunDirection, wowLightDirect.w);
-  wowTowards = dot(wowTowards, wowTowards) > 1e-6 ? normalize(wowTowards) : wowLightDirection;
-  vec3 wowLight = wowLightAmbient.rgb + wowLightDirect.rgb * saturate(dot(normal, wowTowards));
-  reflectedLight.indirectDiffuse += diffuseColor.rgb * pow(max(wowLight, vec3(0.0)), vec3(2.2));
+  vec3 wowLight = wowLitSum(wowLightAmbient.rgb, wowLightDirect.rgb, dot(normal, wowLightDirection), WOW_POINTS);
+  reflectedLight.indirectDiffuse += diffuseColor.rgb * pow(wowLight, vec3(2.2));
 }
 `;
 interface ClientLightUniforms {
   wowLightAmbient: { value: Vector4 };
   wowLightDirect: { value: Vector4 };
   wowLightDirection: { value: Vector3 };
-  wowSunDirection: { value: Vector3 };
 }
 const sharedLightUniforms = (): ClientLightUniforms => ({
   wowLightAmbient: { value: clientLight.ambient },
   wowLightDirect: { value: clientLight.direct },
   wowLightDirection: { value: clientLight.sun },
-  wowSunDirection: { value: clientLight.sun },
 });
+// A lit model material reads the scene block for its point lights.
+function lightMaterial<T extends Material>(material: T): T {
+  material.userData.wowLight = sharedLightUniforms();
+  material.onBeforeCompile = injectClientLight;
+  material.defines = { ...material.defines, ...pointLightDefines(MODEL_POINT_LIGHTS, true) };
+  (material as T & { uniformsGroups: unknown[] }).uniformsGroups = [sceneBlock];
+  return material;
+}
 function injectClientLight(this: Material, shader: WebGLProgramParametersWithUniforms): void {
   Object.assign(shader.uniforms, this.userData.wowLight as ClientLightUniforms);
+  shader.vertexShader = CLIENT_LIGHT_VERTEX_DECLARATIONS + shader.vertexShader
+    .replace('#include <project_vertex>', `#include <project_vertex>\n${pointLightVertex('transformedNormal')}`);
   shader.fragmentShader = CLIENT_LIGHT_DECLARATIONS + shader.fragmentShader
     .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>\n${CLIENT_LIGHT_FRAGMENT}`);
 }
@@ -142,10 +172,10 @@ export interface UnitModelPose {
   // Recent attacks came from real events, so no made-up timed strikes.
   eventDriven?: boolean;
   // Animations the spell's kits name: a loop while casting or channelling,
-  // and a one-off as a spell fires or lands (clip names; skipped if the
-  // model lacks them).
-  kitLoop?: string | null;
-  kitOnce?: string | null;
+  // and a one-off as a spell fires or lands or a cast begins (clip names,
+  // the first the model has winning; skipped if it has none).
+  kitLoop?: string[] | null;
+  kitOnce?: string[] | null;
   // A mounted player's mount model: the mount moves and wears the ring, and
   // the rider sits on its saddle. On foot until the mount's model is ready.
   mountUrl?: string | null;
@@ -161,20 +191,28 @@ export interface UnitModelPose {
   wmoGroupId?: number;
 }
 
-// A unit's own copy of a shared material, keeping the client's light.
+// A unit's own copy of a shared material, keeping the client's light on
+// a lit one.
 function copyMaterial(material: Material): Material {
   const copy = material.clone();
-  copy.userData.wowLight = sharedLightUniforms();
-  copy.userData.wowIndoor = { ambient: new Vector4(), direct: new Vector4() };
-  copy.onBeforeCompile = injectClientLight;
-  return copy;
+  if (!material.userData.wowLight) return copy;
+  return lightMaterial(copy);
 }
+
 
 // The id a rider's mount is drawn under.
 const mountUnitId = (riderId: string): string => `${riderId}#mount`;
 
-// Effect points the converter exports on the skeleton.
+// Points on a unit WowMin's own drawing uses (its glows, plates, a rider's
+// saddle), by the M2 attachments that can serve each, the first the model
+// has winning: 22/21 the spell hands, 1/2 the hands, 15 the chest, 11 the
+// helm (20 the head), 17 the mouth (breath), 18 the name point above the
+// head, and 0 a mount's saddle (a character's shield otherwise; only mounts'
+// is used). The client's own art asks for attachments by ID instead.
 type UnitPointRole = 'handRight' | 'handLeft' | 'chest' | 'head' | 'breath' | 'overhead' | 'mount';
+const ROLE_ATTACHMENTS: Record<UnitPointRole, number[]> = {
+  handRight: [22, 1], handLeft: [21, 2], chest: [15], head: [11, 20], breath: [17, 11, 20], overhead: [18, 11], mount: [0],
+};
 
 // The ring on the floor under a model, with a pointer the way it faces.
 export interface UnitMarkerStyle {
@@ -194,6 +232,10 @@ interface ModelTemplate {
   // The clips' names, for choosing stance clips.
   clipNames?: ReadonlySet<string>;
   speeds?: Record<string, number>;
+  // When (seconds in) each cast clip lets a spell's missile go.
+  releases?: Record<string, number>;
+  // How the client sizes spell effects on the model.
+  effectScales?: EffectScales;
   // Floor ring radius in model units, from the model's footprint.
   radius?: number;
   // Standing height in model units (times the display scale).
@@ -264,10 +306,19 @@ interface UnitInstance {
   sheathItems: Object3D[];
   marker: UnitMarker;
   model: Object3D;
-  points: Map<string, Object3D>;
+  // The converter's effect points on its skeleton: attachments by M2 ID,
+  // and spell release events by name ('$CSL').
+  effectAttachments: Map<number, Object3D>;
+  effectEvents: Map<string, Object3D>;
+  // Its drawn weapons' blades (bottom and top), for swing trails.
+  blades: Array<{ item: Object3D; bottom: Object3D; top: Object3D }>;
+  // Whether a kit holds its animation still.
+  frozen: boolean;
   // How its spells change its model (UnitLook), as a key, and the shared
   // materials swapped out for changed copies, by mesh.
   look: string;
+  // Its own light, which its materials follow (UnitLook.light).
+  light: ModelLight | null;
   changed: Map<Mesh, Material | Material[]>;
   // Whether it was last seen sitting, or null before its first pose.
   sitting: boolean | null;
@@ -357,8 +408,21 @@ function mergeSkinnedParts(scene: Object3D): void {
 }
 
 const scratchVector = new Vector3();
+const scratchMatrix = new Matrix4();
+const scratchPosition = new Vector3();
+const scratchScale = new Vector3();
+const ZERO_OFFSET: Point3 = [0, 0, 0];
 const tintColor = new Color();
 const scratchSphere = new Sphere();
+
+// The first of a role's attachments a unit's model has.
+function rolePoint(unit: UnitInstance, role: UnitPointRole): Object3D | undefined {
+  for (const id of ROLE_ATTACHMENTS[role]) {
+    const point = unit.effectAttachments.get(id);
+    if (point) return point;
+  }
+  return undefined;
+}
 
 // Takes a cloned model's bones out of the scene graph (see
 // UnitInstance.skeleton): they go under a holder in the skinned mesh's own
@@ -486,14 +550,53 @@ export class UnitModelLayer {
   // unit isn't drawn as a model or its model has no such point.
   pointOf(id: string, role: UnitPointRole): Point3 | null {
     const unit = this.units.get(id);
-    const point = unit?.points.get(role);
-    if (!unit || !point) return null;
-    return threeToServer(this.pointWorld(unit, point, scratchVector));
+    const point = unit && rolePoint(unit, role);
+    return unit && point ? threeToServer(this.pointWorld(unit, point, scratchVector.set(0, 0, 0))) : null;
   }
 
-  // A point in a unit's skeleton, in world space.
-  private pointWorld(unit: UnitInstance, point: Object3D, target: Vector3): Vector3 {
-    return target.setFromMatrixPosition(point.matrixWorld).applyMatrix4(unit.skeletonToTop).applyMatrix4(unit.top.matrixWorld);
+  // When (ms into the clip) a drawn unit's cast clip lets a spell's missile
+  // go, or null if the unit isn't drawn, lacks the clip, or it never does.
+  releaseMsOf(id: string, clip: string): number | null {
+    const seconds = this.units.get(id)?.template.releases?.[clip];
+    return seconds === undefined ? null : seconds * 1000;
+  }
+
+  // How the client sizes spell effects on a drawn unit's model, or null.
+  effectScalesOf(id: string): EffectScales | null {
+    return this.units.get(id)?.template.effectScales ?? null;
+  }
+
+  // Whether a unit is drawn as its model, so its attachments are known.
+  isDrawn(id: string): boolean {
+    return this.units.has(id);
+  }
+
+  // A drawn unit's attachment (M2 ID), or its release event ('$CSL'), in
+  // server coordinates, `offset` (model space) from it the way the point
+  // turns; null if the unit isn't drawn or its model has no such point.
+  attachmentOf(id: string, attachment: number | string, offset: Point3 = ZERO_OFFSET): Point3 | null {
+    const unit = this.units.get(id);
+    const point = typeof attachment === 'number' ? unit?.effectAttachments.get(attachment) : unit?.effectEvents.get(attachment);
+    if (!unit || !point) return null;
+    return threeToServer(this.pointWorld(unit, point, scratchVector.set(offset[0], offset[1], offset[2])));
+  }
+
+  // Which way a drawn unit's attachment (M2 ID) is turned, in world space
+  // (three.js axes), as an effect riding on it turns; null if the unit
+  // isn't drawn or its model lacks it. Written into `out`.
+  attachmentTurnOf(id: string, attachment: number, out: Quaternion): Quaternion | null {
+    const unit = this.units.get(id);
+    const point = unit?.effectAttachments.get(attachment);
+    if (!unit || !point) return null;
+    scratchMatrix.multiplyMatrices(unit.top.matrixWorld, unit.skeletonToTop).multiply(point.matrixWorld);
+    scratchMatrix.decompose(scratchPosition, out, scratchScale);
+    return out;
+  }
+
+  // A point in a unit's skeleton, in world space: `local` is in the point's
+  // own space and is overwritten with the result.
+  private pointWorld(unit: UnitInstance, point: Object3D, local: Vector3): Vector3 {
+    return local.applyMatrix4(point.matrixWorld).applyMatrix4(unit.skeletonToTop).applyMatrix4(unit.top.matrixWorld);
   }
 
   // Which way a drawn unit faces (radians about Z), or null.
@@ -602,11 +705,11 @@ export class UnitModelLayer {
     const mount = this.unitFor(mountPose, template, nowMs);
     this.place(mount, mountPose, nowMs);
     shown.add(mountPose.id);
-    const saddle = mount.points.get('mount');
+    const saddle = rolePoint(mount, 'mount');
     if (!saddle) return null;
     // The saddle as of the mount's last pose, where the mount is now.
     mount.top.updateWorldMatrix(true, false);
-    const [x, y, z] = threeToServer(this.pointWorld(mount, saddle, scratchVector));
+    const [x, y, z] = threeToServer(this.pointWorld(mount, saddle, scratchVector.set(0, 0, 0)));
     return {
       ...pose, x, y, z, orientation: mount.root.rotation.z, riding: true,
       marker: { ...pose.marker, hidden: true },
@@ -650,6 +753,8 @@ export class UnitModelLayer {
       }));
       loading.clipNames = new Set(loading.clips.keys());
       loading.speeds = (root?.userData.wowClipSpeeds ?? {}) as Record<string, number>;
+      loading.releases = (root?.userData.wowClipReleases ?? {}) as Record<string, number>;
+      loading.effectScales = root?.userData.wowEffectScales as EffectScales | undefined;
       loading.scene = gltf.scene;
       loading.state = 'ready';
       this.onLoaded();
@@ -702,16 +807,26 @@ export class UnitModelLayer {
       sheathItems: [],
       marker,
       model,
-      points: new Map(),
+      effectAttachments: new Map(),
+      effectEvents: new Map(),
+      blades: [],
+      frozen: false,
       look: '',
+      light: null,
       changed: new Map(),
       sitting: null,
     };
     model.traverse((object) => {
       if (object.userData.wowSheath) unit.sheathItems.push(object);
+      // Weapons ride on the model's top node, so their blades are found here.
+      if (object.userData.wowTrail === 'bottom') {
+        const top = object.parent?.children.find((sibling) => sibling.userData.wowTrail === 'top');
+        if (object.parent && top) unit.blades.push({ item: object.parent, bottom: object, top });
+      }
     });
     skeleton.traverse((object) => {
-      if (object.userData.wowPoint) unit.points.set(object.userData.wowPoint as string, object);
+      if (typeof object.userData.wowAttachment === 'number') unit.effectAttachments.set(object.userData.wowAttachment, object);
+      if (typeof object.userData.wowEvent === 'string') unit.effectEvents.set(object.userData.wowEvent, object);
     });
     this.pose(unit);
     // The clone gives each skinned part its own copy of the skeleton; parts
@@ -791,7 +906,7 @@ export class UnitModelLayer {
         : flight ? { loop: flight, strike: null } : getStanceClips(stance, pose.weapons, unit.template.clipNames!);
     // Standing or fighting, a cast or channel holds the pose its kit names.
     const still = stance !== 'walk' && stance !== 'run' && stance !== 'dead';
-    const kitLoop = still && !seated && pose.kitLoop && clips.has(pose.kitLoop) ? pose.kitLoop : null;
+    const kitLoop = still && !seated ? pose.kitLoop?.find((name) => clips.has(name)) ?? null : null;
     if (kitLoop) chosen.loop = kitLoop;
     if (stance !== unit.stance || chosen.loop !== unit.loopName) {
       unit.stance = stance;
@@ -808,10 +923,11 @@ export class UnitModelLayer {
       unit.loop.timeScale = getMoveTimeScale(unit.speed, unit.template.speeds?.[unit.loopName]);
     }
     const fighting = stance === 'melee' || stance === 'ranged' || stance === 'cast';
+    const kitOnce = still && !seated ? pose.kitOnce?.find((name) => clips.has(name)) ?? null : null;
     if (seated) {
       // No swings or casting poses in the saddle or on the ground.
-    } else if (still && pose.kitOnce && clips.has(pose.kitOnce)) {
-      this.playStrike(unit, pose.kitOnce);
+    } else if (kitOnce) {
+      this.playStrike(unit, kitOnce);
     } else if (pose.strike && (fighting || stance === 'stand')) {
       // A real attack: the clip for what was done, whatever the stance.
       const strike = getStanceClips(pose.strike, pose.weapons, unit.template.clipNames!).strike;
@@ -875,17 +991,46 @@ export class UnitModelLayer {
   // Changes units' models as their spells' kits ask (by unit ID); units
   // left out go back to their models' own look.
   setLooks(looks: ReadonlyMap<string, UnitLook>): void {
-    for (const [id, unit] of this.units) this.setLook(unit, looks.get(id) ?? null);
+    for (const [id, unit] of this.units) {
+      const look = looks.get(id) ?? null;
+      this.setFreeze(unit, look?.freeze ?? null);
+      this.setLook(unit, look);
+    }
   }
 
-  // Multiplies the unit's materials by a colour and an opacity, on copies
-  // of the shared ones, or puts the shared ones back.
+  // Holds a unit's animation still while a kit freezes it, at the kit's
+  // time into its loop where it names one.
+  private setFreeze(unit: UnitInstance, freeze: { atMs: number | null } | null): void {
+    if (Boolean(freeze) === unit.frozen) return;
+    unit.frozen = Boolean(freeze);
+    if (freeze?.atMs !== null && freeze?.atMs !== undefined && unit.loop) {
+      unit.loop.time = Math.min(freeze.atMs / 1000, unit.loop.getClip().duration);
+    }
+    unit.mixer.timeScale = unit.frozen ? 0 : 1;
+  }
+
+  // A drawn unit's blades (bottom and top, server coordinates) of the
+  // weapons it holds drawn.
+  bladesOf(id: string): Array<[Point3, Point3]> {
+    const unit = this.units.get(id);
+    if (!unit) return [];
+    return unit.blades.filter(({ item }) => item.visible).map(({ item, bottom, top }) => {
+      item.updateWorldMatrix(true, true);
+      return [threeToServer(scratchVector.setFromMatrixPosition(bottom.matrixWorld)), threeToServer(scratchVector.setFromMatrixPosition(top.matrixWorld))];
+    });
+  }
+
+  // Multiplies the unit's materials by a colour and an opacity, and gives
+  // them its own light, on copies of the shared ones, or puts the shared
+  // ones back. Its own light is followed by reference, so it can change
+  // without the materials being touched.
   private setLook(unit: UnitInstance, look: UnitLook | null): void {
-    const plain = !look || (look.color === null && look.alpha >= 1 && !look.indoor);
-    const indoor = look?.indoor ?? null;
-    const key = plain ? '' : `${look.color}|${look.alpha.toFixed(3)}|${indoor ? [...indoor.ambient, ...indoor.direct, indoor.outdoor].map((value) => value.toFixed(2)).join(',') : ''}`;
-    if (unit.look === key) return;
+    const plain = !look || (look.color === null && look.alpha >= 1 && !look.light);
+    const own = look?.light ?? null;
+    const key = plain ? '' : `${look.color}|${look.alpha.toFixed(3)}`;
+    if (unit.look === key && unit.light === own) return;
     unit.look = key;
+    unit.light = own;
     if (plain) {
       for (const [mesh, original] of unit.changed) {
         for (const copy of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) copy.dispose();
@@ -907,19 +1052,15 @@ export class UnitModelLayer {
       const copies = Array.isArray(object.material) ? object.material : [object.material];
       copies.forEach((copy, index) => {
         const source = originals[index];
-        if (!(copy instanceof MeshLambertMaterial) || !(source instanceof MeshLambertMaterial)) return;
-        // Indoors the unit's own light, from the fixed indoor direction
-        // (leaning towards the sun's by its share); outdoors the map's,
-        // shared.
-        const uniforms = copy.userData.wowLight as ClientLightUniforms;
-        const own = copy.userData.wowIndoor as { ambient: Vector4; direct: Vector4 };
-        if (indoor) {
-          own.ambient.set(...indoor.ambient, 1);
-          own.direct.set(...indoor.direct, indoor.outdoor);
+        if (!(copy instanceof MeshLambertMaterial || copy instanceof MeshBasicMaterial)
+          || !(source instanceof MeshLambertMaterial || source instanceof MeshBasicMaterial)) return;
+        // A lit material takes the unit's own light, else the map's, shared.
+        const uniforms = copy.userData.wowLight as ClientLightUniforms | undefined;
+        if (uniforms) {
+          uniforms.wowLightAmbient.value = own?.ambient ?? clientLight.ambient;
+          uniforms.wowLightDirect.value = own?.direct ?? clientLight.direct;
+          uniforms.wowLightDirection.value = own?.towards ?? clientLight.sun;
         }
-        uniforms.wowLightAmbient.value = indoor ? own.ambient : clientLight.ambient;
-        uniforms.wowLightDirect.value = indoor ? own.direct : clientLight.direct;
-        uniforms.wowLightDirection.value = indoor ? clientLight.indoor : clientLight.sun;
         copy.color.copy(source.color).multiply(tintColor);
         copy.opacity = source.opacity * look.alpha;
         const seeThrough = copy.opacity < 1;
@@ -932,27 +1073,34 @@ export class UnitModelLayer {
     });
   }
 
-  // Lit, so models keep their shape; the scene itself is unlit.
+  // As the client draws a model's batch (m2MaterialLight): lit by the
+  // client's light, or full bright where its material is unlit or it
+  // modulates the colour behind it (mod, mod2x, in white whatever their
+  // colour). Models built before their materials carried flags are all lit
+  // but the modulating ones.
   private convertMaterial(source: MeshStandardMaterial, modelAlpha = 1): Material {
     const cached = this.materials.get(source.uuid);
     if (cached) return cached;
-    const blend = (source.userData.wowBlend ?? 'opaque') as string;
+    const blend = (source.userData.wowBlend ?? 'opaque') as EffectBlend;
+    const rule = m2MaterialLight(blend, (source.userData.wowMaterialFlags as number | undefined) ?? 0);
     const opacity = source.opacity * modelAlpha;
-    const material = new MeshLambertMaterial({
+    const parameters = {
       name: source.name,
       map: source.map ?? null,
-      color: source.color.clone(),
+      color: rule.color === null ? source.color.clone() : new Color(rule.color, rule.color, rule.color),
       opacity,
       side: source.side === DoubleSide ? DoubleSide : FrontSide,
       // One pass for both faces, as the client draws them (see scene-view.ts).
       forceSinglePass: true,
-      alphaTest: blend === 'alphaKey' ? 0.5 : 0,
+      // The model's alpha key, as it was exported (the client's 224/255).
+      alphaTest: blend === 'alphaKey' ? source.alphaTest : 0,
       transparent: (blend !== 'opaque' && blend !== 'alphaKey') || opacity < 1,
-      depthWrite: (blend === 'opaque' || blend === 'alphaKey') && opacity >= 1,
-      blending: blend === 'add' ? AdditiveBlending : NormalBlending,
-    });
-    material.userData.wowLight = sharedLightUniforms();
-    material.onBeforeCompile = injectClientLight;
+      depthWrite: rule.depthWrite && opacity >= 1,
+      depthTest: rule.depthTest,
+      ...blendFactors(blend),
+    };
+    const material = rule.lit ? new MeshLambertMaterial(parameters) : new MeshBasicMaterial(parameters);
+    if (rule.lit) lightMaterial(material);
     this.materials.set(source.uuid, material);
     return material;
   }
