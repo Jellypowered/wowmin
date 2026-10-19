@@ -6484,6 +6484,7 @@ const $instanceMobsMode = $<HTMLSelectElement>('instance-mobs-mode');
 const $instancePlatesMode = $<HTMLSelectElement>('instance-plates-mode');
 const $instanceLightingMode = $<HTMLSelectElement>('instance-lighting-mode');
 const $instanceObjectLightsBtn = $<HTMLButtonElement>('instance-object-lights-btn');
+const $instanceWaterSpecularBtn = $<HTMLButtonElement>('instance-water-specular-btn');
 const $instanceDecisionsBtn = $<HTMLButtonElement>('instance-decisions-btn');
 const $instanceModelsBtn = $<HTMLButtonElement>('instance-models-btn');
 const $instanceNumbersBtn = $<HTMLButtonElement>('instance-numbers-btn');
@@ -6585,6 +6586,8 @@ const INSTANCE_LIGHTING_STORAGE_KEY = 'wowmin.instanceLighting';
 let instanceLighting: SceneLighting = readStoredSetting(INSTANCE_LIGHTING_STORAGE_KEY) === 'neutral' ? 'neutral' : 'client';
 const INSTANCE_OBJECT_LIGHTS_STORAGE_KEY = 'wowmin.instanceObjectLights';
 let instanceObjectLights = readStoredFlag(INSTANCE_OBJECT_LIGHTS_STORAGE_KEY, true);
+const INSTANCE_WATER_SPECULAR_STORAGE_KEY = 'wowmin.instanceWaterSpecular';
+let instanceWaterSpecular = readStoredFlag(INSTANCE_WATER_SPECULAR_STORAGE_KEY, true);
 // Each map's lights (assets/models/light/<id>.json, from the client), null
 // when it has none or they could not be built.
 const instanceMapLights = new Map<number, MapLights | null>();
@@ -7284,6 +7287,13 @@ function setInstanceObjectLights(enabled: boolean, render = true): void {
   instanceObjectLights = enabled;
   $instanceObjectLightsBtn?.setAttribute('aria-pressed', String(enabled));
   storeSetting(INSTANCE_OBJECT_LIGHTS_STORAGE_KEY, String(enabled));
+  if (render) renderInstanceCanvas();
+}
+
+function setInstanceWaterSpecular(enabled: boolean, render = true): void {
+  instanceWaterSpecular = enabled;
+  $instanceWaterSpecularBtn?.setAttribute('aria-pressed', String(enabled));
+  storeSetting(INSTANCE_WATER_SPECULAR_STORAGE_KEY, String(enabled));
   if (render) renderInstanceCanvas();
 }
 
@@ -8357,7 +8367,7 @@ function drawInstanceCanvas(followPass: boolean): void {
   // Models are placed before the scene draws; units without one get markers.
   const sceneView = getInstanceSceneView();
   void loadInstanceMapLights(session.mapId);
-  sceneView?.setLighting(instanceMapLights.get(session.mapId) ?? null, instanceLighting, instanceObjectLights);
+  sceneView?.setLighting(instanceMapLights.get(session.mapId) ?? null, instanceLighting, instanceObjectLights, instanceWaterSpecular);
   const modelIds = sceneView
     ? sceneView.setUnits(instanceShowModels && live && instanceView3d
       ? getInstanceUnitPoses(visiblePlayers, creatures, decisions, liveNow, strikes, sceneryGuids) : [], liveNow)
@@ -9289,6 +9299,8 @@ setInstanceFades(instanceFades, false);
 $instanceFadesBtn?.addEventListener('click', () => setInstanceFades(!instanceFades));
 setInstanceObjectLights(instanceObjectLights, false);
 $instanceObjectLightsBtn?.addEventListener('click', () => setInstanceObjectLights(!instanceObjectLights));
+setInstanceWaterSpecular(instanceWaterSpecular, false);
+$instanceWaterSpecularBtn?.addEventListener('click', () => setInstanceWaterSpecular(!instanceWaterSpecular));
 $instanceAutoRefresh?.addEventListener('change', () => {
   if ($instanceAutoRefresh.checked) {
     void refreshInstanceWatcher();

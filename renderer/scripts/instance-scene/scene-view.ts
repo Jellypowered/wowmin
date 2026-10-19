@@ -780,6 +780,9 @@ export class InstanceSceneView {
   private mapLights: MapLights | null = null;
   private lighting: SceneLighting = 'client';
   private objectLightsOn = true;
+  // Water's highlight (on unless turned off; the client leaves it off by
+  // default).
+  private waterSpecularOn = true;
   // Towards the sun now, in three.js world space (applyLighting).
   private readonly sunTowards = NEUTRAL_SUN_TOWARDS.clone();
   // ?lightTime=HH:MM pins the time of day the map's light is drawn at, to
@@ -828,9 +831,6 @@ export class InstanceSceneView {
   private readonly liquids = new Map<string, LiquidAnimation[]>();
   // Water's depth ramps, coloured by the map's light.
   private readonly waterRamps = new WaterRamps();
-  // ?specular=1 draws water's highlight, which the client leaves off by
-  // default.
-  private readonly waterSpecular = new URLSearchParams(window.location.search).get('specular') === '1';
   private lastNoonWater: { lights: MapLights; center: Point3; water: WaterColors } | null = null;
   // What the canvas currently shows, to skip redrawing an unchanged frame.
   private lastFrameKey = '';
@@ -1540,12 +1540,14 @@ export class InstanceSceneView {
     return null;
   }
 
-  // The map's lights (null for none yet), how to light the scene, and
-  // whether objects' lights (torches, braziers) are drawn.
-  setLighting(lights: MapLights | null, lighting: SceneLighting, objectLights: boolean): void {
+  // The map's lights (null for none yet), how to light the scene, whether
+  // objects' lights (torches, braziers) are drawn, and whether water's
+  // highlight is.
+  setLighting(lights: MapLights | null, lighting: SceneLighting, objectLights: boolean, waterSpecular: boolean): void {
     this.mapLights = lights;
     this.lighting = lighting;
     this.objectLightsOn = objectLights;
+    this.waterSpecularOn = waterSpecular;
   }
 
   // Sets the scene's lights for a point (the view's centre) now; returns a
@@ -1579,10 +1581,10 @@ export class InstanceSceneView {
     // with no light file (or one from before water's colours), constants.
     const water = colors ? colors.water ?? NEUTRAL_WATER : this.noonWater(center);
     this.waterRamps.update(water);
-    sceneBlockData.set(water.sunCloud, WATER_SPECULAR_OFFSET);
+    sceneBlockData.set([...water.sunCloud, this.waterSpecularOn ? 1 : 0], WATER_SPECULAR_OFFSET);
     const colorKey = colors
       ? [...colors.ambient, ...colors.direct, this.sunTowards.x, this.sunTowards.y].map((value) => value.toFixed(3)).join(',') : 'neutral';
-    return `${colorKey}|${this.nearestLights.map((light) => light.position.join(',')).join(';')}`;
+    return `${colorKey}|${this.waterSpecularOn}|${this.nearestLights.map((light) => light.position.join(',')).join(';')}`;
   }
 
   // Water's colours for the neutral look: the map's light at noon at a
@@ -1647,7 +1649,7 @@ export class InstanceSceneView {
     if (liquid.ramp && mesh.geometry.getAttribute('uv1')) {
       material = createWaterMaterial({
         frame: rawFrames(textures)[0], ramp: this.waterRamps.textures[liquid.ramp], color, interior,
-        specular: this.waterSpecular, partyFade: injectPartyFade,
+        partyFade: injectPartyFade,
       });
     } else if (liquid.scroll) {
       const magma = createMagmaMaterial({ frame: rawFrames(textures)[0], color, partyFade: injectPartyFade });

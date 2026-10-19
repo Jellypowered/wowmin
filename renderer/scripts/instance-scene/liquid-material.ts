@@ -24,8 +24,10 @@ import { prepareDataTexture } from './terrain-material';
 // light from straight above instead) and the nearest few point lights,
 // times the vertex colour (white, or an interior group's material colour);
 // that times the ramp's colour, plus the ripples, which are added, never
-// mixed; the alpha the ramp's. All in the client's colour space, made
-// linear at the end. Needs the scene block (scene-block.ts).
+// mixed; the alpha the ramp's. The ripples' alpha masks the sun's
+// highlight, drawn while the scene block's switch for it is on. All in the
+// client's colour space, made linear at the end. Needs the scene block
+// (scene-block.ts).
 
 // Water takes this many point lights, as the client's water shaders do.
 const WATER_POINT_LIGHTS = 3;
@@ -70,9 +72,7 @@ attribute vec2 uv1;
 uniform vec4 wowLiquidColor;
 varying vec4 vWowLiquidPrimary;
 varying vec2 vWowRampUv;
-#ifdef WOW_WATER_SPECULAR
 varying vec3 vWowSpecular;
-#endif
 `;
 
 // Liquid lies flat: its normal is the scene's up (the normal the party
@@ -97,29 +97,23 @@ wowLit += vWowPoints;
 #endif
 vWowLiquidPrimary = clamp(vec4(wowLit, 1.0) * wowLiquidColor, 0.0, 1.0);
 vWowRampUv = uv1;
-#ifdef WOW_WATER_SPECULAR
 vec3 wowEye = isOrthographic ? vec3(0.0, 0.0, 1.0) : normalize(-mvPosition.xyz);
 vec3 wowHalf = normalize(wowEye + wowClientSunPacked.xyz);
-vWowSpecular = clamp(pow(max(dot(wowLiquidUp, wowHalf), 0.0), ${SPECULAR_POWER.toFixed(1)}) * wowWaterSpecularPacked.rgb, 0.0, 1.0);
-#endif
+vWowSpecular = wowWaterSpecularPacked.w
+  * (clamp(pow(max(dot(wowLiquidUp, wowHalf), 0.0), ${SPECULAR_POWER.toFixed(1)}) * wowWaterSpecularPacked.rgb, 0.0, 1.0) + ${SPECULAR_BASE.toFixed(2)});
 `;
 
 const FRAGMENT_DECLARATIONS = `
 uniform sampler2D wowWaterRamp;
 varying vec4 vWowLiquidPrimary;
 varying vec2 vWowRampUv;
-#ifdef WOW_WATER_SPECULAR
 varying vec3 vWowSpecular;
-#endif
 `;
 
 const FRAGMENT = `
 vec4 wowRipple = texture2D(map, vMapUv);
 vec4 wowRamp = texture2D(wowWaterRamp, vWowRampUv);
-vec3 wowWater = vWowLiquidPrimary.rgb * wowRamp.rgb + wowRipple.rgb;
-#ifdef WOW_WATER_SPECULAR
-wowWater += wowRipple.a * (vWowSpecular + ${SPECULAR_BASE.toFixed(2)});
-#endif
+vec3 wowWater = vWowLiquidPrimary.rgb * wowRamp.rgb + wowRipple.rgb + wowRipple.a * vWowSpecular;
 diffuseColor = vec4(pow(clamp(wowWater, 0.0, 1.0), vec3(2.2)), vWowLiquidPrimary.a * wowRamp.a);
 `;
 
@@ -179,12 +173,11 @@ function liquidMaterial({
 
 // A water type's material: its ramp, and interior WMO water lit by the
 // white light from above.
-export function createWaterMaterial({ frame, ramp, color, interior, specular, partyFade }: {
+export function createWaterMaterial({ frame, ramp, color, interior, partyFade }: {
   frame: Texture;
   ramp: Texture;
   color: readonly number[] | null;
   interior: boolean;
-  specular: boolean;
   partyFade: PartyFade;
 }): MeshBasicMaterial {
   return liquidMaterial({
@@ -194,7 +187,6 @@ export function createWaterMaterial({ frame, ramp, color, interior, specular, pa
       ...pointLightDefines(WATER_POINT_LIGHTS, false),
       WOW_VERTEX_NORMAL: 'wowLiquidUp',
       ...(interior ? { WOW_INTERIOR_LIQUID: '' } : {}),
-      ...(specular ? { WOW_WATER_SPECULAR: '' } : {}),
     },
     uniforms: { wowWaterRamp: { value: ramp } },
     vertexDeclarations: VERTEX_DECLARATIONS,
