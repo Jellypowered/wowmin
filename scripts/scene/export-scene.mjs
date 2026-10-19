@@ -507,6 +507,7 @@ export async function exportMapScene({
   const skippedWmos = [];
   let doodadCount = 0;
   let liquidCount = 0;
+  let liquidTriangles = 0;
   for (const placement of wmoPlacements) {
     let wmo;
     try {
@@ -547,9 +548,10 @@ export async function exportMapScene({
         }));
     });
 
-    // Each group's liquid, in the group's space under the building: interior
-    // liquid (interior water drawn as its own type) takes its material's
-    // diffuse colour.
+    // Each group's liquid, in the group's space under the building, its tiles
+    // across a portal clipped by the group's portals: interior liquid
+    // (interior water drawn as its own type) takes its material's diffuse
+    // colour.
     wmo.groups.forEach((group) => {
       if (!group.liquid) return;
       const type = wmoLiquidType(group.liquid.groupLiquid, wmo.rootFlags, group.flags, firstTileType(group.liquid));
@@ -558,7 +560,12 @@ export async function exportMapScene({
       const typeId = drawnWmoLiquidType(type, interior);
       const drawn = builder.liquidType(typeId);
       const material = drawn && builder.liquidMaterial(typeId);
-      const surface = material && liquidSurface(group.liquid, { magma: drawn.vertexFormat === 1 });
+      const portals = {
+        planes: wmo.portals,
+        refs: wmo.portalRefs.slice(group.portalStart, group.portalStart + group.portalCount),
+        liquidOf: (groupIndex) => wmo.groups[groupIndex]?.liquid ?? null,
+      };
+      const surface = material && liquidSurface(group.liquid, { magma: drawn.vertexFormat === 1, portals });
       if (!surface) return;
       const diffuse = wmo.materials[group.liquid.materialId]?.diffuseColor;
       const color = interior && diffuse !== undefined ? bgraToRgba01(diffuse) : null;
@@ -566,6 +573,7 @@ export async function exportMapScene({
         .setMesh(builder.liquidMesh(`liquid-${group.groupId}`, surface, material, liquidTexCoords(surface, drawn, { depthInfo: own, interior })))
         .setExtras({ kind: 'liquid', wmoGroupId: group.groupId, interior, ...(color ? { color } : {}) }));
       liquidCount += 1;
+      liquidTriangles += surface.indices.length / 3;
     });
 
     for (const doodadIndex of selectDoodadIndices(wmo.sets, placement.doodadSet)) {
@@ -636,6 +644,7 @@ export async function exportMapScene({
           const liquidMesh = builder.liquidMesh(`liquid-${x}-${y}-${typeId}`, surface, liquidMaterial, texCoords);
           root.addChild(document.createNode(`liquid-${x}-${y}-${typeId}`).setMesh(liquidMesh).setExtras({ kind: 'liquid', tile: [x, y] }));
           liquidCount += 1;
+          liquidTriangles += surface.indices.length / 3;
         }
       } catch (error) {
         console.warn(`  ! Liquids in tile ${x},${y} unreadable: ${error instanceof Error ? error.message : error}`);
@@ -702,6 +711,7 @@ export async function exportMapScene({
     },
     stats: {
       liquidCount,
+      liquidTriangles,
       terrainTiles: terrain.tiles,
       terrainChunks: terrain.chunks,
       bytes: glb.byteLength,

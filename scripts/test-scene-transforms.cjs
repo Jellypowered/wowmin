@@ -92,6 +92,8 @@ test('reads the MOGP group ID, flags, and doodad references from a WMO group', a
   const header = Buffer.alloc(0x44);
   header.writeUInt32LE(0x2805, 0x08);
   [-1, -2, -3, 4, 5, 6].forEach((value, index) => header.writeFloatLE(value, 0x0C + index * 4));
+  header.writeUInt16LE(12, 0x24);
+  header.writeUInt16LE(2, 0x26);
   header.writeUInt16LE(3, 0x28);
   header.writeUInt16LE(4, 0x2a);
   header.writeUInt16LE(5, 0x2c);
@@ -108,6 +110,8 @@ test('reads the MOGP group ID, flags, and doodad references from a WMO group', a
     bspFaces: Uint32Array.of(2, 5, 7),
     renderBatches: [],
     boundingBox: [-1, -2, -3, 4, 5, 6],
+    portalStart: 12,
+    portalCount: 2,
     transBatchCount: 3,
     intBatchCount: 4,
     extBatchCount: 5,
@@ -437,6 +441,89 @@ test("takes a WMO's magma texture coordinates from its vertices, in 256ths", asy
   assert.deepEqual([...liquid.magmaUvs.slice(0, 4)], [0, 0, 64, -1]);
   const surface = liquidSurface(liquid, { magma: true });
   assert.deepEqual([...surface.uvs], [0, 0, 0.25, -1 / 256, 0.75, -3 / 256, 1, -4 / 256]);
+});
+
+test("clips a polygon by a plane as the client does: the kept side, mixed data, the strip's order", async () => {
+  const { ConvexClipper } = await load('liquids.mjs');
+  const lerp = (a, b, t) => a + (b - a) * t;
+  // A 4 x 4 square with data 0 at x = 0 and 40 at x = 4.
+  const square = () => {
+    const clipper = new ConvexClipper();
+    [[0, 0], [0, 4], [4, 4], [4, 0]].forEach(([x, y]) => clipper.addVertex([x, y, 0], x * 10));
+    clipper.begin();
+    return clipper;
+  };
+  // x - 2 >= 0 keeps the half towards +x, the cut corners' data halfway.
+  const right = square();
+  assert.equal(right.clip([1, 0, 0, -2], 1), 2);
+  right.end();
+  const kept = right.results(lerp);
+  assert.deepEqual(kept.map(({ position }) => position.slice(0, 2)).sort(), [[2, 0], [2, 4], [4, 0], [4, 4]]);
+  assert.deepEqual(kept.map(({ data }) => data).sort(), [20, 20, 40, 40]);
+  // The strip order covers the quad: its middle two corners are its diagonal.
+  const [a, b, c, d] = kept.map(({ position }) => position);
+  assert.notDeepEqual(a, d);
+  assert.ok(Math.abs(b[0] - c[0]) > 0 && Math.abs(b[1] - c[1]) > 0, 'diagonal b-c');
+  // Side -1 keeps the other half.
+  const left = square();
+  left.clip([1, 0, 0, -2], -1);
+  left.end();
+  assert.deepEqual(left.results(lerp).map(({ position }) => position[0]).sort(), [0, 0, 2, 2]);
+  // A plane that misses the square leaves it whole, in the client's order;
+  // one with the square wholly behind it leaves nothing.
+  const whole = square();
+  assert.equal(whole.clip([1, 0, 0, 10], 1), 0);
+  whole.end();
+  assert.deepEqual(whole.results(lerp).map(({ position }) => position.slice(0, 2)), [[0, 0], [0, 4], [4, 0], [4, 4]]);
+  const gone = square();
+  gone.clip([1, 0, 0, 10], -1);
+  gone.end();
+  assert.deepEqual(gone.results(lerp), []);
+});
+
+test("clips a WMO group's tiles across a portal by the portals whose other group has liquid over them", async () => {
+  const { readWmoLiquid, liquidSurface, LIQUID_UNIT } = await load('liquids.mjs');
+  const { mliq, group } = wmoGroupWithLiquid();
+  // The wet tile lies across a portal; depth 0 on its left, 100 on its right.
+  mliq.writeUInt8(0xC6, 0x1E + 48);
+  [0, 100, 0, 0, 100, 0].forEach((depth, vertex) => mliq.writeUInt8(depth, 0x1E + vertex * 8));
+  const liquid = readWmoLiquid(group());
+  assert.equal(liquid.tiles[0], 0xC6);
+  const half = 10 + LIQUID_UNIT / 2;
+  const portals = (other) => ({ planes: [[1, 0, 0, -half]], refs: [{ portalIndex: 0, groupIndex: 1, side: 1 }], liquidOf: () => other });
+  const neighbour = { corner: [10 + LIQUID_UNIT / 2, 0, 0], xTiles: 4, yTiles: 10 };
+  const clipped = liquidSurface(liquid, { portals: portals(neighbour) });
+  // Two triangles over the right half, the cut corners' depth halfway (cut
+  // to a whole byte).
+  assert.equal(clipped.indices.length, 6);
+  const xs = [...clipped.positions].filter((_, index) => index % 3 === 0);
+  xs.forEach((x) => assert.ok(x >= half - 1e-4, `x ${x} kept`));
+  assert.deepEqual([...clipped.depths].sort((p, q) => p - q), [50, 50, 100, 100]);
+  // No neighbour's liquid over the tile: drawn whole.
+  const far = { corner: [500, 500, 0], xTiles: 1, yTiles: 1 };
+  const whole = liquidSurface(liquid, { portals: portals(far) });
+  assert.equal(whole.indices.length, 6);
+  assert.deepEqual([...whole.depths].sort((p, q) => p - q), [0, 0, 100, 100]);
+  // Without portals the tile is drawn whole, in the plain strip.
+  assert.deepEqual([...liquidSurface(liquid).indices], [0, 2, 1, 2, 1, 3]);
+});
+
+test("reads a building's portal planes and references", async () => {
+  const { readPortals } = await load('wmo.mjs');
+  const mopt = Buffer.alloc(40);
+  [1, 0, 0, -5].forEach((value, index) => mopt.writeFloatLE(value, 4 + index * 4));
+  [0, 0, 1, NaN].forEach((value, index) => mopt.writeFloatLE(value, 24 + index * 4));
+  const mopr = Buffer.alloc(8);
+  mopr.writeUInt16LE(1, 0);
+  mopr.writeUInt16LE(7, 2);
+  mopr.writeInt16LE(-1, 4);
+  const { readChunks } = await load('chunks.mjs');
+  const root = readChunks(Buffer.concat([chunk('MOPT', mopt), chunk('MOPR', mopr)]));
+  const { portals, portalRefs } = readPortals(root);
+  assert.deepEqual(portals[0], [1, 0, 0, -5]);
+  // A plane that is not a number is taken as one far above.
+  assert.deepEqual(portals[1], [0, 0, 1, 800000]);
+  assert.deepEqual(portalRefs, [{ portalIndex: 1, groupIndex: 7, side: -1 }]);
 });
 
 test('resolves WMO liquid types: DBC ids, old kinds, green lava from its tiles, and interior water', async () => {

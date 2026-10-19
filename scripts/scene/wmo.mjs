@@ -64,6 +64,14 @@ const MOGP_HEADER_SIZE = 0x44;
 // count at 0x10.
 const MOBA_SIZE = 24;
 const MOMT_ENTRY_SIZE = 64;
+// MOPT, a building's portals (20 bytes): first vertex, vertex count, then
+// the plane (normal and distance). MOPR, the groups' references to them (8
+// bytes): portal, the group on its other side, and which side of the plane
+// is the group's.
+const MOPT_SIZE = 20;
+const MOPR_SIZE = 8;
+// A portal whose plane reads as not a number is taken as one far above.
+const NO_PLANE = [0, 0, 1, 800000];
 const MOMT_DIFFUSE_COLOR = 0x1c;
 const MODS_ENTRY_SIZE = 32;
 const MODD_ENTRY_SIZE = 40;
@@ -100,6 +108,9 @@ export function readGroupHeader(groupBuffer) {
       }))
       : [],
     boundingBox: readFloats(mogp, 0x0C, 6),
+    // The group's portal references (MOPR): the first and how many.
+    portalStart: mogp.readUInt16LE(0x24),
+    portalCount: mogp.readUInt16LE(0x26),
     transBatchCount: mogp.readUInt16LE(0x28),
     intBatchCount: mogp.readUInt16LE(0x2a),
     extBatchCount: mogp.readUInt16LE(0x2c),
@@ -159,6 +170,24 @@ export function fixVertexColors(bgra, batches, transBatchCount) {
     colors[offset + 3] = 255;
   }
   return colors;
+}
+
+// A building's portal planes ([nx, ny, nz, d] each) and portal references
+// ({ portalIndex, groupIndex, side }), which its groups' portalStart and
+// portalCount index.
+export function readPortals(rootChunks) {
+  const mopt = findChunk(rootChunks, 'MOPT');
+  const mopr = findChunk(rootChunks, 'MOPR');
+  const portals = [];
+  for (let at = 0; mopt && at + MOPT_SIZE <= mopt.length; at += MOPT_SIZE) {
+    const plane = readFloats(mopt, at + 4, 4);
+    portals.push(Number.isNaN(plane[3]) ? [...NO_PLANE] : plane);
+  }
+  const portalRefs = [];
+  for (let at = 0; mopr && at + MOPR_SIZE <= mopr.length; at += MOPR_SIZE) {
+    portalRefs.push({ portalIndex: mopr.readUInt16LE(at), groupIndex: mopr.readUInt16LE(at + 2), side: mopr.readInt16LE(at + 4) });
+  }
+  return { portals, portalRefs };
 }
 
 // Set 0 is the global set every placement shows; the placement may add one more.
@@ -226,6 +255,7 @@ export function loadWmo(rootName, readFile) {
   return {
     materials,
     groups,
+    ...readPortals(rootChunks),
     rootFlags: root.flags,
     // BGRA, as the vertex colours.
     ambient: mohd ? mohd.readUInt32LE(MOHD_AMBIENT) : 0,

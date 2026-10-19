@@ -119,7 +119,7 @@ async function main() {
       console.log(`  ✓ Wrote ${scene.file} (${(stats.bytes / 1048576).toFixed(1)} MB; ${stats.wmoCount} WMO, `
         + `${stats.groupCount} groups, ${stats.doodadCount} doodads (${stats.doodadBatches} instanced batches), ${stats.modelCount} models, ${stats.textureCount} textures`
         + `${stats.terrainTiles ? `, terrain ${stats.terrainTiles} tiles / ${stats.terrainChunks} chunks` : ''}`
-        + `${stats.liquidCount ? `, ${stats.liquidCount} liquids` : ''})`);
+        + `${stats.liquidCount ? `, ${stats.liquidCount} liquids (${stats.liquidTriangles} triangles)` : ''})`);
       for (const skipped of stats.skippedWmos) console.warn(`  ! Skipped WMO ${skipped}`);
       if (stats.missing.length) {
         console.warn(`  ! ${stats.missing.length} referenced file(s) not found in the client, e.g. ${stats.missing.slice(0, 3).join(', ')}`);

@@ -152,17 +152,16 @@ export class LiquidSurface {
     return this;
   }
 
-  // A convex polygon (a tile cut by portals) as a fan: `points` its corners'
-  // positions, `uvs` and `depths` theirs.
-  addPolygon(points, uvs, depths) {
-    if (points.length < 3) return this;
+  // A convex polygon (a tile cut by portals) as a strip: `points` its
+  // corners' positions in strip order, `uvs` and `depths` theirs.
+  addStrip(points, uvs, depths) {
     const first = this.positions.length / 3;
     points.forEach((point, index) => {
       this.positions.push(...point);
       this.uvs.push(...uvs[index]);
       this.depths.push(depths[index]);
     });
-    for (let index = 1; index + 1 < points.length; index += 1) this.indices.push(first, first + index, first + index + 1);
+    for (let index = 0; index + 2 < points.length; index += 1) this.indices.push(first + index, first + index + 1, first + index + 2);
     return this;
   }
 
@@ -178,29 +177,198 @@ export class LiquidSurface {
   }
 }
 
+// The client's clipper of a convex polygon by planes: each plane keeps the
+// side where side × (n · p + d) >= 0; an edge whose ends lie less than
+// FLT_EPSILON apart in distance is left as it is, and a plane that does
+// not cross the polygon exactly twice changes no vertices (though edges
+// wholly on the far side are dropped). New vertices' data is the ends'
+// mixed by `lerp(a, b, t)`, worked out when asked for. The result is in
+// the order the client draws it as a strip: from the first edge left,
+// alternately back round and forward.
+const CLIP_EPSILON = 1.1920929e-7;
+
+export class ConvexClipper {
+  constructor() {
+    this.verts = [];
+    this.edges = [];
+    this.stamp = 0;
+    this.firstEdge = 0;
+  }
+
+  addVertex(position, data) {
+    this.verts.push({ position, data, from: null, to: null, t: 0, edges: [0, 0], stamp: -1, dist: 0 });
+  }
+
+  begin() {
+    const count = this.verts.length;
+    this.verts.forEach((vertex, index) => {
+      vertex.edges = [index - 1, index];
+      vertex.stamp = -1;
+      this.edges.push({ verts: [index, (index + 1) % count], clipped: false });
+    });
+    if (count) this.verts[0].edges[0] = count - 1;
+  }
+
+  // Keeps the side of `plane` ([nx, ny, nz, d]) `side` (1 or -1) says.
+  clip([nx, ny, nz, d], side) {
+    this.stamp += 1;
+    const distance = (vertex) => {
+      if (vertex.stamp !== this.stamp) {
+        const [x, y, z] = vertex.position;
+        vertex.dist = (z * nz + y * ny + x * nx + d) * side;
+        vertex.stamp = this.stamp;
+      }
+      return vertex.dist;
+    };
+    const crossings = [];
+    for (let index = 0; index < this.edges.length; index += 1) {
+      const edge = this.edges[index];
+      if (edge.clipped) continue;
+      const a = this.verts[edge.verts[0]];
+      const b = this.verts[edge.verts[1]];
+      const da = distance(a);
+      const db = distance(b);
+      if (!(da < 0 || db < 0)) continue;
+      if (!(da >= 0 || db >= 0)) {
+        edge.clipped = true;
+        continue;
+      }
+      const sum = Math.abs(db) + Math.abs(da);
+      if (sum <= CLIP_EPSILON) continue;
+      if (crossings.length === 2) {
+        crossings.push(null);
+        break;
+      }
+      const t = Math.abs(da) / sum;
+      const keep = da >= 0 ? 1 : 0;
+      const vertex = {
+        position: [0, 1, 2].map((axis) => (b.position[axis] - a.position[axis]) * t + a.position[axis]),
+        data: undefined, from: a, to: b, t, edges: [0, 0], stamp: this.stamp, dist: 0,
+      };
+      vertex.edges[1 - keep] = index;
+      vertex.edges[keep] = this.edges.length;
+      crossings.push({ edge: index, keep, vertex: this.verts.length });
+      this.verts.push(vertex);
+    }
+    if (crossings.length !== 2) {
+      this.verts.length -= crossings.length;
+      return crossings.length;
+    }
+    const added = [0, 0];
+    for (const { edge, keep, vertex } of crossings) {
+      this.edges[edge].verts[keep] = vertex;
+      added[1 - keep] = vertex;
+    }
+    this.edges.push({ verts: added, clipped: false });
+    return 2;
+  }
+
+  end() {
+    this.firstEdge = this.edges.findIndex((edge) => !edge.clipped);
+    if (this.firstEdge < 0) this.firstEdge = this.edges.length;
+  }
+
+  // The polygon's corners in strip order, each { position, data }.
+  results(lerp) {
+    const dataOf = (vertex) => {
+      if (vertex.data === undefined) vertex.data = lerp(dataOf(vertex.from), dataOf(vertex.to), vertex.t);
+      return vertex.data;
+    };
+    if (this.firstEdge >= this.edges.length) return [];
+    let [front, back] = this.edges[this.firstEdge].verts;
+    const out = [];
+    for (let step = 0; ; step += 1) {
+      const vertex = this.verts[step & 1 ? back : front];
+      out.push({ position: vertex.position, data: dataOf(vertex) });
+      if (back === front || out.length > this.verts.length) break;
+      if (step & 1) back = this.edges[this.verts[back].edges[1]].verts[1];
+      else front = this.edges[this.verts[front].edges[0]].verts[0];
+    }
+    return out;
+  }
+}
+
 // WMO water's ripple texture repeats every 1 / 0.24 yards of the group's
 // space from its liquid's corner; magma and slime carry their own
 // coordinates, in 256ths.
 const WMO_WATER_UV_SCALE = 0.24;
 const WMO_MAGMA_UV_SCALE = 1 / 256;
+// Tiles with this flag lie across a portal: the client clips them by the
+// group's portals rather than drawing them whole.
+const TILE_PORTAL_CLIPPED = 0x80;
+
+// A clipped corner's data mixed as the client mixes it: the depth byte,
+// and the texture coordinates as unsigned 16-bit values, each cut to a
+// whole number.
+function lerpLiquidData(a, b, t) {
+  return {
+    depth: Math.trunc(a.depth + (b.depth - a.depth) * t) & 0xff,
+    s: Math.trunc(a.s + (b.s - a.s) * t) & 0xffff,
+    t: Math.trunc(a.t + (b.t - a.t) * t) & 0xffff,
+  };
+}
+
+const toInt16 = (value) => (value >= 0x8000 ? value - 0x10000 : value);
+
+// Whether another group's liquid reaches over a tile (from `min` to `max`
+// corner), as the client tests it.
+function overlapsTile(other, min, max) {
+  return other.corner[0] < max[0] && other.corner[1] < max[1]
+    && other.xTiles * LIQUID_UNIT + other.corner[0] > min[0] && LIQUID_UNIT * other.yTiles + other.corner[1] > min[1];
+}
 
 // A WMO group's liquid surface in the group's own space (vertex (x, y) at
-// corner + (x, y) × LIQUID_UNIT), with magma's or water's uvs. Null when no
-// tile has any.
-export function liquidSurface({ xVerts, xTiles, yTiles, corner, heights, depths, magmaUvs, tiles }, { magma = false } = {}) {
+// corner + (x, y) × LIQUID_UNIT), with magma's or water's uvs. Tiles
+// across a portal are clipped by the group's portals whose other group has
+// liquid over the tile (`portals`: the building's planes, the group's
+// references, and `liquidOf(groupIndex)`); without them, drawn whole. Null
+// when no tile has any.
+export function liquidSurface({ xVerts, xTiles, yTiles, corner, heights, depths, magmaUvs, tiles }, { magma = false, portals = null } = {}) {
   // Vertex rows can be wider than the tiles need.
   const index = (x, y) => y * xVerts + x;
   const rowHeights = Float32Array.from({ length: (xTiles + 1) * (yTiles + 1) },
     (_, at) => heights[index(at % (xTiles + 1), Math.floor(at / (xTiles + 1)))]);
-  return new LiquidSurface().add({
+  const waterUv = ([px, py]) => [(px - corner[0]) * WMO_WATER_UV_SCALE, (py - corner[1]) * WMO_WATER_UV_SCALE];
+  const magmaUv = (s, t) => [s * WMO_MAGMA_UV_SCALE, t * WMO_MAGMA_UV_SCALE];
+  const wet = (x, y) => (tiles[y * xTiles + x] & 0x0F) !== TILE_NO_LIQUID;
+  const clipped = (x, y) => Boolean(portals) && Boolean(tiles[y * xTiles + x] & TILE_PORTAL_CLIPPED);
+  const surface = new LiquidSurface().add({
     xTiles, yTiles, heights: rowHeights,
-    wet: (x, y) => (tiles[y * xTiles + x] & 0x0F) !== TILE_NO_LIQUID,
+    wet: (x, y) => wet(x, y) && !clipped(x, y),
     place: (x, y) => [corner[0] + x * LIQUID_UNIT, corner[1] + y * LIQUID_UNIT],
     uv: magma
-      ? (x, y) => [magmaUvs[index(x, y) * 2] * WMO_MAGMA_UV_SCALE, magmaUvs[index(x, y) * 2 + 1] * WMO_MAGMA_UV_SCALE]
-      : (x, y, [px, py]) => [(px - corner[0]) * WMO_WATER_UV_SCALE, (py - corner[1]) * WMO_WATER_UV_SCALE],
+      ? (x, y) => magmaUv(magmaUvs[index(x, y) * 2], magmaUvs[index(x, y) * 2 + 1])
+      : (x, y, position) => waterUv(position),
     depth: (x, y) => depths?.[index(x, y)] ?? 0,
-  }).finish();
+  });
+  for (let y = 0; portals && y < yTiles; y += 1) {
+    for (let x = 0; x < xTiles; x += 1) {
+      if (!wet(x, y) || !clipped(x, y)) continue;
+      const clipper = new ConvexClipper();
+      const points = [[0, 0], [0, 1], [1, 1], [1, 0]].map(([dx, dy]) => {
+        const vertex = index(x + dx, y + dy);
+        const position = [(x + dx) * LIQUID_UNIT + corner[0], LIQUID_UNIT * (y + dy) + corner[1], heights[vertex]];
+        clipper.addVertex(position, {
+          depth: depths?.[vertex] ?? 0, s: magmaUvs[vertex * 2] & 0xffff, t: magmaUvs[vertex * 2 + 1] & 0xffff,
+        });
+        return position;
+      });
+      clipper.begin();
+      for (const ref of portals.refs) {
+        const other = portals.liquidOf(ref.groupIndex);
+        const plane = portals.planes[ref.portalIndex];
+        if (other && plane && overlapsTile(other, points[0], points[2])) clipper.clip(plane, ref.side);
+      }
+      clipper.end();
+      const corners = clipper.results(lerpLiquidData);
+      surface.addStrip(
+        corners.map(({ position }) => position),
+        corners.map(({ position, data }) => (magma ? magmaUv(toInt16(data.s), toInt16(data.t)) : waterUv(position))),
+        corners.map(({ data }) => data.depth),
+      );
+    }
+  }
+  return surface.finish();
 }
 
 // LiquidType.dbc: flags, kind (0 water, 1 ocean, 2 magma, 3 slime),
