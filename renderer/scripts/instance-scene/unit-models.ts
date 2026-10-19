@@ -34,7 +34,6 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
-import type { LightColors } from '../utils/map-light';
 import { type EffectBlend, m2MaterialLight } from '../utils/m2-tracks';
 import { blendFactors } from './m2-blend';
 import type { Point3, StrikeKind } from '../utils/spell-events';
@@ -63,17 +62,22 @@ const PET_OVERSIZED_DISPLAY_SCALE = 2;
 export interface UnitLook {
   color: number | null;
   alpha: number;
-  light?: UnitLight;
+  light?: ModelLight;
   // Its animation held still (a kit's freeze): at this time into its loop
   // (ms), or where it is when null.
   freeze?: { atMs: number | null } | null;
 }
 
-// A unit's own light, and how far its light's direction leans from the
-// indoor light's towards the sun's (0 to 1: 1 outdoors, between on a
-// transition face).
-export interface UnitLight extends LightColors {
-  outdoor: number;
+// A light a model takes as the client lights it (a unit's own, which its
+// spell effects share, or the sky's): ambient and direct in the client's
+// colour space (ambient's w 1 while the client's light is on), the way to
+// the light in view space, and how squarely it shines on a surface facing
+// straight up (particles'). Its owner updates it in place.
+export interface ModelLight {
+  ambient: Vector4;
+  direct: Vector4;
+  towards: Vector3;
+  upward: number;
 }
 
 // The map's light as the client lights models: the ambient plus the direct
@@ -99,18 +103,13 @@ const CLIENT_LIGHT_DECLARATIONS = `
 uniform vec4 wowLightAmbient;
 uniform vec4 wowLightDirect;
 uniform vec3 wowLightDirection;
-uniform vec3 wowSunDirection;
 uniform vec4 wowPointPosition[${pointLights.positions.length}];
 uniform vec4 wowPointColor[${pointLights.colors.length}];
 uniform float wowPointCount;
 ${pointLightFunction('wowPointLight', 'wowPointPosition', 'wowPointColor', 'wowPointCount')}${LIT_SUM_FUNCTION}`;
-// The direct light's w is how far its direction leans towards the sun's
-// (1 outdoors, where they are the same; a unit's own share indoors).
 const CLIENT_LIGHT_FRAGMENT = `
 if (wowLightAmbient.w > 0.5) {
-  vec3 wowTowards = mix(wowLightDirection, wowSunDirection, wowLightDirect.w);
-  wowTowards = dot(wowTowards, wowTowards) > 1e-6 ? normalize(wowTowards) : wowLightDirection;
-  vec3 wowLight = wowLitSum(wowLightAmbient.rgb, wowLightDirect.rgb, dot(normal, wowTowards), wowPointLight(-vViewPosition, normal));
+  vec3 wowLight = wowLitSum(wowLightAmbient.rgb, wowLightDirect.rgb, dot(normal, wowLightDirection), wowPointLight(-vViewPosition, normal));
   reflectedLight.indirectDiffuse += diffuseColor.rgb * pow(wowLight, vec3(2.2));
 }
 `;
@@ -118,7 +117,6 @@ interface ClientLightUniforms {
   wowLightAmbient: { value: Vector4 };
   wowLightDirect: { value: Vector4 };
   wowLightDirection: { value: Vector3 };
-  wowSunDirection: { value: Vector3 };
   wowPointPosition: { value: Vector4[] };
   wowPointColor: { value: Vector4[] };
   wowPointCount: { value: number };
@@ -127,7 +125,6 @@ const sharedLightUniforms = (): ClientLightUniforms => ({
   wowLightAmbient: { value: clientLight.ambient },
   wowLightDirect: { value: clientLight.direct },
   wowLightDirection: { value: clientLight.sun },
-  wowSunDirection: { value: clientLight.sun },
   wowPointPosition: { value: pointLights.positions },
   wowPointColor: { value: pointLights.colors },
   wowPointCount: pointLights.count,
@@ -188,7 +185,6 @@ function copyMaterial(material: Material): Material {
   const copy = material.clone();
   if (!material.userData.wowLight) return copy;
   copy.userData.wowLight = sharedLightUniforms();
-  copy.userData.wowOwnLight = { ambient: new Vector4(), direct: new Vector4() };
   copy.onBeforeCompile = injectClientLight;
   return copy;
 }
@@ -311,6 +307,8 @@ interface UnitInstance {
   // How its spells change its model (UnitLook), as a key, and the shared
   // materials swapped out for changed copies, by mesh.
   look: string;
+  // Its own light, which its materials follow (UnitLook.light).
+  light: ModelLight | null;
   changed: Map<Mesh, Material | Material[]>;
   // Whether it was last seen sitting, or null before its first pose.
   sitting: boolean | null;
@@ -804,6 +802,7 @@ export class UnitModelLayer {
       blades: [],
       frozen: false,
       look: '',
+      light: null,
       changed: new Map(),
       sitting: null,
     };
@@ -1011,14 +1010,17 @@ export class UnitModelLayer {
     });
   }
 
-  // Multiplies the unit's materials by a colour and an opacity, on copies
-  // of the shared ones, or puts the shared ones back.
+  // Multiplies the unit's materials by a colour and an opacity, and gives
+  // them its own light, on copies of the shared ones, or puts the shared
+  // ones back. Its own light is followed by reference, so it can change
+  // without the materials being touched.
   private setLook(unit: UnitInstance, look: UnitLook | null): void {
     const plain = !look || (look.color === null && look.alpha >= 1 && !look.light);
     const own = look?.light ?? null;
-    const key = plain ? '' : `${look.color}|${look.alpha.toFixed(3)}|${own ? [...own.ambient, ...own.direct, own.outdoor].map((value) => value.toFixed(3)).join(',') : ''}`;
-    if (unit.look === key) return;
+    const key = plain ? '' : `${look.color}|${look.alpha.toFixed(3)}`;
+    if (unit.look === key && unit.light === own) return;
     unit.look = key;
+    unit.light = own;
     if (plain) {
       for (const [mesh, original] of unit.changed) {
         for (const copy of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) copy.dispose();
@@ -1042,19 +1044,12 @@ export class UnitModelLayer {
         const source = originals[index];
         if (!(copy instanceof MeshLambertMaterial || copy instanceof MeshBasicMaterial)
           || !(source instanceof MeshLambertMaterial || source instanceof MeshBasicMaterial)) return;
-        // A lit material takes the unit's own light, from the fixed indoor
-        // direction leaning towards the sun's by its share; else the map's,
-        // shared.
+        // A lit material takes the unit's own light, else the map's, shared.
         const uniforms = copy.userData.wowLight as ClientLightUniforms | undefined;
         if (uniforms) {
-          const values = copy.userData.wowOwnLight as { ambient: Vector4; direct: Vector4 };
-          if (own) {
-            values.ambient.set(...own.ambient, 1);
-            values.direct.set(...own.direct, own.outdoor);
-          }
-          uniforms.wowLightAmbient.value = own ? values.ambient : clientLight.ambient;
-          uniforms.wowLightDirect.value = own ? values.direct : clientLight.direct;
-          uniforms.wowLightDirection.value = own ? clientLight.indoor : clientLight.sun;
+          uniforms.wowLightAmbient.value = own?.ambient ?? clientLight.ambient;
+          uniforms.wowLightDirect.value = own?.direct ?? clientLight.direct;
+          uniforms.wowLightDirection.value = own?.towards ?? clientLight.sun;
         }
         copy.color.copy(source.color).multiply(tintColor);
         copy.opacity = source.opacity * look.alpha;

@@ -59,7 +59,7 @@ import {
 import { litColor, type Rgb } from '../utils/map-light';
 import { blendFactors } from './m2-blend';
 import { LIT_SUM_FUNCTION } from './point-lights';
-import { clientLight } from './unit-models';
+import { clientLight, type ModelLight } from './unit-models';
 import { EPSILON } from '../utils/vec3';
 
 // Plays one of the client's spell effect models (built by
@@ -322,17 +322,9 @@ function applyBlend(material: MeshBasicMaterial, blend: EffectBlend): void {
   Object.assign(material, blendFactors(blend));
 }
 
-// The light an effect's lit batches and particles take: its unit's own,
-// or the sky's where it has none (skyEffectLight, which the scene view
-// keeps). Ambient and direct in the client's colour space (ambient's w 1
-// while the client's light is on), the way to the light in view space, and
-// how squarely it shines on a surface facing straight up (particles').
-export interface EffectLight {
-  ambient: Vector4;
-  direct: Vector4;
-  towards: Vector3;
-  upward: number;
-}
+// The light an effect's lit batches and particles take: its unit's own
+// (its model's), or the sky's where it has none.
+export type EffectLight = ModelLight;
 
 // The sky's light shares the models' direct light and way to the sun (the
 // scene view and the spell preview keep those); only its ambient, without

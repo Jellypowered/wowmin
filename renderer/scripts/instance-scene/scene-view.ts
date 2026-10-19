@@ -52,10 +52,10 @@ import { ALL_SPELL_AIDS, type SpellAids, SpellEffectLayer, type UnitAnchorRole }
 import { buildLayerArray, BYTE_SHADING_SCALE, createTerrainMaterial, prepareAlphaAtlas } from './terrain-material';
 import { GameObjectLayer, type GameObjectPose } from './game-objects';
 import { type BearerAreaCircle, SpellVisualLayer, type UnitInfo } from './spell-visual-layer';
-import { clientLight, type UnitLook, type UnitModelPose, UnitModelLayer } from './unit-models';
+import { clientLight, type ModelLight, type UnitLook, type UnitModelPose, UnitModelLayer } from './unit-models';
 import { LIT_SUM_FUNCTION, MAX_POINT_LIGHTS, pointLightFunction, pointLights } from './point-lights';
 import { blendFactors } from './m2-blend';
-import { type EffectLight, skyEffectLight } from './m2-effect';
+import { skyEffectLight } from './m2-effect';
 
 type WowBlend = 'opaque' | 'alphaKey' | 'alpha' | 'add' | 'mod' | 'mod2x';
 
@@ -831,9 +831,9 @@ export class InstanceSceneView {
   // as it eases towards the light where it stands, with when it was last
   // eased (performance.now, ms).
   private readonly unitPoints = new Map<string, Point3>();
-  // Each unit's eased light, and the light its spell effects take (its
-  // model's).
-  private readonly unitLights = new Map<string, { eased: EasedLight; effect: EffectLight }>();
+  // Each unit's eased light, and its own light as its model and its spell
+  // effects take it.
+  private readonly unitLights = new Map<string, { eased: EasedLight; light: ModelLight }>();
   private easedAt = 0;
   // The server point at the centre of the last frame drawn, and the view's
   // frustum, for the units' animation budget.
@@ -1032,7 +1032,7 @@ export class InstanceSceneView {
       intersect: (from, to) => this.intersect(from, to),
       blades: (unit) => this.units.bladesOf(unit),
       effectScales: (unit) => this.units.effectScalesOf(unit),
-      light: (unit) => this.unitLights.get(unit)?.effect ?? null,
+      light: (unit) => this.unitLights.get(unit)?.light ?? null,
       attachmentTurn: (unit, attachment, out) => (positions.has(unit) ? this.units.attachmentTurnOf(unit, attachment, out) : null),
       creatureTypeFlags,
     };
@@ -1080,23 +1080,24 @@ export class InstanceSceneView {
       }
       const known = this.unitLights.get(id);
       const eased = known ? easeLight(known.eased, target, seconds) : target;
-      const light = known ?? { eased, effect: { ambient: new Vector4(), direct: new Vector4(), towards: new Vector3(), upward: 1 } };
-      light.eased = eased;
-      this.unitLights.set(id, light);
-      this.setEffectLight(light.effect, eased, lit.direct, share);
+      const entry = known ?? { eased, light: { ambient: new Vector4(), direct: new Vector4(), towards: new Vector3(), upward: 1 } };
+      entry.eased = eased;
+      this.unitLights.set(id, entry);
+      this.setModelLight(entry.light, eased, lit.direct, share);
+      // Units outdoors in the map's light share it; the rest take their own.
       const shared = !indoor?.light && eased.directScale >= 1
         && eased.ambient.every((value, channel) => Math.abs(value - sky.ambient[channel]) < 1 / 512);
       if (shared) continue;
       const look: UnitLook = looks.get(id) ?? { color: null, alpha: 1 };
-      look.light = { ambient: eased.ambient, direct: lit.direct.map((value) => value * eased.directScale) as Rgb, outdoor: share };
+      look.light = entry.light;
       looks.set(id, look);
     }
     for (const id of this.unitLights.keys()) if (!this.unitPoints.has(id)) this.unitLights.delete(id);
   }
 
-  // A unit's effects' light: its own, from the indoor light's direction
-  // leaning towards the sun's by its share (all the way outdoors).
-  private setEffectLight(light: EffectLight, eased: EasedLight, direct: Rgb, share: number): void {
+  // A unit's own light, from the indoor light's direction leaning towards
+  // the sun's by its share (all the way outdoors).
+  private setModelLight(light: ModelLight, eased: EasedLight, direct: Rgb, share: number): void {
     light.ambient.set(...eased.ambient, 1);
     light.direct.set(direct[0] * eased.directScale, direct[1] * eased.directScale, direct[2] * eased.directScale, 1);
     const towards = light.towards.copy(INDOOR_TOWARDS).lerp(this.sunTowards, share);
