@@ -49,7 +49,11 @@ import {
   type UnitWeapons,
 } from '../utils/unit-animation';
 import { threeToServer, useServerAxes } from './iso-camera';
-import { LIT_SUM_FUNCTION, pointLightFunction, pointLights } from './point-lights';
+import {
+  LIT_SUM_FUNCTION, MODEL_POINT_LIGHTS, POINT_LIGHT_FRAGMENT_DECLARATIONS, POINT_LIGHT_VERTEX_DECLARATIONS, pointLightDefines,
+  pointLightVertex,
+} from './point-lights';
+import { SCENE_BLOCK_DECLARATION, sceneBlock } from './scene-block';
 
 // A pet's model scale above this is a giant's (see UnitModelPose.pet).
 const PET_OVERSIZED_DISPLAY_SCALE = 2;
@@ -96,20 +100,19 @@ export const clientLight = {
 };
 
 // The client's light on a lit model material: the uniforms come from the
-// material (shared ones, or a unit's own), and the props' point
-// lights join the sum indoors and out. The scene's three.js ambient and sun
-// are dark while it is on.
+// material (shared ones, or a unit's own), and the props' point lights
+// (from the scene block, picked by the unit's origin, per vertex) join the
+// sum indoors and out. The scene's three.js ambient and sun are dark while
+// it is on.
+const CLIENT_LIGHT_VERTEX_DECLARATIONS = `${SCENE_BLOCK_DECLARATION}${POINT_LIGHT_VERTEX_DECLARATIONS}`;
 const CLIENT_LIGHT_DECLARATIONS = `
 uniform vec4 wowLightAmbient;
 uniform vec4 wowLightDirect;
 uniform vec3 wowLightDirection;
-uniform vec4 wowPointPosition[${pointLights.positions.length}];
-uniform vec4 wowPointColor[${pointLights.colors.length}];
-uniform float wowPointCount;
-${pointLightFunction('wowPointLight', 'wowPointPosition', 'wowPointColor', 'wowPointCount')}${LIT_SUM_FUNCTION}`;
+${POINT_LIGHT_FRAGMENT_DECLARATIONS}${LIT_SUM_FUNCTION}`;
 const CLIENT_LIGHT_FRAGMENT = `
 if (wowLightAmbient.w > 0.5) {
-  vec3 wowLight = wowLitSum(wowLightAmbient.rgb, wowLightDirect.rgb, dot(normal, wowLightDirection), wowPointLight(-vViewPosition, normal));
+  vec3 wowLight = wowLitSum(wowLightAmbient.rgb, wowLightDirect.rgb, dot(normal, wowLightDirection), WOW_POINTS);
   reflectedLight.indirectDiffuse += diffuseColor.rgb * pow(wowLight, vec3(2.2));
 }
 `;
@@ -117,20 +120,24 @@ interface ClientLightUniforms {
   wowLightAmbient: { value: Vector4 };
   wowLightDirect: { value: Vector4 };
   wowLightDirection: { value: Vector3 };
-  wowPointPosition: { value: Vector4[] };
-  wowPointColor: { value: Vector4[] };
-  wowPointCount: { value: number };
 }
 const sharedLightUniforms = (): ClientLightUniforms => ({
   wowLightAmbient: { value: clientLight.ambient },
   wowLightDirect: { value: clientLight.direct },
   wowLightDirection: { value: clientLight.sun },
-  wowPointPosition: { value: pointLights.positions },
-  wowPointColor: { value: pointLights.colors },
-  wowPointCount: pointLights.count,
 });
+// A lit model material reads the scene block for its point lights.
+function lightMaterial<T extends Material>(material: T): T {
+  material.userData.wowLight = sharedLightUniforms();
+  material.onBeforeCompile = injectClientLight;
+  material.defines = { ...material.defines, ...pointLightDefines(MODEL_POINT_LIGHTS, true) };
+  (material as T & { uniformsGroups: unknown[] }).uniformsGroups = [sceneBlock];
+  return material;
+}
 function injectClientLight(this: Material, shader: WebGLProgramParametersWithUniforms): void {
   Object.assign(shader.uniforms, this.userData.wowLight as ClientLightUniforms);
+  shader.vertexShader = CLIENT_LIGHT_VERTEX_DECLARATIONS + shader.vertexShader
+    .replace('#include <project_vertex>', `#include <project_vertex>\n${pointLightVertex('transformedNormal')}`);
   shader.fragmentShader = CLIENT_LIGHT_DECLARATIONS + shader.fragmentShader
     .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>\n${CLIENT_LIGHT_FRAGMENT}`);
 }
@@ -184,9 +191,7 @@ export interface UnitModelPose {
 function copyMaterial(material: Material): Material {
   const copy = material.clone();
   if (!material.userData.wowLight) return copy;
-  copy.userData.wowLight = sharedLightUniforms();
-  copy.onBeforeCompile = injectClientLight;
-  return copy;
+  return lightMaterial(copy);
 }
 
 
@@ -1090,10 +1095,7 @@ export class UnitModelLayer {
       ...blendFactors(blend),
     };
     const material = rule.lit ? new MeshLambertMaterial(parameters) : new MeshBasicMaterial(parameters);
-    if (rule.lit) {
-      material.userData.wowLight = sharedLightUniforms();
-      material.onBeforeCompile = injectClientLight;
-    }
+    if (rule.lit) lightMaterial(material);
     this.materials.set(source.uuid, material);
     return material;
   }

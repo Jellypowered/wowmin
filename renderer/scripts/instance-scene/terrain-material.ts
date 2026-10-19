@@ -14,6 +14,7 @@ import {
 } from 'three';
 
 import { CHUNK_SIZE } from '../utils/terrain-shadow';
+import { pointLightDefines, TERRAIN_POINT_LIGHTS } from './point-lights';
 
 // The ground's material: each chunk blends up to four texture layers through
 // its alpha maps, as the client does (layer 1 as the base, each later layer
@@ -158,7 +159,8 @@ export function createTerrainMaterial({
   partyFade: (shader: WebGLProgramParametersWithUniforms) => void;
 }): MeshLambertMaterial {
   const material = new MeshLambertMaterial({ color: new Color(1, 1, 1), vertexColors: vertexShaded });
-  material.defines = { WOW_NEUTRAL_SCALE: GROUND_BRIGHTNESS.toFixed(2) };
+  // The ground picks its point lights by each vertex, fewer than models.
+  material.defines = { WOW_NEUTRAL_SCALE: GROUND_BRIGHTNESS.toFixed(2), ...pointLightDefines(TERRAIN_POINT_LIGHTS, false) };
   const uniforms = {
     wowTerrainLayers: { value: layers },
     wowTerrainAlpha: { value: alpha },
