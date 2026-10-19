@@ -69,7 +69,7 @@ export function timeOfDay(date: Date): number {
   return (date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60) * 2;
 }
 
-const toRgb = (color: number): Rgb => [((color >> 16) & 0xff) / 255, ((color >> 8) & 0xff) / 255, (color & 0xff) / 255];
+export const toRgb = (color: number): Rgb => [((color >> 16) & 0xff) / 255, ((color >> 8) & 0xff) / 255, (color & 0xff) / 255];
 
 // A band's colour at a time: between the keys either side, wrapping past
 // midnight; the one colour of a single key; black with none.
@@ -206,14 +206,10 @@ export function blendLight(indoor: LightColors, outdoor: LightColors, share: num
   return { direct: mix(indoor.direct, outdoor.direct), ambient: mix(indoor.ambient, outdoor.ambient) };
 }
 
-// How strongly a unit takes its direct light: outdoors the client aims at
-// 2.5 (in effect 1, as the scale never passes 1) or 0.5 where the ground's
-// baked shadow lies under it; indoors 1, or 1 + 1.5 x the floor's alpha on
-// a transition face.
-export const DIRECT_SCALE_LIT = 2.5;
+// How strongly a unit outdoors takes its direct light where the ground's
+// baked shadow lies under it; elsewhere 1. (The client aims higher outside
+// shadow and on transition faces, but the scale never passes 1.)
 export const DIRECT_SCALE_SHADOWED = 0.5;
-export const DIRECT_SCALE_INDOORS = 1;
-export const transitionDirectScale = (share: number): number => 1 + 1.5 * share;
 
 // A unit's light eases towards where it should be rather than jumping: its
 // ambient by up to this much a second on each channel (2 x 255 in the

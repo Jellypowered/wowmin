@@ -374,15 +374,14 @@ function applyLighting(): void {
   const ambient = chosen?.colors.ambient ?? [0, 0, 0];
   const direct = chosen?.colors.direct ?? [0, 0, 0];
   const towards = serverToThree(chosen?.towards ?? [0, 0, 1]).normalize();
+  // The effects' sky light shares the models' direct light and way to it.
   clientLight.ambient.set(...ambient, on);
   clientLight.direct.set(...direct, on);
   skyEffectLight.ambient.set(...ambient, on);
-  skyEffectLight.direct.set(...direct, on);
   skyEffectLight.upward = Math.max(0, towards.y);
   towards.transformDirection(camera.matrixWorldInverse);
   clientLight.sun.copy(towards);
   clientLight.indoor.copy(towards);
-  skyEffectLight.towards.copy(towards);
 }
 
 function frame(): void {

@@ -4,11 +4,9 @@ import {
   Box3,
   BufferGeometry,
   Color,
-  CustomBlending,
   type DataArrayTexture,
   DirectionalLight,
   DoubleSide,
-  DstColorFactor,
   FrontSide,
   Frustum,
   InstancedBufferAttribute,
@@ -26,7 +24,6 @@ import {
   Raycaster,
   Scene,
   Sphere,
-  SrcColorFactor,
   SRGBColorSpace,
   type Texture,
   Uniform,
@@ -36,16 +33,15 @@ import {
   Vector4,
   WebGLRenderer,
   type WebGLProgramParametersWithUniforms,
-  ZeroFactor,
 } from 'three';
 import { type GLTF, GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 
 import { type FadeSettings, type FadeVolume, getSceneFade, type IsoView, MAX_FADE_VOLUMES } from '../utils/map-projection';
 import {
-  blendLight, type BuildingBatchLight, buildingBatchLight, characterAmbientScale, DIRECT_SCALE_INDOORS, DIRECT_SCALE_LIT,
+  blendLight, type BuildingBatchLight, buildingBatchLight, characterAmbientScale,
   DIRECT_SCALE_SHADOWED, type EasedLight, easeLight, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors,
-  lightAt, type MapLights, nearestObjectLights, type ObjectLight, scaleAmbient, type Rgb, sunDirection, timeOfDay, transitionDirectScale,
+  lightAt, type MapLights, nearestObjectLights, type ObjectLight, scaleAmbient, type Rgb, sunDirection, timeOfDay, toRgb,
 } from '../utils/map-light';
 import { ATLAS_SIZE, TerrainShadows } from '../utils/terrain-shadow';
 import { m2MaterialLight, PARTICLE_GROUND_DEPTH } from '../utils/m2-tracks';
@@ -57,12 +53,11 @@ import { buildLayerArray, BYTE_SHADING_SCALE, createTerrainMaterial, prepareAlph
 import { GameObjectLayer, type GameObjectPose } from './game-objects';
 import { type BearerAreaCircle, SpellVisualLayer, type UnitInfo } from './spell-visual-layer';
 import { clientLight, type UnitLook, type UnitModelPose, UnitModelLayer } from './unit-models';
-import { MAX_POINT_LIGHTS, pointLightFunction, pointLights } from './point-lights';
+import { LIT_SUM_FUNCTION, MAX_POINT_LIGHTS, pointLightFunction, pointLights } from './point-lights';
+import { blendFactors } from './m2-blend';
 import { type EffectLight, skyEffectLight } from './m2-effect';
 
 type WowBlend = 'opaque' | 'alphaKey' | 'alpha' | 'add' | 'mod' | 'mod2x';
-// The client's alpha key for models.
-const M2_ALPHA_KEY_REFERENCE = 224 / 255;
 
 interface TerrainTextures {
   layers: DataArrayTexture;
@@ -122,8 +117,7 @@ vec3 wowMocv = vColor.rgb;
 if (wowClientAmbientPacked.w > 0.5) {
   vec3 wowNormal = normalize(vWowNormal);
   vec3 wowPoints = wowPointLight(vWowView, wowNormal);
-  vec3 wowSky = clamp(wowClientAmbientPacked.rgb + wowPoints
-    + min(wowClientDirectPacked.rgb, vec3(1.0)) * clamp(dot(wowNormal, wowClientSunPacked.xyz), 0.0, 1.0), 0.0, 1.0);
+  vec3 wowSky = wowLitSum(wowClientAmbientPacked.rgb, wowClientDirectPacked.rgb, dot(wowNormal, wowClientSunPacked.xyz), wowPoints);
 #ifdef WOW_BUILDING_UNIFIED
   vec3 wowLit = clamp(wowSky * 0.5 + wowMocv, 0.0, 1.0);
   vec3 wowOwn = clamp(clamp(wowBuildingAmbient + wowPoints, 0.0, 1.0) * 0.5 + wowMocv, 0.0, 1.0);
@@ -306,7 +300,7 @@ layout(std140) uniform ${FADE_BLOCK} {
   vec4 wowPointColorPacked[${MAX_POINT_LIGHTS}];
   vec4 wowPointCountPacked;
 };
-${pointLightFunction('wowPointLight', 'wowPointPositionPacked', 'wowPointColorPacked', 'wowPointCountPacked.x')}
+${pointLightFunction('wowPointLight', 'wowPointPositionPacked', 'wowPointColorPacked', 'wowPointCountPacked.x')}${LIT_SUM_FUNCTION}
 #define wowReachMin wowReachMinPacked.xyz
 #define wowReachMax wowReachMaxPacked.xyz
 #define wowHeightRange wowFadeParams.x
@@ -384,8 +378,7 @@ if (wowClientAmbientPacked.w > 0.5) {
   }
   wowDirect *= vWowPropKind.z;
 #endif
-  vec3 wowLight = clamp(wowAmbient + min(wowDirect, vec3(1.0)) * saturate(dot(normal, wowTowards))
-    + wowPointLight(vWowView, normal), 0.0, 1.0);
+  vec3 wowLight = wowLitSum(wowAmbient, wowDirect, dot(normal, wowTowards), wowPointLight(vWowView, normal));
   reflectedLight.indirectDiffuse += diffuseColor.rgb * pow(wowLight, vec3(2.2));
 }
 `;
@@ -513,6 +506,9 @@ interface PropLight {
   ambient: Float32Array;
 }
 const propLights = new WeakMap<object, PropLight>();
+// Each per-copy attribute and the PropLight array it is filled from, three
+// floats a copy.
+const PROP_LIGHT_ATTRIBUTES = [['wowPropKind', 'kind'], ['wowPropDirect', 'direct'], ['wowPropAmbient', 'ambient']] as const;
 
 function propLight(floors: ArrayLike<number>): PropLight {
   const count = floors.length / 4;
@@ -537,7 +533,7 @@ function propLight(floors: ArrayLike<number>): PropLight {
 // floor per copy, shared by the node's primitives.
 const outdoorFloors = new WeakMap<Object3D, Float32Array>();
 function worldPropFloors(mesh: Mesh): Float32Array {
-  const node = mesh instanceof InstancedMesh || mesh.userData.kind === 'doodad' ? mesh : mesh.parent ?? mesh;
+  const node = mesh.userData.kind === 'doodad' || mesh.userData.kind === 'doodads' ? mesh : mesh.parent ?? mesh;
   let floors = outdoorFloors.get(node);
   if (!floors) {
     const count = mesh instanceof InstancedMesh ? mesh.instanceMatrix.count : 1;
@@ -553,10 +549,13 @@ function worldPropFloors(mesh: Mesh): Float32Array {
 const propPoint = new Vector3();
 const propMatrix = new Matrix4();
 function shadeProps(root: Object3D, shadows: TerrainShadows): void {
+  // A node's primitives share their copies' light: worked out once.
+  const shaded = new Set<PropLight>();
   root.traverse((object) => {
     const light = object.userData.wowPropLight as PropLight | undefined;
     if (!(object instanceof Mesh) || !light) return;
-    const count = light.kind.length / 3;
+    const count = shaded.has(light) ? 0 : light.kind.length / 3;
+    shaded.add(light);
     for (let index = 0; index < count; index += 1) {
       if (light.kind[index * 3] < 0.5) continue;
       if (object instanceof InstancedMesh) {
@@ -574,15 +573,21 @@ function shadeProps(root: Object3D, shadows: TerrainShadows): void {
   });
 }
 
-// A tile's alpha atlas's alpha channel, read back from its image.
+// A tile's alpha atlas's alpha channel, read back from its image through
+// one canvas kept for every tile.
+let atlasContext: CanvasRenderingContext2D | null | undefined;
 function atlasAlpha(texture: Texture): Uint8Array | null {
   const image = texture.image as CanvasImageSource | undefined;
   if (!image) return null;
-  const canvas = document.createElement('canvas');
-  canvas.width = ATLAS_SIZE;
-  canvas.height = ATLAS_SIZE;
-  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (atlasContext === undefined) {
+    const canvas = document.createElement('canvas');
+    canvas.width = ATLAS_SIZE;
+    canvas.height = ATLAS_SIZE;
+    atlasContext = canvas.getContext('2d', { willReadFrequently: true });
+  }
+  const context = atlasContext;
   if (!context) return null;
+  context.clearRect(0, 0, ATLAS_SIZE, ATLAS_SIZE);
   context.drawImage(image, 0, 0, ATLAS_SIZE, ATLAS_SIZE);
   const pixels = context.getImageData(0, 0, ATLAS_SIZE, ATLAS_SIZE).data;
   const alpha = new Uint8Array(ATLAS_SIZE * ATLAS_SIZE);
@@ -602,9 +607,7 @@ function applyPropLight(mesh: Mesh, floors: ArrayLike<number>): void {
   geometry.boundingSphere = source.boundingSphere?.clone() ?? null;
   geometry.setDrawRange(source.drawRange.start, source.drawRange.count);
   geometry.userData = source.userData;
-  geometry.setAttribute('wowPropKind', new InstancedBufferAttribute(light.kind.slice(), 3));
-  geometry.setAttribute('wowPropDirect', new InstancedBufferAttribute(light.direct.slice(), 3));
-  geometry.setAttribute('wowPropAmbient', new InstancedBufferAttribute(light.ambient.slice(), 3));
+  for (const [name, field] of PROP_LIGHT_ATTRIBUTES) geometry.setAttribute(name, new InstancedBufferAttribute(light[field].slice(), 3));
   mesh.userData.wowPropLight = light;
   mesh.geometry = geometry;
 }
@@ -828,10 +831,10 @@ export class InstanceSceneView {
   // as it eases towards the light where it stands, with when it was last
   // eased (performance.now, ms).
   private readonly unitPoints = new Map<string, Point3>();
-  private readonly easedLights = new Map<string, EasedLight>();
+  // Each unit's eased light, and the light its spell effects take (its
+  // model's).
+  private readonly unitLights = new Map<string, { eased: EasedLight; effect: EffectLight }>();
   private easedAt = 0;
-  // The light each unit's spell effects take, as its model's.
-  private readonly effectLights = new Map<string, EffectLight>();
   // The server point at the centre of the last frame drawn, and the view's
   // frustum, for the units' animation budget.
   private lastViewCentre: Point3 | null = null;
@@ -922,7 +925,7 @@ export class InstanceSceneView {
   // ?debug.
   get shadowedCount(): number {
     let count = 0;
-    for (const [id, light] of this.easedLights) if (light.directScale < 1 && !this.indoorLights.get(id)?.light) count += 1;
+    for (const [id, { eased }] of this.unitLights) if (eased.directScale < 1 && !this.indoorLights.get(id)?.light) count += 1;
     return count;
   }
 
@@ -1029,7 +1032,7 @@ export class InstanceSceneView {
       intersect: (from, to) => this.intersect(from, to),
       blades: (unit) => this.units.bladesOf(unit),
       effectScales: (unit) => this.units.effectScalesOf(unit),
-      light: (unit) => this.effectLights.get(unit) ?? null,
+      light: (unit) => this.unitLights.get(unit)?.effect ?? null,
       attachmentTurn: (unit, attachment, out) => (positions.has(unit) ? this.units.attachmentTurnOf(unit, attachment, out) : null),
       creatureTypeFlags,
     };
@@ -1056,8 +1059,7 @@ export class InstanceSceneView {
     const seconds = Math.min(0.25, Math.max(0, (nowMs - this.easedAt) / 1000));
     this.easedAt = nowMs;
     if (this.lighting !== 'client' || !this.mapLights) {
-      this.easedLights.clear();
-      this.effectLights.clear();
+      this.unitLights.clear();
       return;
     }
     const shadows = this.shown ? this.shadows.get(this.shown) : undefined;
@@ -1072,14 +1074,16 @@ export class InstanceSceneView {
         const own = { direct: indoor.light.direct, ambient: scaleAmbient(indoor.light.ambient, ambientScale) };
         lit = indoor.outdoor > 0 ? blendLight(own, sky, indoor.outdoor) : own;
         share = indoor.outdoor;
-        target = { ambient: lit.ambient, directScale: indoor.outdoor > 0 ? transitionDirectScale(indoor.outdoor) : DIRECT_SCALE_INDOORS };
+        target = { ambient: lit.ambient, directScale: 1 };
       } else {
-        target = { ambient: sky.ambient, directScale: shadows?.isShadowed(x, y) ? DIRECT_SCALE_SHADOWED : DIRECT_SCALE_LIT };
+        target = { ambient: sky.ambient, directScale: shadows?.isShadowed(x, y) ? DIRECT_SCALE_SHADOWED : 1 };
       }
-      const known = this.easedLights.get(id);
-      const eased = known ? easeLight(known, target, seconds) : { ambient: target.ambient, directScale: Math.min(1, target.directScale) };
-      this.easedLights.set(id, eased);
-      this.setEffectLight(id, eased, lit.direct, share);
+      const known = this.unitLights.get(id);
+      const eased = known ? easeLight(known.eased, target, seconds) : target;
+      const light = known ?? { eased, effect: { ambient: new Vector4(), direct: new Vector4(), towards: new Vector3(), upward: 1 } };
+      light.eased = eased;
+      this.unitLights.set(id, light);
+      this.setEffectLight(light.effect, eased, lit.direct, share);
       const shared = !indoor?.light && eased.directScale >= 1
         && eased.ambient.every((value, channel) => Math.abs(value - sky.ambient[channel]) < 1 / 512);
       if (shared) continue;
@@ -1087,18 +1091,12 @@ export class InstanceSceneView {
       look.light = { ambient: eased.ambient, direct: lit.direct.map((value) => value * eased.directScale) as Rgb, outdoor: share };
       looks.set(id, look);
     }
-    for (const id of this.easedLights.keys()) {
-      if (this.unitPoints.has(id)) continue;
-      this.easedLights.delete(id);
-      this.effectLights.delete(id);
-    }
+    for (const id of this.unitLights.keys()) if (!this.unitPoints.has(id)) this.unitLights.delete(id);
   }
 
   // A unit's effects' light: its own, from the indoor light's direction
   // leaning towards the sun's by its share (all the way outdoors).
-  private setEffectLight(id: string, eased: EasedLight, direct: Rgb, share: number): void {
-    let light = this.effectLights.get(id);
-    if (!light) this.effectLights.set(id, light = { ambient: new Vector4(), direct: new Vector4(), towards: new Vector3(), upward: 1 });
+  private setEffectLight(light: EffectLight, eased: EasedLight, direct: Rgb, share: number): void {
     light.ambient.set(...eased.ambient, 1);
     light.direct.set(direct[0] * eased.directScale, direct[1] * eased.directScale, direct[2] * eased.directScale, 1);
     const towards = light.towards.copy(INDOOR_TOWARDS).lerp(this.sunTowards, share);
@@ -1417,7 +1415,6 @@ export class InstanceSceneView {
     this.fadeData.set([clientLight.sun.x, clientLight.sun.y, clientLight.sun.z], CLIENT_SUN_OFFSET);
     this.fadeData.set([clientLight.indoor.x, clientLight.indoor.y, clientLight.indoor.z], CLIENT_INDOOR_OFFSET);
     this.placePointLights();
-    skyEffectLight.towards.copy(clientLight.sun);
     // setUnits has already updated the unit models' matrices this frame.
     for (const child of this.scene.children) if (child !== root && child !== this.units.group) child.updateMatrixWorld();
     this.renderer.render(this.scene, this.camera);
@@ -1475,12 +1472,12 @@ export class InstanceSceneView {
       // A building's prop's light follows its copies into their new slots.
       const light = mesh.userData.wowPropLight as PropLight | undefined;
       if (light) {
-        for (const [name, source, size] of [['wowPropKind', light.kind, 3], ['wowPropDirect', light.direct, 3], ['wowPropAmbient', light.ambient, 3]] as const) {
+        for (const [name, field] of PROP_LIGHT_ATTRIBUTES) {
           const attribute = mesh.geometry.getAttribute(name) as InstancedBufferAttribute;
           const target = attribute.array as Float32Array;
           for (let slot = 0; slot < count; slot += 1) {
-            const from = instances.shown[slot] * size;
-            target.set(source.subarray(from, from + size), slot * size);
+            const from = instances.shown[slot] * 3;
+            target.set(light[field].subarray(from, from + 3), slot * 3);
           }
           attribute.needsUpdate = true;
         }
@@ -1532,10 +1529,9 @@ export class InstanceSceneView {
     const direct: Rgb = colors?.direct ?? [0, 0, 0];
     this.fadeData.set([...ambient, on], CLIENT_AMBIENT_OFFSET);
     this.fadeData.set([...direct, on], CLIENT_DIRECT_OFFSET);
-    // Effects with no unit of their own take the sky's light (render puts
-    // its way into view space).
+    // Effects with no unit of their own take the sky's light (sharing the
+    // models' direct light and way to the sun).
     skyEffectLight.ambient.set(...ambient, on);
-    skyEffectLight.direct.set(...direct, on);
     skyEffectLight.upward = Math.max(0, this.sunTowards.y);
     // Units (characters) take the zone's character ambient too.
     this.unitSkyLight = { ambient: scaleAmbient(ambient, characterAmbientScale(this.mapLights?.ambientMultiplier)), direct };
@@ -1555,9 +1551,9 @@ export class InstanceSceneView {
     this.nearestLights.forEach((light, index) => {
       const at = serverToThree(light.position).applyMatrix4(view);
       // In the client's colour space, as the rest of its light.
-      const channel = (shift: number) => (((light.color >> shift) & 0xff) / 255) * light.intensity;
+      const [r, g, b] = toRgb(light.color);
       pointLights.positions[index].set(at.x, at.y, at.z, 1);
-      pointLights.colors[index].set(channel(16), channel(8), channel(0), 1);
+      pointLights.colors[index].set(r * light.intensity, g * light.intensity, b * light.intensity, 1);
       this.fadeData.set([at.x, at.y, at.z, 1], POINT_POSITION_OFFSET + index * 4);
       this.fadeData.set(pointLights.colors[index].toArray(), POINT_COLOR_OFFSET + index * 4);
     });
@@ -1623,7 +1619,6 @@ export class InstanceSceneView {
     const vertexLit = Boolean(mesh.geometry.getAttribute('color'));
     const exteriorLit = vertexLit && isExteriorGroup(mesh);
     const building = buildingBatch(mesh);
-    const inBuilding = building !== null;
     const floors = vertexLit ? null : propFloors(mesh) ?? (isWorldProp(mesh) ? worldPropFloors(mesh) : null);
     if (floors && !mesh.geometry.getAttribute('wowPropKind')) applyPropLight(mesh, floors);
     const propLightReady = Boolean(floors);
@@ -1660,7 +1655,7 @@ export class InstanceSceneView {
       const solid = (blend === 'opaque' || blend === 'alphaKey') && source.opacity >= 1 && (rule?.depthWrite ?? true);
       const litProp = !vertexLit && !building && (rule ? rule.lit : blend === 'opaque' || blend === 'alphaKey');
       // A building's solid batches are its floors as well as its walls.
-      const floor = solid && inBuilding;
+      const floor = solid && building !== null;
       const propLit = litProp && propLightReady;
       const shaded = litProp && (propLit || isWorldProp(mesh));
       const light = building ? buildingBatchLight(building.batch, building.counts, building.unified, building.flags,
@@ -1673,7 +1668,7 @@ export class InstanceSceneView {
       const MaterialType = shaded ? MeshLambertMaterial : MeshBasicMaterial;
       // Props are dimmed for the neutral look only (NEUTRAL_SCALE_FRAGMENT).
       const neutralScale = shaded ? PROP_BRIGHTNESS : vertexLit || modulates ? 1 : UNLIT_BRIGHTNESS;
-      const forced = modulates ? blend === 'mod2x' ? 0.5 : 1 : null;
+      const forced = modulates ? m2MaterialLight(blend, 0).color : null;
       const material = new MaterialType({
         name: source.name,
         map: standard.map ?? null,
@@ -1686,17 +1681,17 @@ export class InstanceSceneView {
         // passes for see-through double-sided materials also re-derive the
         // shader program on every draw.
         forceSinglePass: true,
-        alphaTest: blend === 'alphaKey' ? (rule ? M2_ALPHA_KEY_REFERENCE : 0.5) : 0,
+        // The alpha key as exported (the client's 224/255 for a prop's).
+        alphaTest: blend === 'alphaKey' ? source.alphaTest : 0,
         transparent: (blend !== 'opaque' && blend !== 'alphaKey') || source.opacity < 1,
         depthWrite: solid,
         depthTest: rule?.depthTest ?? true,
-        blending: blend === 'add' ? AdditiveBlending : modulates ? CustomBlending
-          : blend === 'mod' || blend === 'mod2x' ? MultiplyBlending : NormalBlending,
-        premultipliedAlpha: !modulates && (blend === 'mod' || blend === 'mod2x'),
-        // A prop's mod and mod2x multiply what is behind by the texture, mod2x
-        // doubled.
-        blendSrc: DstColorFactor,
-        blendDst: blend === 'mod2x' ? SrcColorFactor : ZeroFactor,
+        // A prop blends as the client's models do; a building's mod as
+        // before.
+        ...(vertexLit ? {
+          blending: blend === 'add' ? AdditiveBlending : blend === 'mod' || blend === 'mod2x' ? MultiplyBlending : NormalBlending,
+          premultipliedAlpha: blend === 'mod' || blend === 'mod2x',
+        } : blendFactors(blend)),
       });
       material.onBeforeCompile = injectPartyFade;
       if (neutralScale !== 1) material.defines = { ...material.defines, WOW_NEUTRAL_SCALE: neutralScale.toFixed(2) };

@@ -300,9 +300,9 @@ export function materialBlend(type: number): EffectBlend {
 
 // An M2 material's flags as the client reads them: 0x1 unlit, 0x2 unfogged,
 // 0x4 two-sided, 0x8 no depth test, 0x10 no depth write.
-export const M2_MATERIAL_UNLIT = 0x1;
-export const M2_MATERIAL_NO_DEPTH_TEST = 0x8;
-export const M2_MATERIAL_NO_DEPTH_WRITE = 0x10;
+const M2_MATERIAL_UNLIT = 0x1;
+const M2_MATERIAL_NO_DEPTH_TEST = 0x8;
+const M2_MATERIAL_NO_DEPTH_WRITE = 0x10;
 
 // How the client draws an M2 batch: lit by the light where its model is
 // unless its material says unlit or it modulates (mod and mod2x never are);

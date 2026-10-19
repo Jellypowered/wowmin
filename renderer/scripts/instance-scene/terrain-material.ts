@@ -13,6 +13,8 @@ import {
   type WebGLProgramParametersWithUniforms,
 } from 'three';
 
+import { CHUNK_SIZE } from '../utils/terrain-shadow';
+
 // The ground's material: each chunk blends up to four texture layers through
 // its alpha maps, as the client does (layer 1 as the base, each later layer
 // mixed over it by its alpha), darkened by the baked shadow, then shaded by
@@ -22,8 +24,6 @@ import {
 // chunk's row and column in the tile); per tile an alpha atlas (RGB: layers
 // 2-4, A: light).
 
-const TILE_SIZE = 1600 / 3;
-const CHUNK_SIZE = TILE_SIZE / 16;
 // Ground textures repeat 8 times across a chunk.
 const TEXTURE_REPEAT = CHUNK_SIZE / 8;
 const LAYER_TEXTURE_SIZE = 256;
@@ -135,7 +135,7 @@ const FRAGMENT = `
   // colour space.
   float wowLit = clamp((splat.a - ${SHADOW_LIGHT.toFixed(6)}) / ${(1 - SHADOW_LIGHT).toFixed(6)}, 0.0, 1.0);
   diffuseColor.rgb *= ground * (wowClientAmbientPacked.w > 0.5
-    ? pow(vec3(${CLIENT_SHADOW.toFixed(2)} + ${(1 - CLIENT_SHADOW).toFixed(2)} * wowLit), vec3(2.2)) : vec3(splat.a));
+    ? vec3(pow(${CLIENT_SHADOW.toFixed(2)} + ${(1 - CLIENT_SHADOW).toFixed(2)} * wowLit, 2.2)) : vec3(splat.a));
 }
 `;
 

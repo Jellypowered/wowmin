@@ -17,6 +17,16 @@ export const pointLights = {
   count: { value: 0 },
 };
 
+// The GLSL twin of litColor (map-light.ts): `wowLitSum(ambient, direct,
+// facing, points)`, the light the client gives a lit surface, in its own
+// colour space: the ambient, the direct light (each channel at most 1) by
+// N.L, and any point lights, the sum at most 1.
+export const LIT_SUM_FUNCTION = `
+vec3 wowLitSum(vec3 ambient, vec3 direct, float facing, vec3 points) {
+  return clamp(ambient + min(direct, vec3(1.0)) * clamp(facing, 0.0, 1.0) + points, 0.0, 1.0);
+}
+`;
+
 // A GLSL function `name(position, normal)` (view space) giving the point
 // lights' sum on a surface (pointLightShare in map-light.ts per light),
 // read from the arrays and count given.

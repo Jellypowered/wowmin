@@ -4,8 +4,8 @@
 // less in shadow; scripts/scene/terrain.mjs), 16 x 16 chunks of 64 texels.
 // Pure but for reading the atlas, which the caller supplies.
 
-export const TILE_SIZE = 1600 / 3;
-const CHUNK_SIZE = TILE_SIZE / 16;
+const TILE_SIZE = 1600 / 3;
+export const CHUNK_SIZE = TILE_SIZE / 16;
 const TEXELS_PER_CHUNK = 64;
 export const ATLAS_SIZE = TEXELS_PER_CHUNK * 16;
 // Atlas alpha below this is shadow (older and newer scenes store 150).
@@ -23,10 +23,18 @@ export function shadowTexel([originX, originY]: readonly [number, number], x: nu
   return row * ATLAS_SIZE + column;
 }
 
+// An atlas's alpha as a bit a texel, set where it is shadow.
+function shadowBits(alpha: Uint8Array | null): Uint8Array | null {
+  if (!alpha) return null;
+  const bits = new Uint8Array(alpha.length >> 3);
+  for (let texel = 0; texel < alpha.length; texel += 1) if (alpha[texel] < SHADOW_ALPHA_BELOW) bits[texel >> 3] |= 1 << (texel & 7);
+  return bits;
+}
+
 // The map's tiles' shadows, each read from its atlas the first time a point
-// in it is asked about.
+// in it is asked about and kept as one bit a texel.
 export class TerrainShadows {
-  private readonly tiles: Array<{ origin: readonly [number, number]; read: () => Uint8Array | null; alpha?: Uint8Array | null }> = [];
+  private readonly tiles: Array<{ origin: readonly [number, number]; read: () => Uint8Array | null; bits?: Uint8Array | null }> = [];
 
   // `read` gives the atlas's alpha channel, ATLAS_SIZE squared bytes.
   addTile(origin: readonly [number, number], read: () => Uint8Array | null): void {
@@ -39,8 +47,8 @@ export class TerrainShadows {
     for (const tile of this.tiles) {
       const texel = shadowTexel(tile.origin, x, y);
       if (texel === null) continue;
-      if (tile.alpha === undefined) tile.alpha = tile.read();
-      return Boolean(tile.alpha && tile.alpha[texel] < SHADOW_ALPHA_BELOW);
+      if (tile.bits === undefined) tile.bits = shadowBits(tile.read());
+      return Boolean(tile.bits && tile.bits[texel >> 3] & (1 << (texel & 7)));
     }
     return false;
   }

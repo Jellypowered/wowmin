@@ -1,5 +1,4 @@
 import {
-  AdditiveBlending,
   type AnimationAction,
   type AnimationClip,
   AnimationMixer,
@@ -7,9 +6,7 @@ import {
   Box3,
   BufferGeometry,
   Color,
-  CustomBlending,
   DoubleSide,
-  DstColorFactor,
   Float32BufferAttribute,
   FrontSide,
   Group,
@@ -23,18 +20,15 @@ import {
   MeshBasicMaterial,
   MeshLambertMaterial,
   type MeshStandardMaterial,
-  NormalBlending,
   Object3D,
   RingGeometry,
   Skeleton,
   SkinnedMesh,
-  SrcColorFactor,
   Sphere,
   Vector3,
   Vector4,
   type WebGLProgramParametersWithUniforms,
   DetachedBindMode,
-  ZeroFactor,
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
@@ -42,6 +36,7 @@ import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js
 
 import type { LightColors } from '../utils/map-light';
 import { type EffectBlend, m2MaterialLight } from '../utils/m2-tracks';
+import { blendFactors } from './m2-blend';
 import type { Point3, StrikeKind } from '../utils/spell-events';
 import type { EffectScales } from '../utils/spell-kits';
 import {
@@ -55,7 +50,7 @@ import {
   type UnitWeapons,
 } from '../utils/unit-animation';
 import { threeToServer, useServerAxes } from './iso-camera';
-import { pointLightFunction, pointLights } from './point-lights';
+import { LIT_SUM_FUNCTION, pointLightFunction, pointLights } from './point-lights';
 
 // A pet's model scale above this is a giant's (see UnitModelPose.pet).
 const PET_OVERSIZED_DISPLAY_SCALE = 2;
@@ -108,15 +103,14 @@ uniform vec3 wowSunDirection;
 uniform vec4 wowPointPosition[${pointLights.positions.length}];
 uniform vec4 wowPointColor[${pointLights.colors.length}];
 uniform float wowPointCount;
-${pointLightFunction('wowPointLight', 'wowPointPosition', 'wowPointColor', 'wowPointCount')}`;
+${pointLightFunction('wowPointLight', 'wowPointPosition', 'wowPointColor', 'wowPointCount')}${LIT_SUM_FUNCTION}`;
 // The direct light's w is how far its direction leans towards the sun's
 // (1 outdoors, where they are the same; a unit's own share indoors).
 const CLIENT_LIGHT_FRAGMENT = `
 if (wowLightAmbient.w > 0.5) {
   vec3 wowTowards = mix(wowLightDirection, wowSunDirection, wowLightDirect.w);
   wowTowards = dot(wowTowards, wowTowards) > 1e-6 ? normalize(wowTowards) : wowLightDirection;
-  vec3 wowLight = clamp(wowLightAmbient.rgb + min(wowLightDirect.rgb, vec3(1.0)) * saturate(dot(normal, wowTowards))
-    + wowPointLight(-vViewPosition, normal), 0.0, 1.0);
+  vec3 wowLight = wowLitSum(wowLightAmbient.rgb, wowLightDirect.rgb, dot(normal, wowTowards), wowPointLight(-vViewPosition, normal));
   reflectedLight.indirectDiffuse += diffuseColor.rgb * pow(wowLight, vec3(2.2));
 }
 `;
@@ -199,8 +193,6 @@ function copyMaterial(material: Material): Material {
   return copy;
 }
 
-// The client's alpha key for models.
-const ALPHA_KEY_REFERENCE = 224 / 255;
 
 // The id a rider's mount is drawn under.
 const mountUnitId = (riderId: string): string => `${riderId}#mount`;
@@ -1095,13 +1087,12 @@ export class UnitModelLayer {
       side: source.side === DoubleSide ? DoubleSide : FrontSide,
       // One pass for both faces, as the client draws them (see scene-view.ts).
       forceSinglePass: true,
-      alphaTest: blend === 'alphaKey' ? ALPHA_KEY_REFERENCE : 0,
+      // The model's alpha key, as it was exported (the client's 224/255).
+      alphaTest: blend === 'alphaKey' ? source.alphaTest : 0,
       transparent: (blend !== 'opaque' && blend !== 'alphaKey') || opacity < 1,
       depthWrite: rule.depthWrite && opacity >= 1,
       depthTest: rule.depthTest,
-      blending: blend === 'add' ? AdditiveBlending : blend === 'mod' || blend === 'mod2x' ? CustomBlending : NormalBlending,
-      blendSrc: DstColorFactor,
-      blendDst: blend === 'mod2x' ? SrcColorFactor : ZeroFactor,
+      ...blendFactors(blend),
     };
     const material = rule.lit ? new MeshLambertMaterial(parameters) : new MeshBasicMaterial(parameters);
     if (rule.lit) {

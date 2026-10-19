@@ -289,10 +289,9 @@ test('a unit\'s light eases: ambient at two a second, its direct scale at 3.33 a
   const eased = light.easeLight({ ambient: [0, 0.5, 1], directScale: 1 }, { ambient: [1, 0.5, 0], directScale: light.DIRECT_SCALE_SHADOWED }, 0.1);
   [0.2, 0.5, 0.8].forEach((expected, channel) => near(eased.ambient[channel], expected, `ambient ${channel}`));
   near(eased.directScale, 1 - 1 / 3, 'scale down');
-  // Aiming at 2.5 outdoors, the scale stops at 1.
-  near(light.easeLight({ ambient: [0, 0, 0], directScale: 0.5 }, { ambient: [0, 0, 0], directScale: light.DIRECT_SCALE_LIT }, 1).directScale, 1, 'capped');
-  near(light.easeLight({ ambient: [0, 0, 0], directScale: 0.5 }, { ambient: [0, 0, 0], directScale: light.DIRECT_SCALE_LIT }, 0.06).directScale, 0.7, 'rising');
-  near(light.transitionDirectScale(0.5), 1.75, 'transition');
+  near(light.easeLight({ ambient: [0, 0, 0], directScale: 0.5 }, { ambient: [0, 0, 0], directScale: 1 }, 0.06).directScale, 0.7, 'rising');
+  // Never above 1, whatever it aims at.
+  near(light.easeLight({ ambient: [0, 0, 0], directScale: 0.9 }, { ambient: [0, 0, 0], directScale: 2.5 }, 1).directScale, 1, 'capped');
 });
 
 test('finds the shadow texel under a point as the client does, by its tile\'s corner', () => {
