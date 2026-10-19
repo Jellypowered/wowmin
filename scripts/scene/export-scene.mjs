@@ -19,10 +19,7 @@ import { PNG } from 'pngjs';
 
 import { ATLAS_SIZE, buildTerrainTile, chunkInArea, playArea, pointInArea, WDT_FLAG_BIG_ALPHA } from './terrain.mjs';
 import { readDbc } from './dbc.mjs';
-import {
-  adtLiquidSurfaces, drawnWmoLiquidType, firstTileType, isInteriorLiquid, liquidSurface, liquidTexCoords,
-  liquidTypeInfo, wmoLiquidType,
-} from './liquids.mjs';
+import { adtLiquidSurfaces, liquidTexCoords, liquidTypeInfo, wmoGroupLiquid } from './liquids.mjs';
 import { encodeTexture } from './textures.mjs';
 import {
   floorFaces,
@@ -245,12 +242,9 @@ function bgraToRgba(colors) {
 
 // A BGRA colour (a WMO header's) as 0xRRGGBB.
 const bgraToRgb = (bgra) => bgra & 0xffffff;
-// A BGRA colour (a WMO material's) as [r, g, b, a], 0 to 1.
-const bgraToRgba01 = (bgra) => [16, 8, 0, 24].map((shift) => ((bgra >>> shift) & 0xff) / 255);
 
 class SceneBuilder {
-  constructor({ mapId, readFile, textureMax }) {
-    this.mapId = mapId;
+  constructor({ readFile, textureMax }) {
     this.readFile = readFile;
     this.textureMax = textureMax;
     this.document = new Document();
@@ -497,7 +491,7 @@ export async function exportMapScene({
   }
   if (!wmoPlacements.length && !doodadPlacements.length) throw new Error(`${internalName} places no buildings or doodads.`);
 
-  const builder = new SceneBuilder({ mapId, readFile, textureMax });
+  const builder = new SceneBuilder({ readFile, textureMax });
   const { document } = builder;
   const root = document.createNode('wow-world').setRotation(Z_UP_TO_Y_UP);
   document.createScene(`map-${mapId}`).addChild(root);
@@ -548,29 +542,16 @@ export async function exportMapScene({
         }));
     });
 
-    // Each group's liquid, in the group's space under the building, its tiles
-    // across a portal clipped by the group's portals: interior liquid
-    // (interior water drawn as its own type) takes its material's diffuse
-    // colour.
+    // Each group's liquid, in the group's space under the building
+    // (wmoGroupLiquid).
     wmo.groups.forEach((group) => {
       if (!group.liquid) return;
-      const type = wmoLiquidType(group.liquid.groupLiquid, wmo.rootFlags, group.flags, firstTileType(group.liquid));
-      const own = builder.liquidType(type);
-      const interior = isInteriorLiquid(group.flags, own?.flags);
-      const typeId = drawnWmoLiquidType(type, interior);
-      const drawn = builder.liquidType(typeId);
-      const material = drawn && builder.liquidMaterial(typeId);
-      const portals = {
-        planes: wmo.portals,
-        refs: wmo.portalRefs.slice(group.portalStart, group.portalStart + group.portalCount),
-        liquidOf: (groupIndex) => wmo.groups[groupIndex]?.liquid ?? null,
-      };
-      const surface = material && liquidSurface(group.liquid, { magma: drawn.vertexFormat === 1, portals });
-      if (!surface) return;
-      const diffuse = wmo.materials[group.liquid.materialId]?.diffuseColor;
-      const color = interior && diffuse !== undefined ? bgraToRgba01(diffuse) : null;
+      const liquid = wmoGroupLiquid(wmo, group, (typeId) => builder.liquidType(typeId));
+      const material = liquid && builder.liquidMaterial(liquid.typeId);
+      if (!material) return;
+      const { surface, texCoords, interior, color } = liquid;
       wmoNode.addChild(document.createNode(`liquid-${group.index}`)
-        .setMesh(builder.liquidMesh(`liquid-${group.groupId}`, surface, material, liquidTexCoords(surface, drawn, { depthInfo: own, interior })))
+        .setMesh(builder.liquidMesh(`liquid-${group.groupId}`, surface, material, texCoords))
         .setExtras({ kind: 'liquid', wmoGroupId: group.groupId, interior, ...(color ? { color } : {}) }));
       liquidCount += 1;
       liquidTriangles += surface.indices.length / 3;

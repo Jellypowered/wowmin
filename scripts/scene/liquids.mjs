@@ -134,7 +134,8 @@ export class LiquidSurface {
       if (shared.has(key)) return shared.get(key);
       const position = place(x, y);
       this.positions.push(position[0], position[1], heights[key]);
-      this.uvs.push(...uv(x, y, position));
+      const [u, v] = uv(x, y, position);
+      this.uvs.push(u, v);
       this.depths.push(depth(x, y));
       shared.set(key, this.positions.length / 3 - 1);
       return shared.get(key);
@@ -156,9 +157,9 @@ export class LiquidSurface {
   // corners' positions in strip order, `uvs` and `depths` theirs.
   addStrip(points, uvs, depths) {
     const first = this.positions.length / 3;
-    points.forEach((point, index) => {
-      this.positions.push(...point);
-      this.uvs.push(...uvs[index]);
+    points.forEach(([x, y, z], index) => {
+      this.positions.push(x, y, z);
+      this.uvs.push(uvs[index][0], uvs[index][1]);
       this.depths.push(depths[index]);
     });
     for (let index = 0; index + 2 < points.length; index += 1) this.indices.push(first + index, first + index + 1, first + index + 2);
@@ -371,14 +372,55 @@ export function liquidSurface({ xVerts, xTiles, yTiles, corner, heights, depths,
   return surface.finish();
 }
 
-// LiquidType.dbc: flags, kind (0 water, 1 ocean, 2 magma, 3 slime),
-// LiquidMaterial, six textures (the animated sheet, then the depth ramp's
+// A BGRA colour (a WMO material's) as [r, g, b, a], 0 to 1.
+const bgraToRgba01 = (bgra) => [16, 8, 0, 24].map((shift) => ((bgra >>> shift) & 0xff) / 255);
+
+// A WMO group's liquid as the client draws it, from the building (loadWmo)
+// and `liquidType(typeId)` (liquidTypeInfo's settings, null if unknown):
+// the type it is drawn as (interior water as its own type), whether it is
+// interior, the colour interior liquid takes (its material's diffuse),
+// its surface (liquidSurface, clipped by the group's portals) and texture
+// coordinates (depth read by the group's own type). Null when the drawn
+// type is unknown or no tile is wet.
+export function wmoGroupLiquid(wmo, group, liquidType) {
+  const liquid = group.liquid;
+  const type = wmoLiquidType(liquid.groupLiquid, wmo.rootFlags, group.flags, firstTileType(liquid));
+  const own = liquidType(type);
+  const interior = isInteriorLiquid(group.flags, own?.flags);
+  const typeId = drawnWmoLiquidType(type, interior);
+  const drawn = liquidType(typeId);
+  if (!drawn) return null;
+  const portals = {
+    planes: wmo.portals,
+    refs: wmo.portalRefs.slice(group.portalStart, group.portalStart + group.portalCount),
+    liquidOf: (groupIndex) => wmo.groups[groupIndex]?.liquid ?? null,
+  };
+  const surface = liquidSurface(liquid, { magma: drawn.vertexFormat === FORMAT_TEXCOORDS, portals });
+  if (!surface) return null;
+  const diffuse = wmo.materials[liquid.materialId]?.diffuseColor;
+  return {
+    typeId, interior, surface,
+    color: interior && diffuse !== undefined ? bgraToRgba01(diffuse) : null,
+    texCoords: liquidTexCoords(surface, drawn, { depthInfo: own, interior }),
+  };
+}
+
+// Liquid vertex formats: 0 heights then depth bytes, 1 heights then
+// texture coordinates (magma and slime: u16 pairs in terrain, s, t in
+// buildings), 2 depth bytes alone; the last two lie at height 0, and a
+// terrain layer of format 2 without data is deep everywhere.
+const FORMAT_DEPTH = 0;
+export const FORMAT_TEXCOORDS = 1;
+const FORMAT_DEPTH_ONLY = 2;
+const NO_DEPTH_DATA = 255;
+const hasHeights = (format) => format === FORMAT_DEPTH || format === FORMAT_TEXCOORDS;
+const hasDepths = (format) => format === FORMAT_DEPTH || format === FORMAT_DEPTH_ONLY;
+
+// LiquidType.dbc: flags, LiquidMaterial, six textures (the animated sheet, then the depth ramp's
 // name), 18 floats and 4 ints whose meaning depends on the material.
 // LiquidMaterial.dbc: the vertex format (0 heights and depth bytes, 1
 // heights and texture coordinates).
-const LIQUID_KINDS = ['water', 'ocean', 'magma', 'slime'];
 const LIQUID_TYPE_FLAGS = 2;
-const LIQUID_TYPE_KIND = 3;
 const LIQUID_TYPE_MATERIAL = 14;
 const LIQUID_TYPE_TEXTURE = 15;
 const LIQUID_TYPE_RAMP_TEXTURE = 16;
@@ -387,9 +429,8 @@ const LIQUID_TYPE_INTS = 41;
 const LIQUID_MATERIAL_VERTEX_FORMAT = 1;
 const MAX_LIQUID_FRAMES = 30;
 // Materials: water, magma (and slime), procedural water (drawn as ocean).
-export const LIQUID_MATERIAL_WATER = 1;
-export const LIQUID_MATERIAL_MAGMA = 2;
-export const LIQUID_MATERIAL_PROCEDURAL = 3;
+const LIQUID_MATERIAL_MAGMA = 2;
+const LIQUID_MATERIAL_PROCEDURAL = 3;
 // Every animated sheet runs through its frames in this long (ms) unless a
 // water type says otherwise.
 const LIQUID_FRAME_PERIOD = 1250;
@@ -405,7 +446,7 @@ function rampOf(material, name) {
   return 'river';
 }
 
-// A liquid type's kind, material and vertex format, flags, and animation
+// A liquid type's material and vertex format, flags, and animation
 // frame files; water's ripple scale and rotation, depth table and depth
 // scale, and ramp; magma's scroll (texture widths a second, u and v). Null
 // if unknown.
@@ -425,9 +466,8 @@ export function liquidTypeInfo(liquidTypes, typeId, readFile, liquidMaterials = 
   const water = material !== LIQUID_MATERIAL_MAGMA;
   return {
     id: typeId,
-    kind: LIQUID_KINDS[record.uint(LIQUID_TYPE_KIND)] ?? 'water',
     material,
-    vertexFormat: liquidMaterials.get(material)?.uint(LIQUID_MATERIAL_VERTEX_FORMAT) ?? (water ? 0 : 1),
+    vertexFormat: liquidMaterials.get(material)?.uint(LIQUID_MATERIAL_VERTEX_FORMAT) ?? (water ? FORMAT_DEPTH : FORMAT_TEXCOORDS),
     flags: record.uint(LIQUID_TYPE_FLAGS),
     frames,
     ...(water ? {
@@ -445,12 +485,16 @@ export function liquidTypeInfo(liquidTypes, typeId, readFile, liquidMaterials = 
 }
 
 // How a water type turns its ripple uvs: rotated by its rotation float (as
-// the client reads it) and scaled by its scale float. Identity for magma.
-export function rippleTransform(info) {
-  if (info?.rippleScale === undefined) return ([u, v]) => [u, v];
+// the client reads it) and scaled by its scale float, as the cosine and
+// sine times the scale. Identity for magma.
+function rippleTurn(info) {
+  if (info?.rippleScale === undefined) return { cos: 1, sin: 0 };
   const angle = info.rippleRotation * DEGREES_PER_RADIAN;
-  const cos = Math.cos(angle) * info.rippleScale;
-  const sin = Math.sin(angle) * info.rippleScale;
+  return { cos: Math.cos(angle) * info.rippleScale, sin: Math.sin(angle) * info.rippleScale };
+}
+
+export function rippleTransform(info) {
+  const { cos, sin } = rippleTurn(info);
   return ([u, v]) => [u * cos - v * sin, u * sin + v * cos];
 }
 
@@ -468,15 +512,17 @@ export function depthCoord(table, depth) {
 // liquid is, which can differ from the one it is drawn as), times the
 // drawn type's depth scale. No ramp coordinates for magma and slime.
 export function liquidTexCoords(surface, info, { depthInfo = info, interior = false } = {}) {
-  const transform = rippleTransform(info);
-  const count = surface.uvs.length / 2;
+  const { cos, sin } = rippleTurn(info);
+  const { uvs } = surface;
+  const count = uvs.length / 2;
   const ripple = new Float32Array(count * 2);
-  for (let vertex = 0; vertex < count; vertex += 1) {
-    ripple.set(transform([surface.uvs[vertex * 2], surface.uvs[vertex * 2 + 1]]), vertex * 2);
+  for (let at = 0; at < count * 2; at += 2) {
+    ripple[at] = uvs[at] * cos - uvs[at + 1] * sin;
+    ripple[at + 1] = uvs[at] * sin + uvs[at + 1] * cos;
   }
   if (info.material === LIQUID_MATERIAL_MAGMA) return { ripple, ramp: null };
   const ramp = new Float32Array(count * 2);
-  const tabled = depthInfo && depthInfo.depthTable !== undefined && depthInfo.vertexFormat !== 1;
+  const tabled = depthInfo && depthInfo.depthTable !== undefined && depthInfo.vertexFormat !== FORMAT_TEXCOORDS;
   for (let vertex = 0; vertex < count; vertex += 1) {
     ramp[vertex * 2] = interior ? 1 : 0;
     ramp[vertex * 2 + 1] = (tabled ? depthCoord(depthInfo.depthTable, surface.depths[vertex]) : 0) * info.depthScale;
@@ -505,13 +551,6 @@ const MCLQ_LAYER_SIZE = 8 + 81 * MCLQ_VERTEX_SIZE + 64 + 4 + 80;
 // MH2O: per chunk (offset, layer count, attributes), each layer 24 bytes.
 const MH2O_CHUNK_SIZE = 12;
 const MH2O_LAYER_SIZE = 24;
-// Vertex formats: 0 heights then depth bytes, 1 heights then texture
-// coordinates (u16 pairs), 2 depth bytes alone; the last two lie at height
-// 0, and a layer of format 2 without data is deep everywhere.
-const FORMAT_DEPTH = 0;
-const FORMAT_TEXCOORDS = 1;
-const FORMAT_DEPTH_ONLY = 2;
-const NO_DEPTH_DATA = 255;
 // The ground's liquid textures repeat every 1 / 0.06 yards of the world;
 // stored coordinates are in 256ths of a third.
 const TERRAIN_UV_SCALE = 0.06;
@@ -553,8 +592,8 @@ function readMclq(mcnk, { mapId, vertexFormat }) {
     const typeId = mapId === OUTLAND && kind === MCLQ_MAGMA ? GREEN_LAVA : kind;
     const format = vertexFormat(typeId);
     const vertex = (index) => start + 8 + index * MCLQ_VERTEX_SIZE;
-    const heights = Float32Array.from({ length: 81 }, (_, index) => (format > FORMAT_TEXCOORDS ? 0 : mcnk.readFloatLE(vertex(index) + 4)));
-    const depths = Uint8Array.from({ length: 81 }, (_, index) => (format === FORMAT_DEPTH || format === FORMAT_DEPTH_ONLY ? mcnk[vertex(index)] : 0));
+    const heights = Float32Array.from({ length: 81 }, (_, index) => (hasHeights(format) ? mcnk.readFloatLE(vertex(index) + 4) : 0));
+    const depths = Uint8Array.from({ length: 81 }, (_, index) => (hasDepths(format) ? mcnk[vertex(index)] : 0));
     const stored = format === FORMAT_TEXCOORDS
       ? Uint16Array.from({ length: 162 }, (_, index) => mcnk.readUInt16LE(vertex(index >> 1) + (index & 1) * 2))
       : null;
@@ -590,15 +629,14 @@ function readMh2o(mh2o, index) {
     if (!xTiles || !yTiles || x0 + xTiles > CHUNK_TILES || y0 + yTiles > CHUNK_TILES) continue;
     const vertexCount = (xTiles + 1) * (yTiles + 1);
     const fits = (bytes) => vertexOffset && vertexOffset + bytes <= mh2o.length;
-    const withHeights = format === FORMAT_DEPTH || format === FORMAT_TEXCOORDS;
     const heights = Float32Array.from({ length: vertexCount }, (_, vertex) => {
-      if (!withHeights) return 0;
+      if (!hasHeights(format)) return 0;
       return fits(vertexCount * 4) ? mh2o.readFloatLE(vertexOffset + vertex * 4) : minHeight;
     });
     const depthStart = format === FORMAT_DEPTH ? vertexOffset + vertexCount * 4 : vertexOffset;
     const depths = Uint8Array.from({ length: vertexCount }, (_, vertex) => {
       if (format === FORMAT_DEPTH_ONLY && !vertexOffset) return NO_DEPTH_DATA;
-      if (format !== FORMAT_DEPTH && format !== FORMAT_DEPTH_ONLY) return 0;
+      if (!hasDepths(format)) return 0;
       return fits(depthStart - vertexOffset + vertexCount) ? mh2o[depthStart + vertex] : 0;
     });
     const stored = format === FORMAT_TEXCOORDS && fits(vertexCount * 8)
@@ -624,9 +662,10 @@ const defaultVertexFormat = (typeId) => ([3, 4, GREEN_LAVA].includes(typeId) ? F
 // One ADT tile's liquid surfaces by LiquidType ID, for chunks overlapping
 // `area` (see terrain.mjs's chunkInArea), in server coordinates; `mapId`
 // for Outland's green lava, `vertexFormat(typeId)` the type's material's
-// format. Tiles lying wholly under the ground are left out (Utgarde Keep has
-// a sea far below its mountain).
-export function adtLiquidSurfaces(adtBuffer, { inArea = () => true, mapId = 0, vertexFormat = defaultVertexFormat } = {}) {
+// format (undefined for the default: magma and slime 1, water 0). Tiles
+// lying wholly under the ground are left out (Utgarde Keep has a sea far
+// below its mountain).
+export function adtLiquidSurfaces(adtBuffer, { inArea = () => true, mapId = 0, vertexFormat = () => undefined } = {}) {
   const chunks = readChunks(adtBuffer);
   const mh2o = findChunk(chunks, 'MH2O');
   const surfaces = new Map();

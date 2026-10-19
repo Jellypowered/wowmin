@@ -69,8 +69,9 @@ export function buildLayerArray(images: Array<CanvasImageSource | null>): DataAr
   return array;
 }
 
-// A tile's alpha atlas holds data, not colour.
-export function prepareAlphaAtlas(texture: Texture): Texture {
+// A texture that holds data, not colour (a tile's alpha atlas, water's
+// depth ramps): sampled as stored, clamped, linear, no mipmaps.
+export function prepareDataTexture<T extends Texture>(texture: T): T {
   texture.colorSpace = NoColorSpace;
   texture.wrapS = ClampToEdgeWrapping;
   texture.wrapT = ClampToEdgeWrapping;

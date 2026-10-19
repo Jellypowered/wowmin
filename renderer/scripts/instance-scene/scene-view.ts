@@ -41,15 +41,18 @@ import {
   blendLight, type BuildingBatchLight, buildingBatchLight, characterAmbientScale,
   DIRECT_SCALE_SHADOWED, type EasedLight, easeLight, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors,
   lightAt, type MapLights, nearestObjectLights, NOON, type ObjectLight, scaleAmbient, type Rgb, sunDirection, timeOfDay, toRgb,
+  type WaterColors,
 } from '../utils/map-light';
-import { liquidFrameIndex, liquidScrollOffset, NEUTRAL_WATER, type WaterRamp } from '../utils/liquid-light';
+import {
+  liquidFrameIndex, liquidScrollOffset, NEUTRAL_WATER, NEUTRAL_WATER_ALPHA, NEUTRAL_WATER_COLOR, type WaterRamp,
+} from '../utils/liquid-light';
 import { ATLAS_SIZE, TerrainShadows } from '../utils/terrain-shadow';
 import { m2MaterialLight, PARTICLE_GROUND_DEPTH } from '../utils/m2-tracks';
 import { type FaceCulling, TriangleGrid } from '../utils/triangle-grid';
 import type { CombatEffectStore, Point3, UnitKey } from '../utils/spell-events';
 import { applyIsoCamera, serverToThree, threeToServer } from './iso-camera';
 import { ALL_SPELL_AIDS, type SpellAids, SpellEffectLayer, type UnitAnchorRole } from './spell-effects';
-import { buildLayerArray, BYTE_SHADING_SCALE, createTerrainMaterial, prepareAlphaAtlas } from './terrain-material';
+import { buildLayerArray, BYTE_SHADING_SCALE, createTerrainMaterial, prepareDataTexture } from './terrain-material';
 import { GameObjectLayer, type GameObjectPose } from './game-objects';
 import { type BearerAreaCircle, SpellVisualLayer, type UnitInfo } from './spell-visual-layer';
 import { clientLight, type ModelLight, NEUTRAL_LIGHT, type UnitLook, type UnitModelPose, UnitModelLayer } from './unit-models';
@@ -90,8 +93,6 @@ interface LiquidExtras {
   color?: [number, number, number];
 }
 
-const LIQUID_MATERIAL_MAGMA = 2;
-
 // An animated liquid material and its frames, run through every `period`
 // ms; magma's sheet scrolls `speed` widths a second into `offset`.
 interface LiquidAnimation {
@@ -102,11 +103,9 @@ interface LiquidAnimation {
 }
 
 // Scenes exported before liquids carried their texture coordinates: frames
-// at this many a second, water see-through.
+// at this many a second, water see-through in the neutral water colour
+// when its map gave none.
 const LIQUID_FPS = 15;
-const WATER_OPACITY = 0.7;
-// Water without a colour from its map: a dull blue-green.
-const WATER_COLOR: [number, number, number] = [0.2, 0.3, 0.3];
 // Water textures are dark ripples, mostly alpha: laid over the water's colour.
 const WATER_FRAGMENT = `
 #ifdef USE_MAP
@@ -282,10 +281,14 @@ wowLocal = instanceMatrix * wowLocal;
 #endif
 vec4 wowWorld = modelMatrix * wowLocal;
 vWowPosition = vec3(wowWorld.x, -wowWorld.z, wowWorld.y);
+// The view-space normal point lights shine on: a building's, the
+// material's own (WOW_VERTEX_NORMAL as a define), or three.js's.
+#ifndef WOW_VERTEX_NORMAL
 #ifdef WOW_BUILDING
 #define WOW_VERTEX_NORMAL vWowNormal
 #else
 #define WOW_VERTEX_NORMAL transformedNormal
+#endif
 #endif
 ${pointLightVertex('WOW_VERTEX_NORMAL')}`;
 const FADE_FRAGMENT_DECLARATIONS = `${SCENE_BLOCK_DECLARATION}${POINT_LIGHT_FRAGMENT_DECLARATIONS}${LIT_SUM_FUNCTION}
@@ -439,6 +442,27 @@ function drawnInScene(object: Object3D): boolean {
 // meshes holding its primitives.
 // One function for every material, so three.js shares the compiled program.
 // The material also needs the fade block (withFade).
+// A liquid in a scene exported before liquids carried their texture
+// coordinates: its first frame unlit, water and ocean see-through in their
+// map's colour, magma and slime solid (they glow).
+function olderLiquidMaterial(liquid: LiquidExtras, frame: Texture): MeshBasicMaterial {
+  const see = liquid.kind === 'water' || liquid.kind === 'ocean';
+  const material = new MeshBasicMaterial({
+    map: frame, side: DoubleSide, forceSinglePass: true, transparent: see, opacity: see ? NEUTRAL_WATER_ALPHA : 1, depthWrite: !see,
+  });
+  if (!see) {
+    material.onBeforeCompile = injectPartyFade;
+    return material;
+  }
+  material.color.setRGB(...(liquid.color ?? NEUTRAL_WATER_COLOR), SRGBColorSpace);
+  material.onBeforeCompile = (shader) => {
+    injectPartyFade(shader);
+    shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>', WATER_FRAGMENT);
+  };
+  material.customProgramCacheKey = () => 'wow-water-old';
+  return material;
+}
+
 function injectPartyFade(shader: WebGLProgramParametersWithUniforms): void {
   shader.vertexShader = FADE_VERTEX_DECLARATIONS + shader.vertexShader
     .replace('#include <project_vertex>', `#include <project_vertex>\n${FADE_VERTEX}`);
@@ -807,6 +831,7 @@ export class InstanceSceneView {
   // ?specular=1 draws water's highlight, which the client leaves off by
   // default.
   private readonly waterSpecular = new URLSearchParams(window.location.search).get('specular') === '1';
+  private lastNoonWater: { lights: MapLights; center: Point3; water: WaterColors } | null = null;
   // What the canvas currently shows, to skip redrawing an unchanged frame.
   private lastFrameKey = '';
   // The fade and reach the scene's visible meshes were last chosen for.
@@ -1552,12 +1577,25 @@ export class InstanceSceneView {
       ? nearestObjectLights(this.mapLights.objects, center, MAX_POINT_LIGHTS) : [];
     // Water's colours: the light's now, or for the neutral look its noon's;
     // with no light file (or one from before water's colours), constants.
-    const water = (colors ?? (this.mapLights ? lightAt(this.mapLights, center, NOON) : null))?.water ?? NEUTRAL_WATER;
+    const water = colors ? colors.water ?? NEUTRAL_WATER : this.noonWater(center);
     this.waterRamps.update(water);
-    sceneBlockData.set([...water.sunCloud, this.waterSpecular ? 1 : 0], WATER_SPECULAR_OFFSET);
+    sceneBlockData.set(water.sunCloud, WATER_SPECULAR_OFFSET);
     const colorKey = colors
       ? [...colors.ambient, ...colors.direct, this.sunTowards.x, this.sunTowards.y].map((value) => value.toFixed(3)).join(',') : 'neutral';
     return `${colorKey}|${this.nearestLights.map((light) => light.position.join(',')).join(';')}`;
+  }
+
+  // Water's colours for the neutral look: the map's light at noon at a
+  // point (kept while the point and the lights stay the same), or
+  // constants without a light file or one from before water's colours.
+  private noonWater(center: Point3): WaterColors {
+    const lights = this.mapLights;
+    if (!lights?.lights.some((light) => light.water)) return NEUTRAL_WATER;
+    const cached = this.lastNoonWater;
+    if (cached?.lights === lights && cached.center.every((value, axis) => value === center[axis])) return cached.water;
+    const water = lightAt(lights, center, NOON).water ?? NEUTRAL_WATER;
+    this.lastNoonWater = { lights, center: [center[0], center[1], center[2]], water };
+    return water;
   }
 
   // Puts the props' point lights in view space in the scene block, for the
@@ -1593,56 +1631,35 @@ export class InstanceSceneView {
   // A liquid's material and its frames (shared by the scene's meshes of
   // the same type and colour, in `made`): water and magma as the client
   // draws them (createWaterMaterial, createMagmaMaterial), interior WMO
-  // liquid by its group's colour; for scenes exported before liquids
-  // carried these, the first frame unlit, water and ocean see-through in
-  // their map's colour, magma and slime solid (they glow).
+  // liquid by its group's colour; older scenes' as before
+  // (olderLiquidMaterial).
   private liquidMaterial(liquid: LiquidExtras, frames: Map<string, Texture>, mesh: Mesh, made: Map<string, LiquidAnimation>):
     LiquidAnimation | null {
     const textures = liquid.frames.map((name) => frames.get(name)).filter((texture): texture is Texture => Boolean(texture));
     if (!textures.length) return null;
     const interior = Boolean(mesh.userData.interior);
-    const color = mesh.userData.color as number[] | undefined;
-    const water = liquid.material !== undefined && liquid.material !== LIQUID_MATERIAL_MAGMA && liquid.ramp
-      && Boolean(mesh.geometry.getAttribute('uv1'));
-    const magma = liquid.material === LIQUID_MATERIAL_MAGMA && Boolean(liquid.scroll);
-    const key = water || magma ? `${liquid.id}|${interior}|${color?.join(',') ?? ''}` : `${liquid.id}`;
+    const color = (mesh.userData.color as number[] | undefined) ?? null;
+    const key = `${liquid.id}|${interior}|${color?.join(',') ?? ''}`;
     const known = made.get(key);
     if (known) return known;
-    let animation: LiquidAnimation;
-    if (water) {
-      animation = {
-        material: this.withFade(createWaterMaterial({
-          frame: rawFrames(textures)[0], ramp: this.waterRamps.textures[liquid.ramp!], color: color ?? null, interior,
-          specular: this.waterSpecular, partyFade: injectPartyFade,
-        })),
-        frames: textures,
-        period: liquid.period ?? textures.length * (1000 / LIQUID_FPS),
-      };
-    } else if (magma) {
-      const { material, scroll } = createMagmaMaterial({ frame: rawFrames(textures)[0], color: color ?? null, partyFade: injectPartyFade });
-      animation = {
-        material: this.withFade(material),
-        frames: textures,
-        period: liquid.period ?? textures.length * (1000 / LIQUID_FPS),
-        scroll: { speed: liquid.scroll!, offset: scroll },
-      };
-    } else {
-      const see = liquid.material !== undefined ? liquid.material !== LIQUID_MATERIAL_MAGMA : liquid.kind === 'water' || liquid.kind === 'ocean';
-      const material = new MeshBasicMaterial({
-        map: textures[0], side: DoubleSide, forceSinglePass: true, transparent: see, opacity: see ? WATER_OPACITY : 1, depthWrite: !see,
+    let material: MeshBasicMaterial;
+    let scroll: LiquidAnimation['scroll'];
+    if (liquid.ramp && mesh.geometry.getAttribute('uv1')) {
+      material = createWaterMaterial({
+        frame: rawFrames(textures)[0], ramp: this.waterRamps.textures[liquid.ramp], color, interior,
+        specular: this.waterSpecular, partyFade: injectPartyFade,
       });
-      if (see) {
-        material.color.setRGB(...(liquid.color ?? WATER_COLOR), SRGBColorSpace);
-        material.onBeforeCompile = (shader) => {
-          injectPartyFade(shader);
-          shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>', WATER_FRAGMENT);
-        };
-        material.customProgramCacheKey = () => 'wow-water-old';
-      } else {
-        material.onBeforeCompile = injectPartyFade;
-      }
-      animation = { material: this.withFade(material), frames: textures, period: textures.length * (1000 / LIQUID_FPS) };
+    } else if (liquid.scroll) {
+      const magma = createMagmaMaterial({ frame: rawFrames(textures)[0], color, partyFade: injectPartyFade });
+      material = magma.material;
+      scroll = { speed: liquid.scroll, offset: magma.scroll };
+    } else {
+      material = olderLiquidMaterial(liquid, textures[0]);
     }
+    const animation: LiquidAnimation = {
+      material: this.withFade(material), frames: textures, period: liquid.period ?? textures.length * (1000 / LIQUID_FPS),
+      ...(scroll ? { scroll } : {}),
+    };
     made.set(key, animation);
     return animation;
   }
@@ -1657,7 +1674,7 @@ export class InstanceSceneView {
     const layers = buildLayerArray(names.map((name) => (byName.get(name)?.map?.image as CanvasImageSource | undefined) ?? null));
     const alphas = new Map<string, Texture>();
     for (const material of materials) {
-      if (material.name.startsWith('terrain-alpha-') && material.map) alphas.set(material.name, prepareAlphaAtlas(material.map));
+      if (material.name.startsWith('terrain-alpha-') && material.map) alphas.set(material.name, prepareDataTexture(material.map));
     }
     return { layers, alphas };
   }

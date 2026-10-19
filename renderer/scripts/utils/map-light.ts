@@ -13,14 +13,10 @@ export type LightKeys = Array<[number, number]>;
 // A light's water: its colours in the shallows and the deep, ocean's and
 // river's, the sun's colour on clouds (water's highlight), and its alphas:
 // water shallow, water deep, ocean shallow, ocean deep.
-export interface WaterKeys {
-  oceanShallow: LightKeys;
-  oceanDeep: LightKeys;
-  riverShallow: LightKeys;
-  riverDeep: LightKeys;
-  sunCloud: LightKeys;
-  alphas: [number, number, number, number];
-}
+const WATER_BANDS = ['oceanShallow', 'oceanDeep', 'riverShallow', 'riverDeep', 'sunCloud'] as const;
+type WaterBand = typeof WATER_BANDS[number];
+type Water<T> = Record<WaterBand, T> & { alphas: [number, number, number, number] };
+export type WaterKeys = Water<LightKeys>;
 
 export interface MapLight {
   id: number;
@@ -82,14 +78,7 @@ export async function fetchMapLights(mapId: number): Promise<MapLights | null> {
 }
 
 // Water's colours and alphas at a time (WaterKeys').
-export interface WaterColors {
-  oceanShallow: Rgb;
-  oceanDeep: Rgb;
-  riverShallow: Rgb;
-  riverDeep: Rgb;
-  sunCloud: Rgb;
-  alphas: [number, number, number, number];
-}
+export type WaterColors = Water<Rgb>;
 
 // The direct (sun) and ambient colours at a point, 0 to 1 (sRGB), and
 // water's where the light file has them.
@@ -99,10 +88,8 @@ export interface LightColors {
   water?: WaterColors;
 }
 
-const WATER_BANDS = ['oceanShallow', 'oceanDeep', 'riverShallow', 'riverDeep', 'sunCloud'] as const;
-
 function waterColorsAt(water: WaterKeys, time: number): WaterColors {
-  const colors = Object.fromEntries(WATER_BANDS.map((band) => [band, keyColor(water[band], time)])) as Omit<WaterColors, 'alphas'>;
+  const colors = Object.fromEntries(WATER_BANDS.map((band) => [band, keyColor(water[band], time)])) as Record<WaterBand, Rgb>;
   return { ...colors, alphas: [...water.alphas] };
 }
 

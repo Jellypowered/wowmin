@@ -32,7 +32,7 @@ export const CLIENT_INDOOR_OFFSET = CLIENT_SUN_OFFSET + 4;
 export const POINT_POSITION_OFFSET = CLIENT_INDOOR_OFFSET + 4;
 export const POINT_COLOR_OFFSET = POINT_POSITION_OFFSET + MAX_POINT_LIGHTS * 4;
 export const POINT_COUNT_OFFSET = POINT_COLOR_OFFSET + MAX_POINT_LIGHTS * 4;
-// Water's highlight: the sun's colour on clouds.
+// Water's highlight: the sun's colour on clouds (w unused).
 export const WATER_SPECULAR_OFFSET = POINT_COUNT_OFFSET + 4;
 const SCENE_BLOCK_FLOATS = WATER_SPECULAR_OFFSET + 4;
 

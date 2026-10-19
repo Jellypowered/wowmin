@@ -17,7 +17,8 @@ import { clientLight, NEUTRAL_LIGHT, type UnitModelPose, UnitModelLayer } from '
 import type { StreamCombatEvent } from '../../src/types/api';
 import { PARTICLE_GROUND_DEPTH } from './utils/m2-tracks';
 import {
-  fetchMapLights, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors, lightAt, type MapLights, type Rgb, sunDirection,
+  fetchMapLights, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors, lightAt, type MapLights, NOON, type Rgb,
+  sunDirection,
 } from './utils/map-light';
 import { CombatEffectStore, type Point3, type UnitKey, unitKey } from './utils/spell-events';
 
@@ -54,7 +55,6 @@ const DEFAULT_STRESS_PRESETS = ['Frostbolt', 'Fireball', 'Shadow Bolt', 'Holy Li
 const STATS_INTERVAL_MS = 1000;
 // The client's lights the preview can show units and effects in: noon, and
 // the forge floor's vertex colour (Utgarde Keep, group 22843).
-const NOON = 1440;
 const FORGE_FLOOR: Rgb = [108 / 255, 80 / 255, 56 / 255];
 
 // What one play of a spell is: the form's fields, or a preset's.

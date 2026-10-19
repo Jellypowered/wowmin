@@ -14,8 +14,8 @@ export const RAMP_HEIGHT = 64;
 const OCEAN_DEEPEST_VALUE = 0.9;
 
 // Water with no light to colour it: a dull blue-green, partly see-through.
-const NEUTRAL_WATER_COLOR: Rgb = [0.2, 0.3, 0.3];
-const NEUTRAL_WATER_ALPHA = 0.7;
+export const NEUTRAL_WATER_COLOR: Rgb = [0.2, 0.3, 0.3];
+export const NEUTRAL_WATER_ALPHA = 0.7;
 export const NEUTRAL_WATER: WaterColors = {
   oceanShallow: NEUTRAL_WATER_COLOR, oceanDeep: NEUTRAL_WATER_COLOR,
   riverShallow: NEUTRAL_WATER_COLOR, riverDeep: NEUTRAL_WATER_COLOR,
@@ -23,6 +23,7 @@ export const NEUTRAL_WATER: WaterColors = {
   alphas: [NEUTRAL_WATER_ALPHA, NEUTRAL_WATER_ALPHA, NEUTRAL_WATER_ALPHA, NEUTRAL_WATER_ALPHA],
 };
 
+const WHITE = [255, 255, 255];
 const toByte = (value: number): number => Math.min(255, Math.max(0, Math.round(value * 255)));
 
 // Row y of 64 between two bytes, in the client's 8.8 fixed point: the
@@ -32,12 +33,13 @@ function rampByte(shallow: number, deep: number, row: number): number {
   return ((shallow << 8) + row * step) >> 8;
 }
 
-// A ramp's texels as the client builds them: river and ocean from their
-// shallow colour and alpha to their deep; WMO water's left half the river's
-// deep colour, its right half white (interior water's), with the river's
-// alphas.
-export function waterRampTexels(ramp: WaterRamp, water: WaterColors): Uint8Array {
-  const texels = new Uint8Array(RAMP_WIDTH * RAMP_HEIGHT * 4);
+// A ramp's texels as the client builds them, into `texels`: river and
+// ocean from their shallow colour and alpha to their deep; WMO water's left
+// half the river's deep colour, its right half white (interior water's),
+// with the river's alphas.
+export function waterRampTexels(
+  ramp: WaterRamp, water: WaterColors, texels: Uint8Array = new Uint8Array(RAMP_WIDTH * RAMP_HEIGHT * 4),
+): Uint8Array {
   const ocean = ramp === 'ocean';
   const shallow = (ocean ? water.oceanShallow : water.riverShallow).map(toByte);
   const deep = (ocean ? water.oceanDeep : water.riverDeep).map(toByte);
@@ -53,8 +55,11 @@ export function waterRampTexels(ramp: WaterRamp, water: WaterColors): Uint8Array
     }
     for (let column = 0; column < RAMP_WIDTH; column += 1) {
       const texel = (row * RAMP_WIDTH + column) * 4;
-      const rgb = ramp === 'wmo' ? (column < RAMP_WIDTH / 2 ? wmoColor : [255, 255, 255]) : color;
-      texels.set([rgb[0], rgb[1], rgb[2], rowAlpha], texel);
+      const rgb = ramp === 'wmo' ? (column < RAMP_WIDTH / 2 ? wmoColor : WHITE) : color;
+      texels[texel] = rgb[0];
+      texels[texel + 1] = rgb[1];
+      texels[texel + 2] = rgb[2];
+      texels[texel + 3] = rowAlpha;
     }
   }
   return texels;

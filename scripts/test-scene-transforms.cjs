@@ -443,6 +443,33 @@ test("takes a WMO's magma texture coordinates from its vertices, in 256ths", asy
   assert.deepEqual([...surface.uvs], [0, 0, 0.25, -1 / 256, 0.75, -3 / 256, 1, -4 / 256]);
 });
 
+test("draws a WMO group's interior water as interior WMO water, in its material's colour, depth by its own type", async () => {
+  const { readWmoLiquid, wmoGroupLiquid } = await load('liquids.mjs');
+  const { header, mliq, group } = wmoGroupWithLiquid();
+  // The root says groupLiquid is a LiquidType ID: 1, water, so WMO water (13).
+  header.writeUInt32LE(1, 0x34);
+  for (let vertex = 0; vertex < 6; vertex += 1) mliq.writeUInt8(40, 0x1E + vertex * 8);
+  const water = { material: 1, vertexFormat: 0, rippleScale: 1, rippleRotation: 0, depthScale: 1, frames: [] };
+  // Interior WMO water reads depth by another table here, to tell them apart.
+  const types = new Map([[13, { ...water, flags: 0xf, depthTable: 1 }], [17, { ...water, flags: 0xf, depthTable: 0 }]]);
+  const wmo = {
+    rootFlags: 0x4, portals: [], portalRefs: [], materials: [], groups: [],
+  };
+  wmo.materials[7] = { diffuseColor: 0xff102030 };
+  const interiorGroup = { flags: 0, portalStart: 0, portalCount: 0, liquid: readWmoLiquid(group()) };
+  const interior = wmoGroupLiquid(wmo, interiorGroup, (id) => types.get(id) ?? null);
+  assert.equal(interior.typeId, 17);
+  assert.equal(interior.interior, true);
+  assert.deepEqual(interior.color, [0x10 / 255, 0x20 / 255, 0x30 / 255, 1]);
+  // The ramp's white half, depth by the group's own type's table (40 / 255).
+  assert.deepEqual([...interior.texCoords.ramp.slice(0, 2)], [1, Math.fround(40 / 255)]);
+  // An exterior group's water stays WMO water, white, in the ramp's left half.
+  const exterior = wmoGroupLiquid(wmo, { ...interiorGroup, flags: 0x8 }, (id) => types.get(id) ?? null);
+  assert.deepEqual([exterior.typeId, exterior.interior, exterior.color], [13, false, null]);
+  assert.equal(exterior.texCoords.ramp[0], 0);
+  assert.equal(wmoGroupLiquid(wmo, interiorGroup, () => null), null);
+});
+
 test("clips a polygon by a plane as the client does: the kept side, mixed data, the strip's order", async () => {
   const { ConvexClipper } = await load('liquids.mjs');
   const lerp = (a, b, t) => a + (b - a) * t;
@@ -557,8 +584,8 @@ test('resolves WMO liquid types: DBC ids, old kinds, green lava from its tiles, 
 });
 
 // LiquidType records as liquidTypeInfo reads them.
-function liquidTypeRecord({ flags = 0, kind = 0, material = 1, texture = '', ramp = '', floats = [], ints = [] }) {
-  const fields = { 2: flags, 3: kind, 14: material };
+function liquidTypeRecord({ flags = 0, material = 1, texture = '', ramp = '', floats = [], ints = [] }) {
+  const fields = { 2: flags, 14: material };
   floats.forEach((value, index) => { fields[23 + index] = value; });
   ints.forEach((value, index) => { fields[41 + index] = value; });
   return {
@@ -571,9 +598,9 @@ test("reads a liquid type's settings: water's ripples, depth table and ramp, mag
   const { liquidTypeInfo } = await load('liquids.mjs');
   const materials = new Map([[1, { uint: () => 0 }], [2, { uint: () => 1 }]]);
   const types = new Map([
-    [14, liquidTypeRecord({ flags: 0x20f, kind: 1, ramp: 'proceduralOceanDepthTex', floats: [0.25, 180, 1], ints: [1, 1250] })],
+    [14, liquidTypeRecord({ flags: 0x20f, ramp: 'proceduralOceanDepthTex', floats: [0.25, 180, 1], ints: [1, 1250] })],
     [13, liquidTypeRecord({ ramp: 'proceduralWmoWaterTex', floats: [1, 0, 1], ints: [1, 0] })],
-    [19, liquidTypeRecord({ kind: 2, material: 2, floats: [0, 0.1] })],
+    [19, liquidTypeRecord({ material: 2, floats: [0, 0.1] })],
   ]);
   const ocean = liquidTypeInfo(types, 14, () => null, materials);
   assert.deepEqual([ocean.material, ocean.vertexFormat, ocean.ramp, ocean.rippleScale, ocean.rippleRotation, ocean.depthTable, ocean.period],

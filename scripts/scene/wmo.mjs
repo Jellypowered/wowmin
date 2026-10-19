@@ -11,7 +11,6 @@ import { toM2Path } from './placement.mjs';
 
 export const WMO_GROUP_FLAG_VERTEX_COLORS = 0x4;
 export const WMO_GROUP_FLAG_EXTERIOR = 0x8;
-export const WMO_GROUP_FLAG_INTERIOR = 0x2000;
 export const WMO_MATERIAL_FLAG_UNLIT = 0x1;
 export const WMO_MATERIAL_FLAG_UNCULLED = 0x4;
 export const WMO_MATERIAL_FLAG_WINDOW = 0x20;
