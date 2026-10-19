@@ -34,6 +34,16 @@ const WORLD_CORNER = 17066.666;
 const BANDS_PER_PARAMS = 18;
 const BAND_DIRECT = 0;
 const BAND_AMBIENT = 1;
+// The sun's colour on clouds, which water's highlight takes, and water's
+// colours: ocean shallow and deep, then river shallow and deep.
+const BAND_SUN_CLOUD = 9;
+const BAND_OCEAN_SHALLOW = 14;
+const BAND_OCEAN_DEEP = 15;
+const BAND_RIVER_SHALLOW = 16;
+const BAND_RIVER_DEEP = 17;
+// LightParams: water's alpha in the shallows and the deep, then ocean's.
+const PARAMS_WATER_SHALLOW_ALPHA = 5;
+const PARAMS_ALPHA_COUNT = 4;
 const BAND_COUNT = 1;
 const BAND_TIMES = 2;
 const BAND_COLOURS = 18;
@@ -200,6 +210,21 @@ export function objectLights(readFile, { wmos, doodads }) {
   }));
 }
 
+// A light's water: its colour bands (bandOf(index), LightIntBand's) and its
+// LightParams' alphas (0 to 1, 3 decimals; zeros without the record).
+export function waterOf(bandOf, params) {
+  const alphas = Array.from({ length: PARAMS_ALPHA_COUNT },
+    (_, index) => (params ? Math.round(params.float(PARAMS_WATER_SHALLOW_ALPHA + index) * 1000) / 1000 : 0));
+  return {
+    oceanShallow: bandKeys(bandOf(BAND_OCEAN_SHALLOW)),
+    oceanDeep: bandKeys(bandOf(BAND_OCEAN_DEEP)),
+    riverShallow: bandKeys(bandOf(BAND_RIVER_SHALLOW)),
+    riverDeep: bandKeys(bandOf(BAND_RIVER_DEEP)),
+    sunCloud: bandKeys(bandOf(BAND_SUN_CLOUD)),
+    alphas,
+  };
+}
+
 // The ambient multiplier of a map's zone: its top-level area's (the one
 // with no parent, the lowest ID if several), 0 if none. The client takes
 // the player's own area, falling back to the parent's unless the area has
@@ -213,10 +238,12 @@ export function zoneAmbientMultiplier(areas, mapId) {
   return zone ? Math.round(zone.float(AREA_AMBIENT_MULTIPLIER) * 1000) / 1000 : 0;
 }
 
-// The map's lights, with their direct and ambient keys: `defaultLight` set on
-// the one that covers the whole map (at the origin, no radius), else on the
-// fallback light; and its objects' lights. Positions are in server
-// coordinates and distances in yards.
+// The map's lights, with their direct and ambient keys and water's colours
+// (ocean and river, shallow and deep), the sun's colour on clouds, and
+// water's alphas (water shallow and deep, ocean shallow and deep):
+// `defaultLight` set on the one that covers the whole map (at the origin,
+// no radius), else on the fallback light; and its objects' lights.
+// Positions are in server coordinates and distances in yards.
 export function mapLights(readFile, mapId) {
   const table = (name) => {
     const buffer = readFile(`DBFilesClient\\${name}.dbc`);
@@ -225,6 +252,7 @@ export function mapLights(readFile, mapId) {
   const lights = table('Light');
   const bands = table('LightIntBand')?.byId();
   if (!lights || !bands) return null;
+  const lightParams = table('LightParams')?.byId();
   const describe = (record, defaultLight) => {
     const params = record.uint(LIGHT_PARAMS);
     const band = (index) => bands.get(params * BANDS_PER_PARAMS - (BANDS_PER_PARAMS - 1) + index);
@@ -237,6 +265,7 @@ export function mapLights(readFile, mapId) {
       outer: record.float(LIGHT_OUTER) / LIGHT_UNITS,
       direct: bandKeys(band(BAND_DIRECT)),
       ambient: bandKeys(band(BAND_AMBIENT)),
+      water: waterOf(band, lightParams?.get(params)),
     };
   };
   const records = [...lights.records()];

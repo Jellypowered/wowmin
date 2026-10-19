@@ -42,7 +42,8 @@ export const UNIT_MODEL_CACHE_VERSION = 11;
 // 11: bone tracks on a loop of no length hold their first key.
 // 12: map lights carry only models' point lights, without fade distances.
 // 13: effect and game object materials carry their M2 flags (unlit, depth).
-export const SPELL_ART_CACHE_VERSION = 13;
+// 14: map lights carry water's colours, alphas and the sun's colour on clouds.
+export const SPELL_ART_CACHE_VERSION = 14;
 const SPELL_ART_KINDS = new Set<UnitModelRequest['kind']>(['effect', 'visual', 'spell', 'icon', 'gameobject', 'light']);
 const EXTENSIONS: Partial<Record<UnitModelRequest['kind'], string>> = { visual: 'json', spell: 'json', icon: 'png', light: 'json' };
 // A look that could not be built is not retried for this long.

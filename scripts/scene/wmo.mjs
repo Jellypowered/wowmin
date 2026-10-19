@@ -64,6 +64,7 @@ const MOGP_HEADER_SIZE = 0x44;
 // count at 0x10.
 const MOBA_SIZE = 24;
 const MOMT_ENTRY_SIZE = 64;
+const MOMT_DIFFUSE_COLOR = 0x1c;
 const MODS_ENTRY_SIZE = 32;
 const MODD_ENTRY_SIZE = 40;
 
@@ -181,6 +182,8 @@ export function loadWmo(rootName, readFile) {
   const materials = root.materials.map((material, index) => ({
     flags: material.flags,
     blendMode: momt.readUInt32LE(index * MOMT_ENTRY_SIZE + 8),
+    // BGRA; interior liquid's colour.
+    diffuseColor: momt.readUInt32LE(index * MOMT_ENTRY_SIZE + MOMT_DIFFUSE_COLOR),
     texture: material.textures[0] ?? null,
   }));
 

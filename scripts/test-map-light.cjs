@@ -43,6 +43,28 @@ function dbc(fieldCount, records) {
   return Buffer.concat([header, body, Buffer.alloc(1)]);
 }
 
+test("reads each light's water: its colour bands, the sun's colour on clouds, and LightParams' alphas", async () => {
+  const { mapLights } = await import(pathToFileURL(path.join(__dirname, 'scene', 'lights.mjs')).href);
+  const band = (id, color) => ({ 0: id, 1: 1, 2: 1440, 18: color });
+  // LightParams 2's bands are 19 + band.
+  const files = {
+    'DBFilesClient\\Light.dbc': dbc(15, [{ 0: 1, 1: 0, 7: 2 }]),
+    'DBFilesClient\\LightIntBand.dbc': dbc(34, [
+      band(19 + 9, 0xffeedd), band(19 + 14, 0x112233), band(19 + 15, 0x223344), band(19 + 16, 0x334455), band(19 + 17, 0x445566),
+    ]),
+    'DBFilesClient\\LightParams.dbc': dbc(9, [{ 0: 2, 5: float(0.5), 6: float(1), 7: float(0.75), 8: float(1) }]),
+  };
+  const [only] = mapLights((name) => files[name] ?? null, 489).lights;
+  assert.deepEqual(only.water, {
+    oceanShallow: [[1440, 0x112233]], oceanDeep: [[1440, 0x223344]],
+    riverShallow: [[1440, 0x334455]], riverDeep: [[1440, 0x445566]],
+    sunCloud: [[1440, 0xffeedd]], alphas: [0.5, 1, 0.75, 1],
+  });
+  // Without LightParams the alphas are zero.
+  delete files['DBFilesClient\\LightParams.dbc'];
+  assert.deepEqual(mapLights((name) => files[name] ?? null, 489).lights[0].water.alphas, [0, 0, 0, 0]);
+});
+
 test('reads a map\'s lights in server coordinates with their keys, falling back to the default light', async () => {
   const { mapLights, lightPosition } = await import(pathToFileURL(path.join(__dirname, 'scene', 'lights.mjs')).href);
   // Warsong Gulch's Alliance base light.

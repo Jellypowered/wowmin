@@ -19,7 +19,10 @@ import { PNG } from 'pngjs';
 
 import { ATLAS_SIZE, buildTerrainTile, chunkInArea, playArea, pointInArea, WDT_FLAG_BIG_ALPHA } from './terrain.mjs';
 import { readDbc } from './dbc.mjs';
-import { adtLiquidSurfaces, firstTileType, liquidSurface, liquidTypeInfo, mapLiquidColours, wmoLiquidType } from './liquids.mjs';
+import {
+  adtLiquidSurfaces, drawnWmoLiquidType, firstTileType, isInteriorLiquid, liquidSurface, liquidTexCoords,
+  liquidTypeInfo, mapLiquidColours, wmoLiquidType,
+} from './liquids.mjs';
 import { encodeTexture } from './textures.mjs';
 import {
   floorFaces,
@@ -242,6 +245,8 @@ function bgraToRgba(colors) {
 
 // A BGRA colour (a WMO header's) as 0xRRGGBB.
 const bgraToRgb = (bgra) => bgra & 0xffffff;
+// A BGRA colour (a WMO material's) as [r, g, b, a], 0 to 1.
+const bgraToRgba01 = (bgra) => [16, 8, 0, 24].map((shift) => ((bgra >>> shift) & 0xff) / 255);
 
 class SceneBuilder {
   constructor({ mapId, readFile, textureMax }) {
@@ -255,17 +260,32 @@ class SceneBuilder {
     this.missing = new Set();
   }
 
+  // A liquid type's settings (liquidTypeInfo), or null if unknown.
+  liquidType(typeId) {
+    this.liquidTypes ??= new Map();
+    if (this.liquidTypes.has(typeId)) return this.liquidTypes.get(typeId);
+    this.liquidTables ??= (() => {
+      const table = (name) => {
+        const buffer = this.readFile(`DBFilesClient\\${name}.dbc`);
+        return buffer ? readDbc(buffer).byId() : new Map();
+      };
+      return { types: table('LiquidType'), materials: table('LiquidMaterial') };
+    })();
+    const info = liquidTypeInfo(this.liquidTables.types, typeId, this.readFile, this.liquidTables.materials);
+    this.liquidTypes.set(typeId, info);
+    return info;
+  }
+
   // A liquid type's material, named liquid-<id>, with its animation frames
-  // as materials liquid-frame-<n>, shared by types with the same texture
-  // (extras list them, and water's colour); null if unknown.
+  // as materials liquid-frame-<n>, shared by types with the same texture.
+  // Its extras say how the client draws it: its material (water, magma),
+  // water's depth ramp, magma's scroll, and the frames' period (ms); and,
+  // for renderers before those, its kind and water's colour. Null if
+  // unknown.
   liquidMaterial(typeId) {
     this.liquidMaterials ??= new Map();
     if (this.liquidMaterials.has(typeId)) return this.liquidMaterials.get(typeId);
-    this.liquidTypes ??= (() => {
-      const buffer = this.readFile('DBFilesClient\\LiquidType.dbc');
-      return buffer ? readDbc(buffer).byId() : new Map();
-    })();
-    const info = liquidTypeInfo(this.liquidTypes, typeId, this.readFile);
+    const info = this.liquidType(typeId);
     let material = null;
     if (info?.frames.length) {
       this.liquidFrames ??= new Map();
@@ -289,7 +309,14 @@ class SceneBuilder {
       if (frames.length) {
         const color = info.kind === 'water' || info.kind === 'ocean' ? this.liquidColours()?.[info.kind] : null;
         material = this.document.createMaterial(`liquid-${typeId}`).setDoubleSided(true)
-          .setExtras({ wowLiquid: { id: typeId, kind: info.kind, frames, ...(color && { color }) } });
+          .setExtras({
+            wowLiquid: {
+              id: typeId, material: info.material, frames, period: info.period,
+              ...(info.ramp ? { ramp: info.ramp } : {}),
+              ...(info.scroll ? { scroll: info.scroll } : {}),
+              kind: info.kind, ...(color && { color }),
+            },
+          });
       }
     }
     this.liquidMaterials.set(typeId, material);
@@ -306,13 +333,17 @@ class SceneBuilder {
     return this.waterColours;
   }
 
-  // A liquid surface (positions, uvs, indices) as a one-primitive mesh.
-  liquidMesh(name, surface, material) {
-    return this.document.createMesh(name).addPrimitive(this.document.createPrimitive()
+  // A liquid surface (positions, indices) as a one-primitive mesh, with its
+  // texture coordinates (liquidTexCoords): TEXCOORD_0 the ripple (or lava)
+  // texture's, TEXCOORD_1 water's depth ramp's.
+  liquidMesh(name, surface, material, { ripple, ramp }) {
+    const primitive = this.document.createPrimitive()
       .setAttribute('POSITION', this.accessor('VEC3', surface.positions))
-      .setAttribute('TEXCOORD_0', this.accessor('VEC2', surface.uvs))
+      .setAttribute('TEXCOORD_0', this.accessor('VEC2', ripple))
       .setIndices(this.accessor('SCALAR', surface.indices))
-      .setMaterial(material));
+      .setMaterial(material);
+    if (ramp) primitive.setAttribute('TEXCOORD_1', this.accessor('VEC2', ramp));
+    return this.document.createMesh(name).addPrimitive(primitive);
   }
 
   accessor(type, array, normalized = false) {
@@ -529,15 +560,24 @@ export async function exportMapScene({
         }));
     });
 
-    // Each group's liquid, in the group's space under the building.
+    // Each group's liquid, in the group's space under the building: interior
+    // liquid (interior water drawn as its own type) takes its material's
+    // diffuse colour.
     wmo.groups.forEach((group) => {
       if (!group.liquid) return;
-      const surface = liquidSurface(group.liquid);
-      const typeId = wmoLiquidType(group.liquid.groupLiquid, wmo.rootFlags, group.flags, firstTileType(group.liquid));
-      const material = surface && builder.liquidMaterial(typeId);
-      if (!material) return;
-      wmoNode.addChild(document.createNode(`liquid-${group.index}`).setMesh(builder.liquidMesh(`liquid-${group.groupId}`, surface, material))
-        .setExtras({ kind: 'liquid', wmoGroupId: group.groupId }));
+      const type = wmoLiquidType(group.liquid.groupLiquid, wmo.rootFlags, group.flags, firstTileType(group.liquid));
+      const own = builder.liquidType(type);
+      const interior = isInteriorLiquid(group.flags, own?.flags);
+      const typeId = drawnWmoLiquidType(type, interior);
+      const drawn = builder.liquidType(typeId);
+      const material = drawn && builder.liquidMaterial(typeId);
+      const surface = material && liquidSurface(group.liquid, { magma: drawn.vertexFormat === 1 });
+      if (!surface) return;
+      const diffuse = wmo.materials[group.liquid.materialId]?.diffuseColor;
+      const color = interior && diffuse !== undefined ? bgraToRgba01(diffuse) : null;
+      wmoNode.addChild(document.createNode(`liquid-${group.index}`)
+        .setMesh(builder.liquidMesh(`liquid-${group.groupId}`, surface, material, liquidTexCoords(surface, drawn, { depthInfo: own, interior })))
+        .setExtras({ kind: 'liquid', wmoGroupId: group.groupId, interior, ...(color ? { color } : {}) }));
       liquidCount += 1;
     });
 
@@ -599,10 +639,14 @@ export async function exportMapScene({
       if (!adt) continue;
       // The tile's liquids, one mesh per liquid type.
       try {
-        for (const [typeId, surface] of adtLiquidSurfaces(adt, { inArea: (position) => chunkInArea(position, area) })) {
+        const liquids = adtLiquidSurfaces(adt, {
+          inArea: (position) => chunkInArea(position, area), mapId, vertexFormat: (typeId) => builder.liquidType(typeId)?.vertexFormat,
+        });
+        for (const [typeId, surface] of liquids) {
           const liquidMaterial = builder.liquidMaterial(typeId);
           if (!liquidMaterial) continue;
-          const liquidMesh = builder.liquidMesh(`liquid-${x}-${y}-${typeId}`, surface, liquidMaterial);
+          const texCoords = liquidTexCoords(surface, builder.liquidType(typeId));
+          const liquidMesh = builder.liquidMesh(`liquid-${x}-${y}-${typeId}`, surface, liquidMaterial, texCoords);
           root.addChild(document.createNode(`liquid-${x}-${y}-${typeId}`).setMesh(liquidMesh).setExtras({ kind: 'liquid', tile: [x, y] }));
           liquidCount += 1;
         }
