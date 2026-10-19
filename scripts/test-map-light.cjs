@@ -407,3 +407,12 @@ test("picks an animated sheet's frame as the client does: 30 frames in 1250 ms",
   assert.equal(liquids.liquidFrameIndex(1250 * 7 + 625, 1250, 30), 15);
   assert.equal(liquids.liquidFrameIndex(500, 1250, 0), 0);
 });
+
+test("scrolls magma's sheet as the client does: whole-millisecond periods of 1000 / speed", () => {
+  // Terrain magma: 0.025 widths a second, once round every 40 s.
+  near(liquids.liquidScrollOffset(10000, 0.025), 0.25, 'quarter way');
+  near(liquids.liquidScrollOffset(40000, 0.025), 0, 'wrapped');
+  // WMO magma: 0.1 a second along v, every 10 s.
+  near(liquids.liquidScrollOffset(12500.9, 0.1), 0.25, 'whole milliseconds');
+  assert.equal(liquids.liquidScrollOffset(12345, 0), 0);
+});

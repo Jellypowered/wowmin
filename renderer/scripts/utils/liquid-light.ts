@@ -67,3 +67,13 @@ export function liquidFrameIndex(now: number, period: number, count: number): nu
   const along = ((now % period) + period) % period / period * count;
   return Math.min(count - 1, Math.max(0, Math.round(along - 0.5)));
 }
+
+// How far magma's sheet has scrolled along one axis at `now` (ms), in
+// texture widths: `speed` widths a second, wrapping each whole width (the
+// client counts whole milliseconds of a whole-millisecond period). 0 for
+// none.
+export function liquidScrollOffset(now: number, speed: number): number {
+  if (!speed) return 0;
+  const period = Math.trunc(1000 / speed);
+  return period > 0 ? (Math.floor(now) % period) / period : 0;
+}

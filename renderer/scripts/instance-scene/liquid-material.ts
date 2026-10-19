@@ -8,6 +8,7 @@ import {
   RGBAFormat,
   type Texture,
   UnsignedByteType,
+  Vector2,
   Vector4,
   type WebGLProgramParametersWithUniforms,
 } from 'three';
@@ -157,6 +158,46 @@ export function createWaterMaterial({
   };
   material.customProgramCacheKey = () => 'wow-water';
   return material;
+}
+
+// Magma and slime as the client draws them: unlit and solid, the sheet's
+// colour times the vertex colour (white, or an interior group's material
+// colour), the sheet scrolling by `scroll` (texture widths, set each
+// frame). The product is taken in the client's colour space and made
+// linear once, as water is.
+const MAGMA_VERTEX_DECLARATIONS = `
+uniform vec2 wowLiquidScroll;
+`;
+
+const MAGMA_FRAGMENT_DECLARATIONS = `
+uniform vec4 wowLiquidColor;
+`;
+
+const MAGMA_FRAGMENT = `
+diffuseColor = vec4(pow(clamp(texture2D(map, vMapUv).rgb * wowLiquidColor.rgb, 0.0, 1.0), vec3(2.2)), 1.0);
+`;
+
+export function createMagmaMaterial({
+  frame, color, partyFade,
+}: {
+  frame: Texture;
+  color: readonly number[] | null;
+  partyFade: (shader: WebGLProgramParametersWithUniforms) => void;
+}): { material: MeshBasicMaterial; scroll: Vector2 } {
+  const material = new MeshBasicMaterial({ map: frame, side: DoubleSide, forceSinglePass: true });
+  const [r, g, b, a] = color ?? [1, 1, 1, 1];
+  const scroll = new Vector2();
+  const uniforms = { wowLiquidColor: { value: new Vector4(r, g, b, a) }, wowLiquidScroll: { value: scroll } };
+  material.onBeforeCompile = (shader) => {
+    partyFade(shader);
+    Object.assign(shader.uniforms, uniforms);
+    shader.vertexShader = MAGMA_VERTEX_DECLARATIONS + shader.vertexShader
+      .replace('#include <uv_vertex>', '#include <uv_vertex>\nvMapUv += wowLiquidScroll;');
+    shader.fragmentShader = MAGMA_FRAGMENT_DECLARATIONS + shader.fragmentShader
+      .replace('#include <map_fragment>', MAGMA_FRAGMENT);
+  };
+  material.customProgramCacheKey = () => 'wow-magma';
+  return { material, scroll };
 }
 
 // A liquid's frames are sampled as stored, in the client's colour space.
