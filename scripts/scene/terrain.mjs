@@ -101,6 +101,15 @@ export function readShadows(adtBuffer) {
   });
 }
 
+// A chunk's shadow (readShadows) as the client keeps it, MCSH's own bytes:
+// 64 rows of 64 bits, least significant bit first, in base64, for units and
+// props to be shaded by where they stand.
+export function encodeShadow(shadow) {
+  const bytes = Buffer.alloc((SPLAT_SIZE * SPLAT_SIZE) / 8);
+  shadow.forEach((shaded, texel) => { if (shaded) bytes[texel >> 3] |= 1 << (texel & 7); });
+  return bytes.toString('base64');
+}
+
 // Writes one chunk's layer alphas and shadow into the tile's atlas at chunk
 // cell (row, column): RGB the alpha of layers 2-4, A the light.
 export function packChunkSplats(atlas, row, column, layers, shadow) {
@@ -201,6 +210,9 @@ export function buildTerrainTile(adtBuffer, { bigAlpha, area = null, textureInde
   const shading = readVertexShading(adtBuffer);
   const shadows = readShadows(adtBuffer);
   const atlas = new Uint8Array(ATLAS_SIZE * ATLAS_SIZE * 4);
+  // Each built chunk's shadow (encodeShadow), by chunk (row x 16 + column),
+  // null where it has none.
+  const chunkShadows = new Array(256).fill(null);
   const positions = [];
   const normals = [];
   const colors = [];
@@ -231,6 +243,7 @@ export function buildTerrainTile(adtBuffer, { bigAlpha, area = null, textureInde
     layerIndices.push(new Uint8Array(CHUNK_VERTEX_COUNT * 4).map((_, index) => layers[index % 4]));
     cells.push(new Uint8Array(CHUNK_VERTEX_COUNT * 2).map((_, index) => (index % 2 ? column : row)));
     packChunkSplats(atlas, row, column, chunk.layers, shadows[chunkIndex]);
+    if (shadows[chunkIndex]?.includes(1)) chunkShadows[chunkIndex] = encodeShadow(shadows[chunkIndex]);
     for (const index of chunkIndices(chunk.holes)) indices.push(index + vertexCount);
     vertexCount += CHUNK_VERTEX_COUNT;
     chunkCount += 1;
@@ -252,6 +265,7 @@ export function buildTerrainTile(adtBuffer, { bigAlpha, area = null, textureInde
     layers: concat(layerIndices),
     cells: concat(cells),
     atlas,
+    shadows: chunkShadows,
     // The tile's north-west corner: chunk 0's position.
     origin: [mapArea.chunks[0].position[0], mapArea.chunks[0].position[1]],
     indices: vertexCount > 65535 ? Uint32Array.from(indices) : Uint16Array.from(indices),

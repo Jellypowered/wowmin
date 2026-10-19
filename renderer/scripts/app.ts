@@ -4,7 +4,7 @@ import { parseOnlineList, playersFromDatabase } from './utils/online-players';
 import { type ActiveInstanceSession, type DungeonFloor, type DungeonMapFloor, type InstanceCoordinateBounds, type InstanceProjectionViewport, type InstanceViewTransform, applyInstanceViewTransform, getBattlegroundObjectiveLabels, getBattlegroundStatusLabel, getBattlegroundStrategyLabel, getInstanceCoordinateBounds, getInstanceFactionColor, getInstanceMapProfile, getInstanceProjectionViewport, getParticipantDungeonFloor, groupActiveInstanceSessions, parseInstanceSessionKey, zoomInstanceViewAt, INSTANCE_MAX_ZOOM, isSceneryCreature } from './utils/instance-watch';
 import { clampIsoPitch, type CompassPoint, createFlatProjection, createIsoView, DEFAULT_ISO_YAW, type FadeSettings, getCompassDirections, getFadeVolumes, getHeightBand, getIsoPanForCenter, getNextQuarterTurn, ISO_PITCH, type IsoView, type MapProjection, resolveMinimapTileProjection, type SceneBox } from './utils/map-projection';
 import { InstanceSceneView, type SceneLighting } from './instance-scene/scene-view';
-import type { MapLights } from './utils/map-light';
+import { fetchMapLights, type MapLights } from './utils/map-light';
 import type { UnitModelPose } from './instance-scene/unit-models';
 import type { GameObjectPose } from './instance-scene/game-objects';
 import {
@@ -6484,9 +6484,12 @@ const $instanceMobsMode = $<HTMLSelectElement>('instance-mobs-mode');
 const $instancePlatesMode = $<HTMLSelectElement>('instance-plates-mode');
 const $instanceLightingMode = $<HTMLSelectElement>('instance-lighting-mode');
 const $instanceObjectLightsBtn = $<HTMLButtonElement>('instance-object-lights-btn');
+const $instanceWaterSpecularBtn = $<HTMLButtonElement>('instance-water-specular-btn');
 const $instanceDecisionsBtn = $<HTMLButtonElement>('instance-decisions-btn');
 const $instanceModelsBtn = $<HTMLButtonElement>('instance-models-btn');
 const $instanceNumbersBtn = $<HTMLButtonElement>('instance-numbers-btn');
+const $instanceGlowsBtn = $<HTMLButtonElement>('instance-glows-btn');
+const $instanceCirclesBtn = $<HTMLButtonElement>('instance-circles-btn');
 const $instanceBotCard = $<HTMLElement>('instance-bot-card');
 const $instanceBotDecisions = $<HTMLElement>('instance-bot-decisions');
 const $instanceDebugOverlay = $<HTMLElement>('instance-debug-overlay');
@@ -6583,6 +6586,8 @@ const INSTANCE_LIGHTING_STORAGE_KEY = 'wowmin.instanceLighting';
 let instanceLighting: SceneLighting = readStoredSetting(INSTANCE_LIGHTING_STORAGE_KEY) === 'neutral' ? 'neutral' : 'client';
 const INSTANCE_OBJECT_LIGHTS_STORAGE_KEY = 'wowmin.instanceObjectLights';
 let instanceObjectLights = readStoredFlag(INSTANCE_OBJECT_LIGHTS_STORAGE_KEY, true);
+const INSTANCE_WATER_SPECULAR_STORAGE_KEY = 'wowmin.instanceWaterSpecular';
+let instanceWaterSpecular = readStoredFlag(INSTANCE_WATER_SPECULAR_STORAGE_KEY, true);
 // Each map's lights (assets/models/light/<id>.json, from the client), null
 // when it has none or they could not be built.
 const instanceMapLights = new Map<number, MapLights | null>();
@@ -6637,6 +6642,11 @@ let instanceShowModels = readStoredInstanceModels();
 const instanceCombatEffects = new CombatEffectStore();
 const INSTANCE_NUMBERS_STORAGE_KEY = 'wowmin.instanceNumbers';
 let instanceShowNumbers = readStoredInstanceNumbers();
+// WowMin's own spell aids beside the game's art: glows, and floor circles.
+const INSTANCE_GLOWS_STORAGE_KEY = 'wowmin.instanceGlows';
+const INSTANCE_CIRCLES_STORAGE_KEY = 'wowmin.instanceCircles';
+let instanceShowGlows = readStoredFlag(INSTANCE_GLOWS_STORAGE_KEY, true);
+let instanceShowCircles = readStoredFlag(INSTANCE_CIRCLES_STORAGE_KEY, true);
 // Rough model heights in yards, for placing labels and click targets above
 // a model rather than at its feet.
 const INSTANCE_PLAYER_MODEL_HEIGHT = 2.2;
@@ -7096,6 +7106,20 @@ function setInstanceShowNumbers(enabled: boolean): void {
   renderInstanceCanvas();
 }
 
+function setInstanceShowGlows(enabled: boolean): void {
+  instanceShowGlows = enabled;
+  $instanceGlowsBtn?.setAttribute('aria-pressed', String(enabled));
+  storeSetting(INSTANCE_GLOWS_STORAGE_KEY, String(enabled));
+  renderInstanceCanvas();
+}
+
+function setInstanceShowCircles(enabled: boolean): void {
+  instanceShowCircles = enabled;
+  $instanceCirclesBtn?.setAttribute('aria-pressed', String(enabled));
+  storeSetting(INSTANCE_CIRCLES_STORAGE_KEY, String(enabled));
+  renderInstanceCanvas();
+}
+
 function setInstanceShowModels(enabled: boolean): void {
   instanceShowModels = enabled;
   $instanceModelsBtn?.setAttribute('aria-pressed', String(enabled));
@@ -7266,14 +7290,18 @@ function setInstanceObjectLights(enabled: boolean, render = true): void {
   if (render) renderInstanceCanvas();
 }
 
+function setInstanceWaterSpecular(enabled: boolean, render = true): void {
+  instanceWaterSpecular = enabled;
+  $instanceWaterSpecularBtn?.setAttribute('aria-pressed', String(enabled));
+  storeSetting(INSTANCE_WATER_SPECULAR_STORAGE_KEY, String(enabled));
+  if (render) renderInstanceCanvas();
+}
+
 async function loadInstanceMapLights(mapId: number): Promise<void> {
   if (instanceMapLights.has(mapId) || instanceMapLightLoads.has(mapId)) return;
   instanceMapLightLoads.add(mapId);
   try {
-    const response = await fetch(`assets/models/light/${mapId}.json`);
-    instanceMapLights.set(mapId, response.ok ? await response.json() as MapLights : null);
-  } catch {
-    instanceMapLights.set(mapId, null);
+    instanceMapLights.set(mapId, await fetchMapLights(mapId));
   } finally {
     instanceMapLightLoads.delete(mapId);
     if (getSelectedInstanceSession()?.mapId === mapId) renderInstanceCanvas();
@@ -8317,12 +8345,19 @@ function drawInstanceCanvas(followPass: boolean): void {
   // Where the units shown stand, for combat effects: effects on units that
   // aren't shown (the mobs selector, other floors) are skipped.
   const combatPositions = new Map<UnitKey, Point3>();
+  // Creatures' type_flags, for the spell colours the client skips on some.
+  const creatureTypeFlags = new Map<UnitKey, number>();
   if (live) {
     for (const player of visiblePlayers) {
       const guid = instanceLivePositions.guidOf(player.name);
       if (guid !== null) combatPositions.set(unitKey(guid, false), [player.position_x, player.position_y, player.position_z]);
     }
-    for (const creature of creatures) combatPositions.set(unitKey(creature.guid, true), [creature.x, creature.y, creature.z]);
+    for (const creature of creatures) {
+      const key = unitKey(creature.guid, true);
+      combatPositions.set(key, [creature.x, creature.y, creature.z]);
+      const typeFlags = instanceCreatureInfo.get(creature.entry)?.typeFlags;
+      if (typeFlags) creatureTypeFlags.set(key, typeFlags);
+    }
   }
   const strikes = new Map(live ? instanceCombatEffects.advance(liveNow, (from, to) => {
     const start = combatPositions.get(from);
@@ -8332,13 +8367,14 @@ function drawInstanceCanvas(followPass: boolean): void {
   // Models are placed before the scene draws; units without one get markers.
   const sceneView = getInstanceSceneView();
   void loadInstanceMapLights(session.mapId);
-  sceneView?.setLighting(instanceMapLights.get(session.mapId) ?? null, instanceLighting, instanceObjectLights);
+  sceneView?.setLighting(instanceMapLights.get(session.mapId) ?? null, instanceLighting, instanceObjectLights, instanceWaterSpecular);
   const modelIds = sceneView
     ? sceneView.setUnits(instanceShowModels && live && instanceView3d
       ? getInstanceUnitPoses(visiblePlayers, creatures, decisions, liveNow, strikes, sceneryGuids) : [], liveNow)
     : new Set<string>();
   const effectsDrawn = sceneView?.setEffects(live && instanceView3d ? instanceCombatEffects : null, combatPositions, liveNow,
-    live ? instanceLiveAuras.all(liveNow) : undefined, (spellId) => instanceSpellNames.isTaunt(spellId)) ?? 0;
+    live ? instanceLiveAuras.all(liveNow) : undefined, (spellId) => instanceSpellNames.isTaunt(spellId),
+    { glows: instanceShowGlows, circles: instanceShowCircles }, (unit) => creatureTypeFlags.get(unit) ?? 0) ?? 0;
   sceneView?.setGameObjects(live && instanceView3d ? getInstanceGameObjectPoses(liveNow) : [], liveNow);
   const bossPositions = creatures
     .filter((creature) => isBossCreature(creature, instanceCreatureInfo.get(creature.entry)))
@@ -8882,7 +8918,7 @@ function renderInstanceDebugOverlay(now: number): void {
     `stream  ${instanceLiveStream?.status ?? 'off'} · ${frames.rate.toFixed(1)} frames/s · gap max ${Math.round(frames.max)} ms`,
     `        per s: ${perSecond('paths')} paths · ${perSecond('creatures')} mobs · ${perSecond('bots')} bots · ${perSecond('combat')} combat events · ${perSecond('auras')} aura lists`,
     `combat  ${counts.effects} effects drawn (${counts.spellArt} client art, ${counts.particles} particles) · ${instanceCombatEffects.dropped} events dropped by the server`,
-    `shown   ${counts.players} players · ${counts.mobsShown}/${counts.mobsStreamed} mobs · ${counts.paths} paths · ${counts.bots} bots · ${counts.models} models · ${getInstanceSceneView()?.indoorCount ?? 0} lit indoors`,
+    `shown   ${counts.players} players · ${counts.mobsShown}/${counts.mobsStreamed} mobs · ${counts.paths} paths · ${counts.bots} bots · ${counts.models} models · ${getInstanceSceneView()?.indoorCount ?? 0} lit indoors · ${getInstanceSceneView()?.shadowedCount ?? 0} in shadow`,
     `view    zoom ${transform.zoom.toFixed(2)} · yaw ${Math.round(getInstanceViewYaw() * 180 / Math.PI)}° · pitch ${Math.round(getInstanceViewPitch() * 180 / Math.PI)}°${floor ? ` · floor ${floor.floorIndex}` : ''}`,
   ];
   $instanceDebugOverlay.textContent = lines.join('\n');
@@ -9223,6 +9259,10 @@ $instanceModelsBtn?.setAttribute('aria-pressed', String(instanceShowModels));
 $instanceModelsBtn?.addEventListener('click', () => setInstanceShowModels(!instanceShowModels));
 $instanceNumbersBtn?.setAttribute('aria-pressed', String(instanceShowNumbers));
 $instanceNumbersBtn?.addEventListener('click', () => setInstanceShowNumbers(!instanceShowNumbers));
+$instanceGlowsBtn?.setAttribute('aria-pressed', String(instanceShowGlows));
+$instanceGlowsBtn?.addEventListener('click', () => setInstanceShowGlows(!instanceShowGlows));
+$instanceCirclesBtn?.setAttribute('aria-pressed', String(instanceShowCircles));
+$instanceCirclesBtn?.addEventListener('click', () => setInstanceShowCircles(!instanceShowCircles));
 // Pointer-down too, as the card redraws every second and a click could
 // straddle a redraw.
 for (const type of ['pointerdown', 'click'] as const) {
@@ -9259,6 +9299,8 @@ setInstanceFades(instanceFades, false);
 $instanceFadesBtn?.addEventListener('click', () => setInstanceFades(!instanceFades));
 setInstanceObjectLights(instanceObjectLights, false);
 $instanceObjectLightsBtn?.addEventListener('click', () => setInstanceObjectLights(!instanceObjectLights));
+setInstanceWaterSpecular(instanceWaterSpecular, false);
+$instanceWaterSpecularBtn?.addEventListener('click', () => setInstanceWaterSpecular(!instanceWaterSpecular));
 $instanceAutoRefresh?.addEventListener('change', () => {
   if ($instanceAutoRefresh.checked) {
     void refreshInstanceWatcher();

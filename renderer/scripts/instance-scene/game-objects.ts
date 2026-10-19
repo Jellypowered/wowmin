@@ -2,7 +2,7 @@ import { type Camera, Group } from 'three';
 
 import type { Point3 } from '../utils/spell-events';
 import { useServerAxes } from './iso-camera';
-import { EffectInstance, type EffectTemplate, EffectTemplateCache, getEffectView } from './m2-effect';
+import { EffectInstance, type EffectTemplate, EffectTemplateCache, type EffectView, getEffectView } from './m2-effect';
 
 // Game objects (battleground banners and flags, doors, chests) as the
 // client's models, from the module's game object lists: each plays its idle
@@ -27,7 +27,8 @@ export class GameObjectLayer {
   private readonly templates: EffectTemplateCache;
   private readonly shown = new Map<number, { displayId: number; instance: EffectInstance }>();
 
-  constructor(onLoaded: () => void) {
+  // `groundBelow` finds the ground for particles that start on it.
+  constructor(onLoaded: () => void, private readonly groundBelow: EffectView['ground'] = null) {
     this.templates = new EffectTemplateCache(onLoaded);
     useServerAxes(this.group);
   }
@@ -39,7 +40,7 @@ export class GameObjectLayer {
   update(poses: GameObjectPose[], now: number, camera: Camera): void {
     // Effects bring their own nodes up to date; the scene view does the rest.
     this.group.updateWorldMatrix(true, false);
-    const view = getEffectView(camera, this.group);
+    const view = getEffectView(camera, this.group, this.groundBelow);
     const budget = { left: PARTICLE_BUDGET };
     const wanted = new Set<number>();
     for (const pose of poses) {

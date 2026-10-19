@@ -9,9 +9,6 @@ const M2_PARTICLES_OFFSET = 296;
 export const PARTICLE_SIZE = 476;
 export const RIBBON_SIZE = 176;
 const FIXED16_ONE = 32767;
-// Gravity keys hold a packed direction and magnitude rather than a float.
-const PARTICLE_FLAG_COMPRESSED_GRAVITY = 0x800000;
-const COMPRESSED_GRAVITY_SCALE = 0.04238648;
 
 const reader = (width, read) => ({ width, read });
 export const FLOAT = reader(4, (buffer, at) => buffer.readFloatLE(at));
@@ -19,7 +16,6 @@ const FIXED16 = reader(2, (buffer, at) => buffer.readInt16LE(at) / FIXED16_ONE);
 const UINT16 = reader(2, (buffer, at) => buffer.readUInt16LE(at));
 const UINT8 = reader(1, (buffer, at) => buffer.readUInt8(at));
 const UINT32 = reader(4, (buffer, at) => buffer.readUInt32LE(at));
-const INT32 = reader(4, (buffer, at) => buffer.readInt32LE(at));
 const VEC2 = { ...FLOAT, components: 2 };
 export const VEC3 = { ...FLOAT, components: 3 };
 
@@ -71,20 +67,6 @@ export function readFBlock(buffer, at, type) {
   return { times, values };
 }
 
-// Gravity keys under CompressedGravity: int8 x, int8 y, int16 z per key,
-// decoded to a vector (wowdev.wiki).
-export function decompressGravity(packed) {
-  const x = (packed << 24 >> 24) / 128;
-  const y = (packed << 16 >> 24) / 128;
-  let magnitude = (packed >> 16) * COMPRESSED_GRAVITY_SCALE;
-  let z = Math.sqrt(Math.max(0, 1 - x * x - y * y));
-  if (magnitude < 0) {
-    z = -z;
-    magnitude = -magnitude;
-  }
-  return [x * magnitude, y * magnitude, z * magnitude];
-}
-
 function readString(buffer, at) {
   const { count, offset } = m2Array(buffer, at);
   if (!count || offset + count > buffer.length) return null;
@@ -92,13 +74,11 @@ function readString(buffer, at) {
   return buffer.toString('latin1', offset, end < 0 || end > offset + count ? offset + count : end) || null;
 }
 
-function readGravity(buffer, at, flags) {
-  if (!(flags & PARTICLE_FLAG_COMPRESSED_GRAVITY)) {
-    const track = readTrack(buffer, at, FLOAT);
-    return { ...track, sequences: track.sequences.map(({ times, values }) => ({ times, values: values.flatMap((value) => [0, 0, -value]) })) };
-  }
-  const track = readTrack(buffer, at, INT32);
-  return { ...track, sequences: track.sequences.map(({ times, values }) => ({ times, values: values.flatMap(decompressGravity) })) };
+// Gravity keys as vectors down Z. The 3.3.5 client reads gravity as a plain
+// float whatever the flags say; compressed gravity came later.
+function readGravity(buffer, at) {
+  const track = readTrack(buffer, at, FLOAT);
+  return { ...track, sequences: track.sequences.map(({ times, values }) => ({ times, values: values.flatMap((value) => [0, 0, -value]) })) };
 }
 
 export function parseParticleEmitter(buffer, at) {
@@ -122,8 +102,8 @@ export function parseParticleEmitter(buffer, at) {
     speedVariation: readTrack(buffer, at + 0x48, FLOAT),
     verticalRange: readTrack(buffer, at + 0x5C, FLOAT),
     horizontalRange: readTrack(buffer, at + 0x70, FLOAT),
-    // As vectors (x, y, z) per key, decompressed if packed.
-    gravity: readGravity(buffer, at + 0x84, flags),
+    // As vectors (x, y, z) per key, pointing down Z.
+    gravity: readGravity(buffer, at + 0x84),
     lifespan: readTrack(buffer, at + 0x98, FLOAT),
     lifespanVariation: buffer.readFloatLE(at + 0xAC),
     emissionRate: readTrack(buffer, at + 0xB0, FLOAT),
@@ -162,7 +142,8 @@ export function parseParticleEmitter(buffer, at) {
 
 export function parseRibbon(buffer, at) {
   return {
-    bone: buffer.readUInt32LE(at + 0x04),
+    // A uint16 and padding, as the client reads it.
+    bone: buffer.readUInt16LE(at + 0x04),
     position: readValues(buffer, { count: 1, offset: at + 0x08 }, VEC3),
     textures: readValues(buffer, m2Array(buffer, at + 0x14), UINT16),
     materials: readValues(buffer, m2Array(buffer, at + 0x1C), UINT16),

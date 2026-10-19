@@ -38,6 +38,15 @@ import type { UnitAnchorRole } from '../utils/spell-kits';
 // A unit's anchor point in server coordinates, or null if it isn't shown.
 export type UnitAnchor = (unit: UnitKey, role: UnitAnchorRole) => Point3 | null;
 
+// WowMin's own spell aids, which aren't the client's art, each shown or
+// not: the glows (casts, beams, missiles, and hits of spells without art),
+// and the floor circles (harmful areas, taunts, and steady areas round an
+// aura's bearer).
+export interface SpellAids {
+  glows: boolean;
+  circles: boolean;
+}
+
 const EFFECT_RENDER_ORDER = 3;
 const RING_LIFT = 0.08;
 // Area rings of one colour at about one height are drawn as one shape: a
@@ -51,6 +60,10 @@ const AREA_EDGE_STRENGTH = 0.5;
 const BEAM_SPACING = 1.2;
 const MAX_BEAM_SPRITES = 40;
 const TRAIL_SPRITES = 3;
+
+// Every aid shown.
+export const ALL_SPELL_AIDS: SpellAids = { glows: true, circles: true };
+
 const NO_EFFECTS: Pick<CombatEffectStore, 'casts' | 'beams' | 'projectiles' | 'impacts' | 'rings'> = {
   casts: [], beams: [], projectiles: [], impacts: [], rings: [],
 };
@@ -189,15 +202,18 @@ export class SpellEffectLayer {
   }
 
   // Draws the store's effects, or none for a null store, except missiles and
-  // impacts `skip` says are drawn elsewhere (the client's own art).
+  // impacts `skip` says are drawn elsewhere (the client's own art), and the
+  // aids turned off.
   update(store: CombatEffectStore | null, now: number, anchor: UnitAnchor,
-    skip: (entry: Projectile | Impact | CastGlow | AreaRing | Beam) => boolean = () => false): void {
+    skip: (entry: Projectile | Impact | CastGlow | AreaRing | Beam) => boolean = () => false, aids: SpellAids = ALL_SPELL_AIDS): void {
     this.spritesUsed = 0;
     let drawn = 0;
     const effects = store ?? NO_EFFECTS;
+    const glows = aids.glows ? effects : NO_EFFECTS;
+    const areas = aids.circles ? effects : NO_EFFECTS;
 
-    for (const cast of effects.casts) {
-      if (cast.startAt > now || skip(cast)) continue;
+    for (const cast of glows.casts) {
+      if (!cast.glow || cast.startAt > now || skip(cast)) continue;
       const right = anchor(cast.caster, 'handRight');
       if (!right) continue;
       drawn += 1;
@@ -214,7 +230,7 @@ export class SpellEffectLayer {
       if (left) this.sprite(left, cast.color, size * 0.85, 0.75);
     }
 
-    for (const beam of effects.beams) {
+    for (const beam of glows.beams) {
       if (beam.startAt > now || skip(beam)) continue;
       const from = anchor(beam.source, 'handRight');
       const to = anchor(beam.target, 'chest');
@@ -229,7 +245,7 @@ export class SpellEffectLayer {
       }
     }
 
-    for (const projectile of effects.projectiles) {
+    for (const projectile of glows.projectiles) {
       if (projectile.startAt > now || skip(projectile)) continue;
       const from = anchor(projectile.source, 'handRight');
       const to = anchor(projectile.target, 'chest');
@@ -250,8 +266,8 @@ export class SpellEffectLayer {
       }
     }
 
-    for (const impact of effects.impacts) {
-      if (impact.at > now || skip(impact)) continue;
+    for (const impact of glows.impacts) {
+      if (!impact.glow || impact.at > now || skip(impact)) continue;
       const t = clamp01((now - impact.at) / IMPACT_LIFETIME_MS);
       const scale = impact.small ? 0.5 : 1;
       if (impact.heal) {
@@ -276,7 +292,7 @@ export class SpellEffectLayer {
     }
 
     const circles: AreaCircle[] = [];
-    for (const area of effects.rings) {
+    for (const area of areas.rings) {
       if (area.startAt > now || skip(area)) continue;
       const center = area.point ?? anchor(area.caster, 'feet');
       // The caster must be shown, even for a ring at a ground point.

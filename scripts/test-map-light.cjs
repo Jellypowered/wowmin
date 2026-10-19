@@ -12,7 +12,7 @@ function loadModule(relativePath) {
   const output = esbuild.buildSync({
     entryPoints: [path.join(__dirname, relativePath)], bundle: true, write: false, platform: 'node', format: 'cjs',
   }).outputFiles[0].text;
-  const context = { module: { exports: {} }, Math, Date };
+  const context = { module: { exports: {} }, Math, Date, atob };
   context.exports = context.module.exports;
   vm.runInNewContext(output, context);
   return context.module.exports;
@@ -42,6 +42,28 @@ function dbc(fieldCount, records) {
   header.writeUInt32LE(1, 16);
   return Buffer.concat([header, body, Buffer.alloc(1)]);
 }
+
+test("reads each light's water: its colour bands, the sun's colour on clouds, and LightParams' alphas", async () => {
+  const { mapLights } = await import(pathToFileURL(path.join(__dirname, 'scene', 'lights.mjs')).href);
+  const band = (id, color) => ({ 0: id, 1: 1, 2: 1440, 18: color });
+  // LightParams 2's bands are 19 + band.
+  const files = {
+    'DBFilesClient\\Light.dbc': dbc(15, [{ 0: 1, 1: 0, 7: 2 }]),
+    'DBFilesClient\\LightIntBand.dbc': dbc(34, [
+      band(19 + 9, 0xffeedd), band(19 + 14, 0x112233), band(19 + 15, 0x223344), band(19 + 16, 0x334455), band(19 + 17, 0x445566),
+    ]),
+    'DBFilesClient\\LightParams.dbc': dbc(9, [{ 0: 2, 5: float(0.5), 6: float(1), 7: float(0.75), 8: float(1) }]),
+  };
+  const [only] = mapLights((name) => files[name] ?? null, 489).lights;
+  assert.deepEqual(only.water, {
+    oceanShallow: [[1440, 0x112233]], oceanDeep: [[1440, 0x223344]],
+    riverShallow: [[1440, 0x334455]], riverDeep: [[1440, 0x445566]],
+    sunCloud: [[1440, 0xffeedd]], alphas: [0.5, 1, 0.75, 1],
+  });
+  // Without LightParams the alphas are zero.
+  delete files['DBFilesClient\\LightParams.dbc'];
+  assert.deepEqual(mapLights((name) => files[name] ?? null, 489).lights[0].water.alphas, [0, 0, 0, 0]);
+});
 
 test('reads a map\'s lights in server coordinates with their keys, falling back to the default light', async () => {
   const { mapLights, lightPosition } = await import(pathToFileURL(path.join(__dirname, 'scene', 'lights.mjs')).href);
@@ -91,7 +113,7 @@ test('a band\'s colour at a time runs between its keys and wraps past midnight',
   assert.equal(light.timeOfDay(new Date(2026, 9, 12, 12, 0, 0)), 1440);
 });
 
-test('area lights count in full inside their inner radius and fade out to their outer, the default light filling the rest', () => {
+test('area lights count in full inside their inner radius and fade out to their outer, mixed over the default light', () => {
   const area = { id: 2, defaultLight: false, position: [0, 0, 0], inner: 10, outer: 20, direct: [[0, 0xffffff]], ambient: [[0, 0x000000]] };
   const fallback = { id: 1, defaultLight: true, position: null, inner: 0, outer: 0, direct: [[0, 0x000000]], ambient: [[0, 0xffffff]] };
   const map = { mapId: 1, lights: [area, fallback] };
@@ -103,31 +125,29 @@ test('area lights count in full inside their inner radius and fade out to their 
   near(between.direct[0], 0.5, 'direct');
   near(between.ambient[0], 0.5, 'ambient');
   assert.deepEqual(plain(light.lightAt(map, [100, 0, 0], 0)), { direct: [0, 0, 0], ambient: [1, 1, 1] });
-  // Overlapping lights are scaled to add up to one.
-  const twice = light.lightAt({ mapId: 1, lights: [area, { ...area, id: 3 }, fallback] }, [0, 0, 0], 0);
-  assert.deepEqual(plain(twice.direct), [1, 1, 1]);
+  // Overlapping lights are mixed in turn, the farthest first, not averaged:
+  // the nearer light (red, weight 0.5) over the farther (white, in full).
+  const nearer = { ...area, id: 3, position: [8, 0, 0], inner: 1, outer: 5, direct: [[0, 0xff0000]] };
+  const both = light.lightAt({ mapId: 1, lights: [nearer, area, fallback] }, [5, 0, 0], 0);
+  assert.equal(light.lightWeight(nearer, [5, 0, 0]), 0.5);
+  assert.deepEqual(plain(both.direct), [1, 0.5, 0.5]);
+  assert.deepEqual(plain(both.ambient), [0, 0, 0]);
+  // A nearer light in full hides the farther one.
+  const hidden = light.lightAt({ mapId: 1, lights: [area, { ...nearer, inner: 20, outer: 30 }, fallback] }, [5, 0, 0], 0);
+  assert.deepEqual(plain(hidden.direct), [1, 0, 0]);
 });
 
-test('reads buildings\' and models\' point lights from their own bytes', async () => {
-  const { readM2Lights, readWmoLights } = await import(pathToFileURL(path.join(__dirname, 'scene', 'lights.mjs')).href);
-  const { readChunks } = await import(pathToFileURL(path.join(__dirname, 'scene', 'chunks.mjs')).href);
-  // MOLT: an omni light and an ambient one (left out).
-  const molt = Buffer.alloc(96);
-  molt[0] = 0;
-  molt.writeUInt32LE(0xfffda648, 4);
-  [-18.5, 29, 2.75].forEach((value, axis) => molt.writeFloatLE(value, 8 + axis * 4));
-  molt.writeFloatLE(0.9, 20);
-  molt.writeFloatLE(3.5, 40);
-  molt.writeFloatLE(7, 44);
-  molt[48] = 3;
-  const chunk = Buffer.concat([Buffer.from('TLOM'), Buffer.from(Uint32Array.of(molt.length).buffer), molt]);
-  const lights = readWmoLights(readChunks(chunk));
-  assert.equal(lights.length, 1);
-  assert.equal(lights[0].color, 0xfda648);
-  assert.deepEqual(lights[0].position, [-18.5, 29, 2.75]);
-  near(lights[0].intensity, 0.9, 'intensity');
-  assert.deepEqual([lights[0].start, lights[0].end], [3.5, 7]);
+test('a lit surface takes the ambient plus the direct light by N.L, capped at 1', () => {
+  const colors = { direct: [1, 0.5, 0], ambient: [0.2, 0.3, 0.4] };
+  const lit = light.litColor(colors, 0.5);
+  [0.7, 0.55, 0.4].forEach((expected, channel) => near(lit[channel], expected, `channel ${channel}`));
+  assert.deepEqual(plain(light.litColor(colors, -1)), [0.2, 0.3, 0.4]);
+  assert.deepEqual(plain(light.litColor({ direct: [3, 1, 1], ambient: [0.5, 0.5, 0.5] }, 0.25)), [0.75, 0.75, 0.75]);
+  assert.deepEqual(plain(light.litColor({ direct: [1, 1, 1], ambient: [0.5, 0.9, 1.4] }, 1)), [1, 1, 1]);
+});
 
+test('reads models\' point lights from their own bytes, without fade distances', async () => {
+  const { readM2Lights } = await import(pathToFileURL(path.join(__dirname, 'scene', 'lights.mjs')).href);
   // An M2 with one point light: tracks hold one sequence of one key each.
   const m2 = Buffer.alloc(1024);
   m2.writeUInt32LE(1, 0x108);
@@ -157,7 +177,7 @@ test('reads buildings\' and models\' point lights from their own bytes', async (
   track(light + 76, [2]);
   track(light + 96, [0.5]);
   track(light + 116, [1.5]);
-  assert.deepEqual(JSON.parse(JSON.stringify(readM2Lights(m2))), [{ position: [0, 0.25, 1], color: 0xff8000, intensity: 2, start: 0.5, end: 1.5 }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(readM2Lights(m2))), [{ position: [0, 0.25, 1], color: 0xff8000, intensity: 2 }]);
   assert.deepEqual(readM2Lights(Buffer.alloc(16)), []);
 });
 
@@ -169,11 +189,17 @@ test('places a light by its building\'s turn, scale, and position', async () => 
   [100, 202, 16].forEach((expected, axis) => near(placed[axis], expected, `axis ${axis}`));
 });
 
-test('picks the object lights nearest the view, within reach', () => {
-  const at = (x) => ({ position: [x, 0, 0], color: 0xffffff, intensity: 1, start: 1, end: 5 });
+test('picks the object lights nearest the view', () => {
+  const at = (x) => ({ position: [x, 0, 0], color: 0xffffff, intensity: 1 });
   const lights = [at(50), at(5), at(300), at(20)];
-  assert.deepEqual(plain(light.nearestObjectLights(lights, [0, 0, 0], 2, 100).map((entry) => entry.position[0])), [5, 20]);
-  assert.deepEqual(plain(light.nearestObjectLights(lights, [0, 0, 0], 8, 100).map((entry) => entry.position[0])), [5, 20, 50]);
+  assert.deepEqual(plain(light.nearestObjectLights(lights, [0, 0, 0], 2).map((entry) => entry.position[0])), [5, 20]);
+  assert.deepEqual(plain(light.nearestObjectLights(lights, [0, 0, 0], 8).map((entry) => entry.position[0])), [5, 20, 50, 300]);
+});
+
+test('a point light falls off as the client\'s fixed curve, by how squarely it shines on the surface', () => {
+  near(light.pointLightShare(1, 1), 1 / 0.73, 'one yard, head on');
+  near(light.pointLightShare(10, 0.5), 0.5 / 10, 'ten yards, at 60 degrees');
+  assert.equal(light.pointLightShare(4, -0.5), 0);
 });
 
 test('the sun shines from a fixed bearing, highest at noon and midnight and lowest at six', () => {
@@ -279,4 +305,114 @@ test('lights a building\'s batches as the client\'s two render paths do', () => 
   assert.equal(light.buildingBatchLight(3, counts, true, 0x8, 0), 'lit');
   assert.equal(light.buildingBatchLight(3, counts, true, 0x40, 0x1), 'unlit');
   assert.equal(light.buildingBatchLight(0, counts, true, 0x8, 0), 'transition');
+});
+
+test('a unit\'s light eases: ambient at two a second, its direct scale at 3.33 a second and never above 1', () => {
+  const eased = light.easeLight({ ambient: [0, 0.5, 1], directScale: 1 }, { ambient: [1, 0.5, 0], directScale: light.DIRECT_SCALE_SHADOWED }, 0.1);
+  [0.2, 0.5, 0.8].forEach((expected, channel) => near(eased.ambient[channel], expected, `ambient ${channel}`));
+  near(eased.directScale, 1 - 1 / 3, 'scale down');
+  near(light.easeLight({ ambient: [0, 0, 0], directScale: 0.5 }, { ambient: [0, 0, 0], directScale: 1 }, 0.06).directScale, 0.7, 'rising');
+  // Never above 1, whatever it aims at.
+  near(light.easeLight({ ambient: [0, 0, 0], directScale: 0.9 }, { ambient: [0, 0, 0], directScale: 2.5 }, 1).directScale, 1, 'capped');
+});
+
+test('finds the shadow texel under a point as the client does, by its tile\'s corner', () => {
+  const shadow = loadModule('../renderer/scripts/utils/terrain-shadow.ts');
+  const chunk = 1600 / 3 / 16;
+  const origin = [1000, 2000];
+  assert.equal(shadow.shadowTexel(origin, 1000, 2000), 0);
+  // One chunk south and half a chunk east: row 64, column 32.
+  assert.equal(shadow.shadowTexel(origin, 1000 - chunk - 0.01, 2000 - chunk / 2 - 0.01), 64 * 1024 + 32);
+  assert.equal(shadow.shadowTexel(origin, 1001, 2000), null, 'north of the tile');
+  assert.equal(shadow.shadowTexel(origin, 1000, 2000 - 1600 / 3 - 0.01), null, 'east of the tile');
+  const tiles = new shadow.TerrainShadows();
+  let reads = 0;
+  tiles.addTile(origin, () => {
+    reads += 1;
+    const alpha = new Uint8Array(1024 * 1024).fill(255);
+    alpha[64 * 1024 + 32] = 150;
+    return alpha;
+  });
+  assert.equal(tiles.isShadowed(1000 - chunk - 0.01, 2000 - chunk / 2 - 0.01), true);
+  assert.equal(tiles.isShadowed(999, 1999), false);
+  assert.equal(tiles.isShadowed(5000, 5000), false, 'off the tiles');
+  assert.equal(reads, 1, 'read once');
+  // A scene's own chunk shadows: chunk 17 (row 1, column 1), texel (2, 3)
+  // in it.
+  const bytes = new Uint8Array(512);
+  const bit = 2 * 64 + 3;
+  bytes[bit >> 3] |= 1 << (bit & 7);
+  const chunks = new Array(256).fill(null);
+  chunks[17] = Buffer.from(bytes).toString('base64');
+  const byChunk = new shadow.TerrainShadows();
+  byChunk.addChunks(origin, chunks);
+  const texel = chunk / 64;
+  assert.equal(byChunk.isShadowed(1000 - chunk - 2.5 * texel, 2000 - chunk - 3.5 * texel), true);
+  assert.equal(byChunk.isShadowed(1000 - chunk - 2.5 * texel, 2000 - chunk - 4.5 * texel), false);
+  assert.equal(byChunk.isShadowed(999, 1999), false, 'a chunk without shadow');
+});
+
+test("blends water's colours and alphas across area lights as the light's own colours", () => {
+  const water = (color, alpha) => ({
+    oceanShallow: [[0, color]], oceanDeep: [[0, color]], riverShallow: [[0, color]], riverDeep: [[0, color]], sunCloud: [[0, color]],
+    alphas: [alpha, 1, alpha, 1],
+  });
+  const map = {
+    mapId: 1,
+    lights: [
+      { id: 1, defaultLight: true, position: null, inner: 0, outer: 0, direct: [], ambient: [], water: water(0x000000, 0.5) },
+      { id: 2, defaultLight: false, position: [0, 0, 0], inner: 10, outer: 30, direct: [], ambient: [], water: water(0xff0000, 0.75) },
+    ],
+  };
+  // Halfway through the area light's falloff: half of each.
+  const half = plain(light.lightAt(map, [20, 0, 0], 0).water);
+  near(half.riverDeep[0], 0.5, 'river deep red');
+  near(half.oceanShallow[0], 0.5, 'ocean shallow red');
+  near(half.sunCloud[0], 0.5, 'sun on clouds red');
+  near(half.alphas[0], 0.625, 'water shallow alpha');
+  near(half.alphas[1], 1, 'water deep alpha');
+  assert.deepEqual(plain(light.lightAt(map, [100, 0, 0], 0).water.alphas), [0.5, 1, 0.5, 1]);
+  // Light files from before water's colours have none.
+  assert.equal(light.lightAt({ mapId: 1, lights: [{ ...map.lights[0], water: undefined }] }, [0, 0, 0], 0).water, undefined);
+});
+
+const liquids = loadModule('../renderer/scripts/utils/liquid-light.ts');
+
+test("builds water's depth ramps as the client does: 64 rows from shallow to deep, WMO water's white half, the ocean's darker last row", () => {
+  const water = {
+    oceanShallow: rgb(0x204060), oceanDeep: rgb(0x000000), riverShallow: rgb(0x000000), riverDeep: rgb(0x40ff80), sunCloud: [0, 0, 0],
+    alphas: [0.5, 1, 0.75, 1],
+  };
+  const texel = (texels, row, column) => [...texels.slice((row * 8 + column) * 4, (row * 8 + column) * 4 + 4)];
+  const river = liquids.waterRampTexels('river', water);
+  assert.deepEqual(texel(river, 0, 0), [0, 0, 0, 128]);
+  // Each row a 64th of the way; the last stops a step short of the deep.
+  assert.deepEqual(texel(river, 32, 7), [32, 127, 64, 191]);
+  assert.deepEqual(texel(river, 63, 0), [63, 251, 126, 253]);
+  const ocean = liquids.waterRampTexels('ocean', water);
+  assert.deepEqual(texel(ocean, 0, 3), [32, 64, 96, 191]);
+  assert.deepEqual(texel(ocean, 62, 0), [1, 2, 3, 253]);
+  // The last row is a tenth darker, and opaque.
+  assert.deepEqual(texel(ocean, 63, 0), [0, 1, 1, 255]);
+  const wmo = liquids.waterRampTexels('wmo', water);
+  assert.deepEqual(texel(wmo, 10, 3), [64, 255, 128, 147]);
+  assert.deepEqual(texel(wmo, 10, 4), [255, 255, 255, 147]);
+});
+
+test("picks an animated sheet's frame as the client does: 30 frames in 1250 ms", () => {
+  assert.equal(liquids.liquidFrameIndex(0, 1250, 30), 0);
+  assert.equal(liquids.liquidFrameIndex(41, 1250, 30), 0);
+  assert.equal(liquids.liquidFrameIndex(42, 1250, 30), 1);
+  assert.equal(liquids.liquidFrameIndex(1249, 1250, 30), 29);
+  assert.equal(liquids.liquidFrameIndex(1250 * 7 + 625, 1250, 30), 15);
+  assert.equal(liquids.liquidFrameIndex(500, 1250, 0), 0);
+});
+
+test("scrolls magma's sheet as the client does: whole-millisecond periods of 1000 / speed", () => {
+  // Terrain magma: 0.025 widths a second, once round every 40 s.
+  near(liquids.liquidScrollOffset(10000, 0.025), 0.25, 'quarter way');
+  near(liquids.liquidScrollOffset(40000, 0.025), 0, 'wrapped');
+  // WMO magma: 0.1 a second along v, every 10 s.
+  near(liquids.liquidScrollOffset(12500.9, 0.1), 0.25, 'whole milliseconds');
+  assert.equal(liquids.liquidScrollOffset(12345, 0), 0);
 });

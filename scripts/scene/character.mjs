@@ -9,7 +9,7 @@
 import path from 'node:path';
 
 import { readDbc } from './dbc.mjs';
-import { loadM2 } from './m2.mjs';
+import { findM2Events, loadM2, M2_EVENT_BONE, M2_EVENT_POSITION } from './m2.mjs';
 import { loadSkinnedM2 } from './m2-skinned.mjs';
 import { decodeBlp, drawImage, encodeRgba } from './textures.mjs';
 
@@ -89,6 +89,16 @@ export function readM2Attachments(buffer) {
     });
   }
   return attachments;
+}
+
+// The skeleton's events with these IDs ('$CSL'): { name, bone, position },
+// read from the header like the attachments.
+export function readM2Events(buffer, names) {
+  return findM2Events(buffer, names).map(({ name, base }) => ({
+    name,
+    bone: buffer.readUInt16LE(base + M2_EVENT_BONE),
+    position: [0, 1, 2].map((axis) => buffer.readFloatLE(base + M2_EVENT_POSITION + axis * 4)),
+  }));
 }
 
 // Geoset group values (section ID = group * 100 + value; group 0 is hair,
@@ -377,11 +387,16 @@ export function resolveAttachments(characterData, modelName, placements) {
     const point = skeletonAttachments.find((candidate) => candidate.id === placement.attachment);
     const itemModel = point ? loadM2(placement.model, characterData.readFile) : null;
     if (!itemModel) return [];
+    // A weapon's blade, bottom and top, which a swing's trail sweeps.
+    const blade = readM2Events(characterData.readFile(placement.model), ['$WTB', '$WTT']);
+    const bottom = blade.find((event) => event.name === '$WTB');
+    const top = blade.find((event) => event.name === '$WTT');
     return [{
       ...placement,
       bone: point.bone,
       position: point.position,
       mesh: itemModel,
+      ...(bottom && top ? { trail: { bottom: bottom.position, top: top.position } } : {}),
       textureFor: (batch) => {
         const name = batch.textureType === TEXTURE_HARDCODED ? batch.texture : batch.textureType === TEXTURE_ITEM ? placement.texture : null;
         const blp = name ? characterData.readFile(name) : null;

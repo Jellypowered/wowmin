@@ -50,7 +50,7 @@ async function build(kind, params) {
     return modelName ? buildEffectGlb(data().readFile, modelName) : null;
   }
   if (kind === 'effect') {
-    const modelName = visuals().effectModel(Number(params.effectId));
+    const modelName = params.areaModel !== undefined ? visuals().areaModel(Number(params.areaModel)) : visuals().effectModel(Number(params.effectId));
     return modelName ? buildEffectGlb(data().readFile, modelName) : null;
   }
   return buildUnitGlb(data(), kind, params);

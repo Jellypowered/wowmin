@@ -11,7 +11,6 @@ import { toM2Path } from './placement.mjs';
 
 export const WMO_GROUP_FLAG_VERTEX_COLORS = 0x4;
 export const WMO_GROUP_FLAG_EXTERIOR = 0x8;
-export const WMO_GROUP_FLAG_INTERIOR = 0x2000;
 export const WMO_MATERIAL_FLAG_UNLIT = 0x1;
 export const WMO_MATERIAL_FLAG_UNCULLED = 0x4;
 export const WMO_MATERIAL_FLAG_WINDOW = 0x20;
@@ -20,7 +19,7 @@ export const WMO_MATERIAL_FLAG_CLAMP_T = 0x80;
 const WMO_ROOT_FLAG_VERTEX_COLORS_FIXED = 0x8;
 // The building takes the client's newer ("unified") render path, which adds
 // the header's ambient to its interiors' light and to the floor colour it
-// lights things by (Wow.exe FUN_007a9380, FUN_007c7fe0).
+// lights things by.
 export const WMO_ROOT_FLAG_UNIFIED = 0x2;
 // A group lit by the outdoor light although it is not exterior.
 export const WMO_GROUP_FLAG_EXTERIOR_LIT = 0x40;
@@ -31,8 +30,31 @@ export const MOHD_FLAGS = 0x3c;
 // MOPY flag of a transition face, where a doorway or cave mouth blends
 // indoor light into outdoor.
 export const MOPY_FLAG_TRANSITION = 0x1;
+// The faces the client lights a unit or prop by, its floor: drawn faces
+// (0x20) and detail faces (0x04), never collision-only ones (0x08), and none
+// it leaves out of its ground rays (0x02).
+const MOPY_FLAG_SKIPPED = 0x2;
+const MOPY_FLAG_DETAIL = 0x4;
+const MOPY_FLAG_RENDER = 0x20;
+export const isFloorFace = (flags) => !(flags & MOPY_FLAG_SKIPPED) && Boolean(flags & (MOPY_FLAG_RENDER | MOPY_FLAG_DETAIL));
+
+// A group's floor faces (isFloorFace) among those its collision tree
+// holds (all its triangles where it has none), split by whether they are
+// transition faces.
+export function floorFaces({ bspFaces: faces, polyFlags, indices }) {
+  const floor = [];
+  const transition = [];
+  const count = faces ? faces.length : Math.floor(indices.length / 3);
+  for (let item = 0; item < count; item += 1) {
+    const triangle = faces ? faces[item] : item;
+    const flags = polyFlags ? polyFlags[triangle * 2] : MOPY_FLAG_RENDER;
+    if (triangle * 3 + 2 >= indices.length || !isFloorFace(flags)) continue;
+    (flags & MOPY_FLAG_TRANSITION ? transition : floor).push(triangle);
+  }
+  return { floor, transition };
+}
 // A prop's floor: a ray from this far above its origin down to this far
-// below (Wow.exe FUN_007a0d60).
+// below.
 const PROP_FLOOR_ABOVE = 1;
 const PROP_FLOOR_BELOW = 12;
 
@@ -41,11 +63,28 @@ const MOGP_HEADER_SIZE = 0x44;
 // count at 0x10.
 const MOBA_SIZE = 24;
 const MOMT_ENTRY_SIZE = 64;
+// MOPT, a building's portals (20 bytes): first vertex, vertex count, then
+// the plane (normal and distance). MOPR, the groups' references to them (8
+// bytes): portal, the group on its other side, and which side of the plane
+// is the group's.
+const MOPT_SIZE = 20;
+const MOPR_SIZE = 8;
+// A portal whose plane reads as not a number is taken as one far above.
+const NO_PLANE = [0, 0, 1, 800000];
+const MOMT_DIFFUSE_COLOR = 0x1c;
 const MODS_ENTRY_SIZE = 32;
 const MODD_ENTRY_SIZE = 40;
 
 export function groupFileName(rootName, index) {
   return rootName.replace(/\.wmo$/i, `_${String(index).padStart(3, '0')}.wmo`);
+}
+
+// MOBR's triangle indices (u16 each), once each, in order.
+function bspFaces(mobr) {
+  if (!mobr) return null;
+  const faces = new Set();
+  for (let at = 0; at + 1 < mobr.length; at += 2) faces.add(mobr.readUInt16LE(at));
+  return Uint32Array.from([...faces].sort((left, right) => left - right));
 }
 
 export function readGroupHeader(groupBuffer) {
@@ -58,6 +97,9 @@ export function readGroupHeader(groupBuffer) {
     flags: mogp.readUInt32LE(0x08),
     // MOPY: a flags byte and a material per triangle.
     polyFlags: findChunk(chunks, 'MOPY'),
+    // MOBR: the triangles of the group's collision tree (BSP), which the
+    // client finds floors in, or null; detail faces are left out of it.
+    bspFaces: bspFaces(findChunk(chunks, 'MOBR')),
     // Each render batch's first index and index count.
     renderBatches: moba
       ? Array.from({ length: Math.floor(moba.length / MOBA_SIZE) }, (_, index) => ({
@@ -65,6 +107,9 @@ export function readGroupHeader(groupBuffer) {
       }))
       : [],
     boundingBox: readFloats(mogp, 0x0C, 6),
+    // The group's portal references (MOPR): the first and how many.
+    portalStart: mogp.readUInt16LE(0x24),
+    portalCount: mogp.readUInt16LE(0x26),
     transBatchCount: mogp.readUInt16LE(0x28),
     intBatchCount: mogp.readUInt16LE(0x2a),
     extBatchCount: mogp.readUInt16LE(0x2c),
@@ -102,7 +147,7 @@ export function readDoodadDefinitions(rootChunks) {
   return { sets, definitions };
 }
 
-// The client's FixColorVertexAlpha (Wow.exe FUN_007d7380), as in
+// The client's FixColorVertexAlpha, as in
 // @wowserhq/format but reading the last transition batch (that library reads
 // one past it, which crashes when every batch is one): the transition
 // batches' vertices (doorways, cave mouths) are halved and keep their alpha,
@@ -126,6 +171,24 @@ export function fixVertexColors(bgra, batches, transBatchCount) {
   return colors;
 }
 
+// A building's portal planes ([nx, ny, nz, d] each) and portal references
+// ({ portalIndex, groupIndex, side }), which its groups' portalStart and
+// portalCount index.
+export function readPortals(rootChunks) {
+  const mopt = findChunk(rootChunks, 'MOPT');
+  const mopr = findChunk(rootChunks, 'MOPR');
+  const portals = [];
+  for (let at = 0; mopt && at + MOPT_SIZE <= mopt.length; at += MOPT_SIZE) {
+    const plane = readFloats(mopt, at + 4, 4);
+    portals.push(Number.isNaN(plane[3]) ? [...NO_PLANE] : plane);
+  }
+  const portalRefs = [];
+  for (let at = 0; mopr && at + MOPR_SIZE <= mopr.length; at += MOPR_SIZE) {
+    portalRefs.push({ portalIndex: mopr.readUInt16LE(at), groupIndex: mopr.readUInt16LE(at + 2), side: mopr.readInt16LE(at + 4) });
+  }
+  return { portals, portalRefs };
+}
+
 // Set 0 is the global set every placement shows; the placement may add one more.
 export function selectDoodadIndices(sets, placementSet) {
   const indices = new Set();
@@ -147,6 +210,8 @@ export function loadWmo(rootName, readFile) {
   const materials = root.materials.map((material, index) => ({
     flags: material.flags,
     blendMode: momt.readUInt32LE(index * MOMT_ENTRY_SIZE + 8),
+    // BGRA; interior liquid's colour.
+    diffuseColor: momt.readUInt32LE(index * MOMT_ENTRY_SIZE + MOMT_DIFFUSE_COLOR),
     texture: material.textures[0] ?? null,
   }));
 
@@ -189,6 +254,7 @@ export function loadWmo(rootName, readFile) {
   return {
     materials,
     groups,
+    ...readPortals(rootChunks),
     rootFlags: root.flags,
     // BGRA, as the vertex colours.
     ambient: mohd ? mohd.readUInt32LE(MOHD_AMBIENT) : 0,
@@ -200,10 +266,12 @@ export function loadWmo(rootName, readFile) {
 // first group that lists the prop, the floor under the prop's origin (its
 // vertex colour as the client keeps it, doubled, plus the building's
 // ambient if it adds one), and how far a transition face there leans it to
-// the outdoor light (its alpha). [r, g, b, share], 0 to 1; 'outdoor' for a
-// prop in an exterior or outdoor-lit group; null if no group lists it or
-// the ray misses.
+// the outdoor light (its alpha). The floor is the highest of the group's
+// floor faces (floorFaces) the ray meets. [r, g, b, share], 0 to 1;
+// 'outdoor' for a prop in an exterior or outdoor-lit group; null if no
+// group lists it or the ray misses.
 const propGroups = new WeakMap();
+const floorFacesOf = new WeakMap();
 
 export function propFloor(wmo, doodadIndex, [x, y, z]) {
   let groups = propGroups.get(wmo);
@@ -220,7 +288,12 @@ export function propFloor(wmo, doodadIndex, [x, y, z]) {
   const top = z + PROP_FLOOR_ABOVE;
   const bottom = z - PROP_FLOOR_BELOW;
   let best = null;
-  for (let triangle = 0; triangle * 3 + 2 < indices.length; triangle += 1) {
+  let faces = floorFacesOf.get(group);
+  if (!faces) {
+    const { floor, transition } = floorFaces(group);
+    floorFacesOf.set(group, faces = [...floor, ...transition]);
+  }
+  for (const triangle of faces) {
     const a = indices[triangle * 3];
     const b = indices[triangle * 3 + 1];
     const c = indices[triangle * 3 + 2];
