@@ -527,40 +527,6 @@ test('maps depth bytes to the ramp: river water deep at 42, ocean and WMO water 
   assert.equal(liquidTexCoords(surface, { material: 2, scroll: [0, 0.1] }).ramp, null);
 });
 
-test("takes water and ocean colours from the map's light at noon, else the default light", async () => {
-  const { mapLiquidColours } = await load('liquids.mjs');
-  const record = (fields) => ({ uint: (field) => fields[field] ?? 0, float: (field) => fields[field] ?? 0 });
-  const lights = {
-    *records() {
-      yield record([1, 0, 0, 0, 0, 0, 0, 2]);
-      yield record([7, 547, 0, 0, 0, 0, 0, 3]);
-    },
-  };
-  // A band keyed at midnight and 1440 (noon) with two colours.
-  const band = (midnight, noon) => {
-    const fields = new Array(34).fill(0);
-    fields[1] = 2;
-    fields[3] = 1440;
-    fields[18] = midnight;
-    fields[19] = noon;
-    return record(fields);
-  };
-  const bands = new Map([
-    [3 * 18 - 17 + 14, band(0, 0xFF0000)],
-    [3 * 18 - 17 + 15, band(0, 0x000000)],
-    [3 * 18 - 17 + 16, band(0, 0x00FF00)],
-    [3 * 18 - 17 + 17, band(0, 0x0000FF)],
-    [2 * 18 - 17 + 16, band(0, 0x202020)],
-    [2 * 18 - 17 + 17, band(0, 0x202020)],
-  ]);
-  const own = mapLiquidColours(lights, bands, 547);
-  assert.deepEqual(own.ocean, [0.5, 0, 0]);
-  assert.deepEqual(own.water, [0, 0.5, 0.5]);
-  const fallback = mapLiquidColours(lights, bands, 409);
-  fallback.water.forEach((value) => near(value, 0x20 / 255, 'default water'));
-  assert.equal(fallback.ocean, null);
-});
-
 // An MCNK at `position` with flat ground at `ground` and an optional MCLQ.
 function mcnkWithLiquid({ position, ground, flags = 0, mclq = null }) {
   const header = Buffer.alloc(128);

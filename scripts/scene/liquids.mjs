@@ -316,63 +316,6 @@ export function liquidTexCoords(surface, info, { depthInfo = info, interior = fa
   return { ripple, ramp };
 }
 
-// Water's colour. The client paints water and ocean in the colours of the
-// map's light (the liquid textures are dark ripples, mostly alpha). Light.dbc:
-// map at field 1, position at 2-4, the clear-weather LightParams at 7.
-// LightIntBand: 18 bands per LightParams (ID params × 18 − 17 + band), each
-// with up to 16 times (half-minutes, 1440 is noon) and BGRA colours.
-const LIGHT_MAP = 1;
-const LIGHT_POSITION = 2;
-const LIGHT_PARAMS = 7;
-const DEFAULT_LIGHT = 1;
-const BANDS_PER_PARAMS = 18;
-const BAND_OCEAN_CLOSE = 14;
-const BAND_RIVER_CLOSE = 16;
-const NOON = 1440;
-
-function bandColourAt(band, time) {
-  const count = Math.min(16, band.uint(1));
-  if (!count) return null;
-  const rgb = (index) => {
-    const value = band.uint(18 + index);
-    return [(value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF].map((channel) => channel / 255);
-  };
-  let index = 0;
-  while (index < count - 1 && band.uint(2 + index + 1) <= time) index += 1;
-  if (index === count - 1) return rgb(index);
-  const from = band.uint(2 + index);
-  const to = band.uint(2 + index + 1);
-  const t = to > from ? Math.min(1, Math.max(0, (time - from) / (to - from))) : 0;
-  const a = rgb(index);
-  const b = rgb(index + 1);
-  return a.map((value, channel) => value + (b[channel] - value) * t);
-}
-
-// The map's water and ocean colours at noon (sRGB, 0-1): the map's own light
-// (its global one at the origin if it has several), else the default light.
-// Close and far colours are averaged.
-export function mapLiquidColours(lights, bandsById, mapId) {
-  let light = null;
-  for (const record of lights.records()) {
-    if (record.uint(LIGHT_MAP) !== mapId) continue;
-    const atOrigin = [0, 1, 2].every((axis) => record.float(LIGHT_POSITION + axis) === 0);
-    if (!light || atOrigin) light = record;
-    if (atOrigin) break;
-  }
-  light ??= [...lights.records()].find((record) => record.uint(0) === DEFAULT_LIGHT) ?? null;
-  if (!light) return null;
-  const params = light.uint(LIGHT_PARAMS);
-  const colour = (closeBand) => {
-    const close = bandsById.get(params * BANDS_PER_PARAMS - 17 + closeBand);
-    const far = bandsById.get(params * BANDS_PER_PARAMS - 17 + closeBand + 1);
-    const a = close && bandColourAt(close, NOON);
-    const b = far && bandColourAt(far, NOON);
-    if (!a || !b) return a ?? b ?? null;
-    return a.map((value, channel) => (value + b[channel]) / 2);
-  };
-  return { water: colour(BAND_RIVER_CLOSE), ocean: colour(BAND_OCEAN_CLOSE) };
-}
-
 // Terrain liquids. A chunk's liquid is an 8 × 8 grid of tiles, columns
 // running east (server −Y) and rows south (server −X) from the chunk's
 // corner, like its ground.

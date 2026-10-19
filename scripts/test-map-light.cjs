@@ -351,3 +351,59 @@ test('finds the shadow texel under a point as the client does, by its tile\'s co
   assert.equal(byChunk.isShadowed(1000 - chunk - 2.5 * texel, 2000 - chunk - 4.5 * texel), false);
   assert.equal(byChunk.isShadowed(999, 1999), false, 'a chunk without shadow');
 });
+
+test("blends water's colours and alphas across area lights as the light's own colours", () => {
+  const water = (color, alpha) => ({
+    oceanShallow: [[0, color]], oceanDeep: [[0, color]], riverShallow: [[0, color]], riverDeep: [[0, color]], sunCloud: [[0, color]],
+    alphas: [alpha, 1, alpha, 1],
+  });
+  const map = {
+    mapId: 1,
+    lights: [
+      { id: 1, defaultLight: true, position: null, inner: 0, outer: 0, direct: [], ambient: [], water: water(0x000000, 0.5) },
+      { id: 2, defaultLight: false, position: [0, 0, 0], inner: 10, outer: 30, direct: [], ambient: [], water: water(0xff0000, 0.75) },
+    ],
+  };
+  // Halfway through the area light's falloff: half of each.
+  const half = plain(light.lightAt(map, [20, 0, 0], 0).water);
+  near(half.riverDeep[0], 0.5, 'river deep red');
+  near(half.oceanShallow[0], 0.5, 'ocean shallow red');
+  near(half.sunCloud[0], 0.5, 'sun on clouds red');
+  near(half.alphas[0], 0.625, 'water shallow alpha');
+  near(half.alphas[1], 1, 'water deep alpha');
+  assert.deepEqual(plain(light.lightAt(map, [100, 0, 0], 0).water.alphas), [0.5, 1, 0.5, 1]);
+  // Light files from before water's colours have none.
+  assert.equal(light.lightAt({ mapId: 1, lights: [{ ...map.lights[0], water: undefined }] }, [0, 0, 0], 0).water, undefined);
+});
+
+const liquids = loadModule('../renderer/scripts/utils/liquid-light.ts');
+
+test("builds water's depth ramps as the client does: 64 rows from shallow to deep, WMO water's white half, the ocean's darker last row", () => {
+  const water = {
+    oceanShallow: rgb(0x204060), oceanDeep: rgb(0x000000), riverShallow: rgb(0x000000), riverDeep: rgb(0x40ff80), sunCloud: [0, 0, 0],
+    alphas: [0.5, 1, 0.75, 1],
+  };
+  const texel = (texels, row, column) => [...texels.slice((row * 8 + column) * 4, (row * 8 + column) * 4 + 4)];
+  const river = liquids.waterRampTexels('river', water);
+  assert.deepEqual(texel(river, 0, 0), [0, 0, 0, 128]);
+  // Each row a 64th of the way; the last stops a step short of the deep.
+  assert.deepEqual(texel(river, 32, 7), [32, 127, 64, 191]);
+  assert.deepEqual(texel(river, 63, 0), [63, 251, 126, 253]);
+  const ocean = liquids.waterRampTexels('ocean', water);
+  assert.deepEqual(texel(ocean, 0, 3), [32, 64, 96, 191]);
+  assert.deepEqual(texel(ocean, 62, 0), [1, 2, 3, 253]);
+  // The last row is a tenth darker, and opaque.
+  assert.deepEqual(texel(ocean, 63, 0), [0, 1, 1, 255]);
+  const wmo = liquids.waterRampTexels('wmo', water);
+  assert.deepEqual(texel(wmo, 10, 3), [64, 255, 128, 147]);
+  assert.deepEqual(texel(wmo, 10, 4), [255, 255, 255, 147]);
+});
+
+test("picks an animated sheet's frame as the client does: 30 frames in 1250 ms", () => {
+  assert.equal(liquids.liquidFrameIndex(0, 1250, 30), 0);
+  assert.equal(liquids.liquidFrameIndex(41, 1250, 30), 0);
+  assert.equal(liquids.liquidFrameIndex(42, 1250, 30), 1);
+  assert.equal(liquids.liquidFrameIndex(1249, 1250, 30), 29);
+  assert.equal(liquids.liquidFrameIndex(1250 * 7 + 625, 1250, 30), 15);
+  assert.equal(liquids.liquidFrameIndex(500, 1250, 0), 0);
+});

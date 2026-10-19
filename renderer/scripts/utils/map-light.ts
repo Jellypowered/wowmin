@@ -10,6 +10,18 @@ import type { Point3 } from './spell-events';
 // 0xRRGGBB].
 export type LightKeys = Array<[number, number]>;
 
+// A light's water: its colours in the shallows and the deep, ocean's and
+// river's, the sun's colour on clouds (water's highlight), and its alphas:
+// water shallow, water deep, ocean shallow, ocean deep.
+export interface WaterKeys {
+  oceanShallow: LightKeys;
+  oceanDeep: LightKeys;
+  riverShallow: LightKeys;
+  riverDeep: LightKeys;
+  sunCloud: LightKeys;
+  alphas: [number, number, number, number];
+}
+
 export interface MapLight {
   id: number;
   defaultLight: boolean;
@@ -20,6 +32,8 @@ export interface MapLight {
   outer: number;
   direct: LightKeys;
   ambient: LightKeys;
+  // Light files from before water's colours have none.
+  water?: WaterKeys;
 }
 
 // A prop's point light (a torch's, a brazier's): server coordinates, its
@@ -67,13 +81,33 @@ export async function fetchMapLights(mapId: number): Promise<MapLights | null> {
   }
 }
 
-// The direct (sun) and ambient colours at a point, 0 to 1 (sRGB).
+// Water's colours and alphas at a time (WaterKeys').
+export interface WaterColors {
+  oceanShallow: Rgb;
+  oceanDeep: Rgb;
+  riverShallow: Rgb;
+  riverDeep: Rgb;
+  sunCloud: Rgb;
+  alphas: [number, number, number, number];
+}
+
+// The direct (sun) and ambient colours at a point, 0 to 1 (sRGB), and
+// water's where the light file has them.
 export interface LightColors {
   direct: Rgb;
   ambient: Rgb;
+  water?: WaterColors;
+}
+
+const WATER_BANDS = ['oceanShallow', 'oceanDeep', 'riverShallow', 'riverDeep', 'sunCloud'] as const;
+
+function waterColorsAt(water: WaterKeys, time: number): WaterColors {
+  const colors = Object.fromEntries(WATER_BANDS.map((band) => [band, keyColor(water[band], time)])) as Omit<WaterColors, 'alphas'>;
+  return { ...colors, alphas: [...water.alphas] };
 }
 
 export const HALF_MINUTES_PER_DAY = 2880;
+export const NOON = HALF_MINUTES_PER_DAY / 2;
 
 // The time of day in the client's units (half-minutes from midnight).
 export function timeOfDay(date: Date): number {
@@ -122,11 +156,12 @@ export function nearestObjectLights(objects: readonly ObjectLight[], point: Poin
 
 // The map's light at a point and time, as the client mixes it: from the
 // default light's colours, each area light that reaches the point mixed over
-// them by its weight, the farthest first.
+// them by its weight, the farthest first; water's colours and alphas alike.
 export function lightAt(map: MapLights, point: Point3, time: number): LightColors {
   const fallback = map.lights.find((light) => light.defaultLight);
   const direct = fallback ? keyColor(fallback.direct, time) : [0, 0, 0] as Rgb;
   const ambient = fallback ? keyColor(fallback.ambient, time) : [0, 0, 0] as Rgb;
+  const water = fallback?.water ? waterColorsAt(fallback.water, time) : undefined;
   const reaching = map.lights.filter((light) => !light.defaultLight && light.position)
     .map((light) => ({ light, weight: lightWeight(light, point), distance: Math.hypot(
       point[0] - light.position![0], point[1] - light.position![1], point[2] - light.position![2]) }))
@@ -139,8 +174,14 @@ export function lightAt(map: MapLights, point: Point3, time: number): LightColor
       direct[channel] += (d[channel] - direct[channel]) * weight;
       ambient[channel] += (a[channel] - ambient[channel]) * weight;
     }
+    if (!water || !light.water) continue;
+    const w = waterColorsAt(light.water, time);
+    for (const band of WATER_BANDS) {
+      for (let channel = 0; channel < 3; channel += 1) water[band][channel] += (w[band][channel] - water[band][channel]) * weight;
+    }
+    for (let index = 0; index < 4; index += 1) water.alphas[index] += (w.alphas[index] - water.alphas[index]) * weight;
   }
-  return { direct, ambient };
+  return water ? { direct, ambient, water } : { direct, ambient };
 }
 
 // Every point light fades with distance (yards) by the same curve, whatever

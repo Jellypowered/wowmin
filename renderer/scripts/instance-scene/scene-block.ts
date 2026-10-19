@@ -32,7 +32,9 @@ export const CLIENT_INDOOR_OFFSET = CLIENT_SUN_OFFSET + 4;
 export const POINT_POSITION_OFFSET = CLIENT_INDOOR_OFFSET + 4;
 export const POINT_COLOR_OFFSET = POINT_POSITION_OFFSET + MAX_POINT_LIGHTS * 4;
 export const POINT_COUNT_OFFSET = POINT_COLOR_OFFSET + MAX_POINT_LIGHTS * 4;
-const SCENE_BLOCK_FLOATS = POINT_COUNT_OFFSET + 4;
+// Water's highlight: the sun's colour on clouds.
+export const WATER_SPECULAR_OFFSET = POINT_COUNT_OFFSET + 4;
+const SCENE_BLOCK_FLOATS = WATER_SPECULAR_OFFSET + 4;
 
 export const sceneBlockData = new Float32Array(SCENE_BLOCK_FLOATS);
 export const sceneBlock = new UniformsGroup().setName(SCENE_BLOCK).add(new Uniform(sceneBlockData));
@@ -56,5 +58,6 @@ layout(std140) uniform ${SCENE_BLOCK} {
   vec4 wowPointPositionPacked[${MAX_POINT_LIGHTS}];
   vec4 wowPointColorPacked[${MAX_POINT_LIGHTS}];
   vec4 wowPointCountPacked;
+  vec4 wowWaterSpecularPacked;
 };
 `;

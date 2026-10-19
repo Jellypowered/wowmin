@@ -40,8 +40,9 @@ import { type FadeSettings, type FadeVolume, getSceneFade, type IsoView, MAX_FAD
 import {
   blendLight, type BuildingBatchLight, buildingBatchLight, characterAmbientScale,
   DIRECT_SCALE_SHADOWED, type EasedLight, easeLight, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors,
-  lightAt, type MapLights, nearestObjectLights, type ObjectLight, scaleAmbient, type Rgb, sunDirection, timeOfDay, toRgb,
+  lightAt, type MapLights, nearestObjectLights, NOON, type ObjectLight, scaleAmbient, type Rgb, sunDirection, timeOfDay, toRgb,
 } from '../utils/map-light';
+import { liquidFrameIndex, NEUTRAL_WATER, type WaterRamp } from '../utils/liquid-light';
 import { ATLAS_SIZE, TerrainShadows } from '../utils/terrain-shadow';
 import { m2MaterialLight, PARTICLE_GROUND_DEPTH } from '../utils/m2-tracks';
 import { type FaceCulling, TriangleGrid } from '../utils/triangle-grid';
@@ -60,8 +61,10 @@ import {
   CLIENT_AMBIENT_OFFSET, CLIENT_DIRECT_OFFSET, CLIENT_INDOOR_OFFSET, CLIENT_SUN_OFFSET, FADE_PARAMS_OFFSET, FADE_REACH_MAX_OFFSET,
   FADE_REACH_MIN_OFFSET, FADE_VOLUME_MAX_OFFSET, FLOOR_AREA_COLOR_OFFSET, FLOOR_AREA_COUNT_OFFSET, FLOOR_AREA_OFFSET, MAX_FLOOR_AREAS,
   POINT_COLOR_OFFSET, POINT_COUNT_OFFSET, POINT_POSITION_OFFSET, SCENE_BLOCK_DECLARATION, sceneBlock, sceneBlockData,
+  WATER_SPECULAR_OFFSET,
 } from './scene-block';
 import { blendFactors } from './m2-blend';
+import { createWaterMaterial, rawFrames, WaterRamps } from './liquid-material';
 import { skyEffectLight } from './m2-effect';
 
 type WowBlend = 'opaque' | 'alphaKey' | 'alpha' | 'add' | 'mod' | 'mod2x';
@@ -71,15 +74,31 @@ interface TerrainTextures {
   alphas: Map<string, Texture>;
 }
 
+// A liquid type as the scene describes it: its material (1 water, 2 magma
+// and slime, 3 procedural water, drawn as water), water's depth ramp, the
+// frames' period (ms). Scenes exported before these say only its kind, and
+// water's colour (sRGB, 0-1).
 interface LiquidExtras {
   id: number;
-  kind: 'water' | 'ocean' | 'magma' | 'slime';
   frames: string[];
-  // Water and ocean: the map's colour for them (sRGB, 0-1).
+  material?: number;
+  ramp?: WaterRamp;
+  period?: number;
+  kind?: 'water' | 'ocean' | 'magma' | 'slime';
   color?: [number, number, number];
 }
 
-// Liquid textures animate at this many frames a second; water is see-through.
+const LIQUID_MATERIAL_MAGMA = 2;
+
+// An animated liquid material and its frames, run through every `period` ms.
+interface LiquidAnimation {
+  material: MeshBasicMaterial;
+  frames: Texture[];
+  period: number;
+}
+
+// Scenes exported before liquids carried their texture coordinates: frames
+// at this many a second, water see-through.
 const LIQUID_FPS = 15;
 const WATER_OPACITY = 0.7;
 // Water without a colour from its map: a dull blue-green.
@@ -778,7 +797,12 @@ export class InstanceSceneView {
   private readonly gameObjects: GameObjectLayer;
   private effectsShown = false;
   // Liquid materials and their animation frames, by scene URL.
-  private readonly liquids = new Map<string, Array<{ material: MeshBasicMaterial; frames: Texture[] }>>();
+  private readonly liquids = new Map<string, LiquidAnimation[]>();
+  // Water's depth ramps, coloured by the map's light.
+  private readonly waterRamps = new WaterRamps();
+  // ?specular=1 draws water's highlight, which the client leaves off by
+  // default.
+  private readonly waterSpecular = new URLSearchParams(window.location.search).get('specular') === '1';
   // What the canvas currently shows, to skip redrawing an unchanged frame.
   private lastFrameKey = '';
   // The fade and reach the scene's visible meshes were last chosen for.
@@ -1232,7 +1256,7 @@ export class InstanceSceneView {
       const root = gltf.scene;
       const terrain = await this.terrainTextures(gltf);
       const frames = await this.liquidFrames(gltf);
-      const liquids: Array<{ material: MeshBasicMaterial; frames: Texture[] }> = [];
+      const liquids = new Map<string, LiquidAnimation>();
       numberBuildingBatches(root);
       // The ground's baked shadow, by chunk (or for older scenes from each
       // tile's alpha atlas).
@@ -1256,17 +1280,16 @@ export class InstanceSceneView {
         }
         const liquid = (object.material as Material).userData?.wowLiquid as LiquidExtras | undefined;
         if (liquid) {
-          const material = this.liquidMaterial(liquid, frames);
-          if (material) {
-            object.material = material.material;
+          const animation = this.liquidMaterial(liquid, frames, object, liquids);
+          if (animation) {
+            object.material = animation.material;
             object.renderOrder = 1;
-            liquids.push(material);
             return;
           }
         }
         object.material = this.convertMaterial(object, terrain);
       });
-      if (liquids.length) this.liquids.set(url, liquids);
+      if (liquids.size) this.liquids.set(url, [...liquids.values()]);
       root.updateMatrixWorld(true);
       this.shadows.set(root, shadows);
       shadeProps(root, shadows);
@@ -1353,9 +1376,8 @@ export class InstanceSceneView {
     if (frameKey === this.lastFrameKey && !this.units.count && !this.effectsShown && !liquids?.length
       && !this.gameObjects.count) return true;
     if (liquids) {
-      for (const liquid of liquids) {
-        liquid.material.map = liquid.frames[Math.floor(performance.now() / (1000 / LIQUID_FPS)) % liquid.frames.length];
-      }
+      const now = performance.now();
+      for (const liquid of liquids) liquid.material.map = liquid.frames[liquidFrameIndex(now, liquid.period, liquid.frames.length)];
     }
     this.lastFrameKey = frameKey;
     this.lastFade = { volumes: active, fade };
@@ -1520,6 +1542,11 @@ export class InstanceSceneView {
     clientLight.direct.set(...direct, on);
     this.nearestLights = colors && this.objectLightsOn && this.mapLights?.objects
       ? nearestObjectLights(this.mapLights.objects, center, MAX_POINT_LIGHTS) : [];
+    // Water's colours: the light's now, or for the neutral look its noon's;
+    // with no light file (or one from before water's colours), constants.
+    const water = (colors ?? (this.mapLights ? lightAt(this.mapLights, center, NOON) : null))?.water ?? NEUTRAL_WATER;
+    this.waterRamps.update(water);
+    sceneBlockData.set([...water.sunCloud, this.waterSpecular ? 1 : 0], WATER_SPECULAR_OFFSET);
     const colorKey = colors
       ? [...colors.ambient, ...colors.direct, this.sunTowards.x, this.sunTowards.y].map((value) => value.toFixed(3)).join(',') : 'neutral';
     return `${colorKey}|${this.nearestLights.map((light) => light.position.join(',')).join(';')}`;
@@ -1555,27 +1582,52 @@ export class InstanceSceneView {
     return frames;
   }
 
-  // A liquid's material: its first frame, unlit; water and ocean see-through
-  // in their map's colour, magma and slime solid (they glow).
-  private liquidMaterial(liquid: LiquidExtras, frames: Map<string, Texture>):
-    { material: MeshBasicMaterial; frames: Texture[] } | null {
+  // A liquid's material and its frames (shared by the scene's meshes of
+  // the same type and colour, in `made`): water as the client draws it
+  // (createWaterMaterial), interior WMO water by its group's colour; for
+  // scenes exported before water carried its ramp, and magma and slime, the
+  // first frame unlit, water and ocean see-through in their map's colour,
+  // magma and slime solid (they glow).
+  private liquidMaterial(liquid: LiquidExtras, frames: Map<string, Texture>, mesh: Mesh, made: Map<string, LiquidAnimation>):
+    LiquidAnimation | null {
     const textures = liquid.frames.map((name) => frames.get(name)).filter((texture): texture is Texture => Boolean(texture));
     if (!textures.length) return null;
-    const see = liquid.kind === 'water' || liquid.kind === 'ocean';
-    const material = new MeshBasicMaterial({
-      map: textures[0], side: DoubleSide, forceSinglePass: true, transparent: see, opacity: see ? WATER_OPACITY : 1, depthWrite: !see,
-    });
-    if (see) {
-      material.color.setRGB(...(liquid.color ?? WATER_COLOR), SRGBColorSpace);
-      material.onBeforeCompile = (shader) => {
-        injectPartyFade(shader);
-        shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>', WATER_FRAGMENT);
+    const interior = Boolean(mesh.userData.interior);
+    const color = mesh.userData.color as number[] | undefined;
+    const water = liquid.material !== undefined && liquid.material !== LIQUID_MATERIAL_MAGMA && liquid.ramp
+      && Boolean(mesh.geometry.getAttribute('uv1'));
+    const key = water ? `${liquid.id}|${interior}|${color?.join(',') ?? ''}` : `${liquid.id}`;
+    const known = made.get(key);
+    if (known) return known;
+    let animation: LiquidAnimation;
+    if (water) {
+      animation = {
+        material: this.withFade(createWaterMaterial({
+          frame: rawFrames(textures)[0], ramp: this.waterRamps.textures[liquid.ramp!], color: color ?? null, interior,
+          specular: this.waterSpecular, partyFade: injectPartyFade,
+        })),
+        frames: textures,
+        period: liquid.period ?? textures.length * (1000 / LIQUID_FPS),
       };
-      material.customProgramCacheKey = () => 'wow-water';
     } else {
-      material.onBeforeCompile = injectPartyFade;
+      const see = liquid.material !== undefined ? liquid.material !== LIQUID_MATERIAL_MAGMA : liquid.kind === 'water' || liquid.kind === 'ocean';
+      const material = new MeshBasicMaterial({
+        map: textures[0], side: DoubleSide, forceSinglePass: true, transparent: see, opacity: see ? WATER_OPACITY : 1, depthWrite: !see,
+      });
+      if (see) {
+        material.color.setRGB(...(liquid.color ?? WATER_COLOR), SRGBColorSpace);
+        material.onBeforeCompile = (shader) => {
+          injectPartyFade(shader);
+          shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>', WATER_FRAGMENT);
+        };
+        material.customProgramCacheKey = () => 'wow-water-old';
+      } else {
+        material.onBeforeCompile = injectPartyFade;
+      }
+      animation = { material: this.withFade(material), frames: textures, period: textures.length * (1000 / LIQUID_FPS) };
     }
-    return { material: this.withFade(material), frames: textures };
+    made.set(key, animation);
+    return animation;
   }
 
   // The map's ground textures as one array, and each tile's alpha atlas by

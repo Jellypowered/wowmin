@@ -21,7 +21,7 @@ import { ATLAS_SIZE, buildTerrainTile, chunkInArea, playArea, pointInArea, WDT_F
 import { readDbc } from './dbc.mjs';
 import {
   adtLiquidSurfaces, drawnWmoLiquidType, firstTileType, isInteriorLiquid, liquidSurface, liquidTexCoords,
-  liquidTypeInfo, mapLiquidColours, wmoLiquidType,
+  liquidTypeInfo, wmoLiquidType,
 } from './liquids.mjs';
 import { encodeTexture } from './textures.mjs';
 import {
@@ -279,9 +279,8 @@ class SceneBuilder {
   // A liquid type's material, named liquid-<id>, with its animation frames
   // as materials liquid-frame-<n>, shared by types with the same texture.
   // Its extras say how the client draws it: its material (water, magma),
-  // water's depth ramp, magma's scroll, and the frames' period (ms); and,
-  // for renderers before those, its kind and water's colour. Null if
-  // unknown.
+  // water's depth ramp, magma's scroll, and the frames' period (ms). Null
+  // if unknown.
   liquidMaterial(typeId) {
     this.liquidMaterials ??= new Map();
     if (this.liquidMaterials.has(typeId)) return this.liquidMaterials.get(typeId);
@@ -307,30 +306,18 @@ class SceneBuilder {
         return frameName ? [frameName] : [];
       });
       if (frames.length) {
-        const color = info.kind === 'water' || info.kind === 'ocean' ? this.liquidColours()?.[info.kind] : null;
         material = this.document.createMaterial(`liquid-${typeId}`).setDoubleSided(true)
           .setExtras({
             wowLiquid: {
               id: typeId, material: info.material, frames, period: info.period,
               ...(info.ramp ? { ramp: info.ramp } : {}),
               ...(info.scroll ? { scroll: info.scroll } : {}),
-              kind: info.kind, ...(color && { color }),
             },
           });
       }
     }
     this.liquidMaterials.set(typeId, material);
     return material;
-  }
-
-  // The map's water and ocean colours, from its light; null if unknown.
-  liquidColours() {
-    if (this.waterColours === undefined) {
-      const lights = this.readFile('DBFilesClient\\Light.dbc');
-      const bands = this.readFile('DBFilesClient\\LightIntBand.dbc');
-      this.waterColours = lights && bands ? mapLiquidColours(readDbc(lights), readDbc(bands).byId(), this.mapId) : null;
-    }
-    return this.waterColours;
   }
 
   // A liquid surface (positions, indices) as a one-primitive mesh, with its
