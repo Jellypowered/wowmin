@@ -6,31 +6,37 @@ import path from 'node:path';
 
 import { Document, NodeIO, TextureInfo } from '@gltf-transform/core';
 
-import { IDENTITY_ROTATION, M2_BLEND, M2_MATERIAL_FLAG_TWO_SIDED, M2_TEXTURE_FLAG_WRAP_S, M2_TEXTURE_FLAG_WRAP_T } from './m2.mjs';
+import {
+  IDENTITY_ROTATION, M2_BLEND, M2_MATERIAL_FLAG_TWO_SIDED, M2_TEXTURE_FLAG_WRAP_S, M2_TEXTURE_FLAG_WRAP_T, RELEASE_EVENTS,
+} from './m2.mjs';
 import { loadSkinnedM2 } from './m2-skinned.mjs';
 import {
-  CharacterData, creatureWeaponAttachments, loadCharacter, readM2Attachments, SLOT, VISIBLE_SLOTS,
+  CharacterData, creatureWeaponAttachments, loadCharacter, readM2Attachments, readM2Events, SLOT, VISIBLE_SLOTS,
 } from './character.mjs';
 import { encodeTexture } from './textures.mjs';
 import { readDbc } from './dbc.mjs';
 
 const TEXTURE_TYPE_HARDCODED = 0;
 const TEXTURE_TYPE_MONSTER_1 = 11;
-// Points spell effects are drawn at, by M2 attachment ID; the first one the
-// model has wins. 22/21 are the spell hands, 1/2 the hands, 15 the chest, 11
-// the helm (20 the head), 17 the mouth (breath), and 18 the name point above
-// the head. 0 is a mount's saddle, where its rider sits (a character's shield
-// otherwise; only mounts' is used).
-const EFFECT_POINTS = {
-  handRight: [22, 1], handLeft: [21, 2], chest: [15], head: [11, 20], breath: [17, 11, 20], overhead: [18, 11], mount: [0],
-};
+// CreatureModelData's spell effect scales, world and attached.
+const MODEL_WORLD_EFFECT_SCALE = 23;
+const MODEL_ATTACHED_EFFECT_SCALE = 24;
 
-// The effect points a skeleton has, from its attachment table.
-export function effectPoints(skeletonAttachments) {
-  return Object.entries(EFFECT_POINTS).flatMap(([role, ids]) => {
-    const point = ids.map((id) => skeletonAttachments.find((candidate) => candidate.id === id)).find(Boolean);
-    return point ? [{ role, bone: point.bone, position: point.position }] : [];
-  });
+// Points spell effects are drawn at: every attachment the skeleton has, by
+// M2 attachment ID (the renderer picks the client's for each kit slot and
+// missile), and the events a spell is released at (RELEASE_EVENTS), the
+// first of each ID only.
+export function effectPoints(skeletonAttachments, skeletonEvents = []) {
+  const attachments = new Map();
+  for (const { id, bone, position } of skeletonAttachments) if (!attachments.has(id)) attachments.set(id, { attachment: id, bone, position });
+  const events = new Map();
+  for (const { name, bone, position } of skeletonEvents) if (!events.has(name)) events.set(name, { event: name, bone, position });
+  return [...attachments.values(), ...events.values()];
+}
+
+// A model file's effect points.
+function modelEffectPoints(buffer) {
+  return effectPoints(readM2Attachments(buffer), readM2Events(buffer, RELEASE_EVENTS));
 }
 
 // Strictly increasing key times in seconds, dropping repeated times.
@@ -59,7 +65,9 @@ function animatedChannels(clips, boneCount) {
 
 // `alpha` (0 to 1) is how opaque the display draws the model (a
 // Shadowfiend is half see-through); it goes on the root for the renderer.
-export function buildUnitDocument(model, { name, textureFor, scale = 1, alpha = 1, textureMax = 256, attachments = [], points = [] }) {
+export function buildUnitDocument(model, {
+  name, textureFor, scale = 1, alpha = 1, textureMax = 256, attachments = [], points = [], effectScales = null,
+}) {
   const document = new Document();
   const buffer = document.createBuffer();
   const accessor = (type, array, normalized = false) =>
@@ -193,10 +201,17 @@ export function buildUnitDocument(model, { name, textureFor, scale = 1, alpha = 
         .setIndices(accessor('SCALAR', Uint16Array.from(slice)))
         .setMaterial(material));
     }
-    joint.addChild(document.createNode(`${name}-${attachment.role}-${attachment.sheath ?? 'worn'}`)
+    const item = document.createNode(`${name}-${attachment.role}-${attachment.sheath ?? 'worn'}`)
       .setTranslation(attachment.position.map((value, axis) => value - pivot[axis]))
       .setMesh(itemMesh)
-      .setExtras({ wowItem: attachment.role, wowSheath: attachment.sheath ?? null }));
+      .setExtras({ wowItem: attachment.role, wowSheath: attachment.sheath ?? null });
+    // A drawn weapon's blade, bottom and top, for a swing's trail.
+    if (attachment.trail && attachment.sheath === 'drawn') {
+      for (const end of ['bottom', 'top']) {
+        item.addChild(document.createNode(`${name}-${attachment.role}-${end}`).setTranslation(attachment.trail[end]).setExtras({ wowTrail: end }));
+      }
+    }
+    joint.addChild(item);
   });
 
   // Empty nodes where spell effects go, moving with their bone.
@@ -204,18 +219,21 @@ export function buildUnitDocument(model, { name, textureFor, scale = 1, alpha = 
     const joint = joints[point.bone];
     if (!joint) continue;
     const pivot = model.bones[point.bone].pivot;
-    joint.addChild(document.createNode(`${name}-${point.role}`)
+    const attached = point.attachment !== undefined;
+    joint.addChild(document.createNode(attached ? `${name}-attachment${point.attachment}` : `${name}-event${point.event}`)
       .setTranslation(point.position.map((value, axis) => value - pivot[axis]))
-      .setExtras({ wowPoint: point.role }));
+      .setExtras(attached ? { wowAttachment: point.attachment } : { wowEvent: point.event }));
   }
 
   const channels = animatedChannels(model.clips, model.bones.length);
   const durations = {};
   const speeds = {};
+  const releases = {};
   for (const clip of model.clips) {
     const animation = document.createAnimation(clip.name);
     durations[clip.name] = clip.duration / 1000;
     if (clip.moveSpeed > 0) speeds[clip.name] = clip.moveSpeed;
+    if (clip.releaseMs !== null && clip.releaseMs !== undefined) releases[clip.name] = clip.releaseMs / 1000;
     channels.forEach((paths, boneIndex) => {
       const bone = model.bones[boneIndex];
       const parent = model.bones[bone.parentIndex];
@@ -240,8 +258,13 @@ export function buildUnitDocument(model, { name, textureFor, scale = 1, alpha = 
     });
   }
   // Durations restore each clip's full length (the last key can come early);
-  // speeds are the yards per second a movement clip was made for.
-  root.setExtras({ wowClipDurations: durations, wowClipSpeeds: speeds, ...(alpha < 1 ? { wowModelAlpha: alpha } : {}) });
+  // speeds are the yards per second a movement clip was made for; releases
+  // are when (seconds in) a cast clip lets a spell's missile go.
+  // Effect scales size spell effects on it as the client does.
+  root.setExtras({
+    wowClipDurations: durations, wowClipSpeeds: speeds, wowClipReleases: releases, ...(alpha < 1 ? { wowModelAlpha: alpha } : {}),
+    ...(effectScales ? { wowEffectScales: effectScales } : {}),
+  });
   return document;
 }
 
@@ -262,6 +285,23 @@ export class UnitData {
       this.tables.set(name, buffer ? readDbc(buffer).byId() : new Map());
     }
     return this.tables.get(name);
+  }
+
+  // How the client sizes spell effects on a model (CreatureModelData's
+  // world and attached effect scales, by model file; 1 without a row), and
+  // its footprint: 0.3 times the smaller of its bounding box's width and
+  // depth (model units; `box` is min x, y, z, max x, y, z), a world effect
+  // growing with it past 1.
+  modelEffectScales(modelName, box) {
+    if (!this.modelDataByFile) {
+      this.modelDataByFile = new Map();
+      for (const row of this.table('CreatureModelData').values()) {
+        this.modelDataByFile.set(row.string(2).replace(/\.md[xl]$/i, '.m2').toLowerCase(), row);
+      }
+    }
+    const row = this.modelDataByFile.get(modelName.toLowerCase());
+    const footprint = box ? 0.3 * Math.min(box[3] - box[0], box[4] - box[1]) : 0;
+    return { world: row?.float(MODEL_WORLD_EFFECT_SCALE) || 1, attached: row?.float(MODEL_ATTACHED_EFFECT_SCALE) || 1, footprint };
   }
 
   // CreatureDisplayInfo → model, texture variations, scale, and opacity
@@ -306,9 +346,11 @@ async function buildCreatureGlb(unitData, displayId, { weapons = {} } = {}) {
   };
   unitData.characters ??= new CharacterData(unitData);
   const attachments = creatureWeaponAttachments(unitData.characters, display.modelName, weapons);
-  const points = effectPoints(readM2Attachments(unitData.readFile(display.modelName)));
+  const modelBuffer = unitData.readFile(display.modelName);
+  const points = modelEffectPoints(modelBuffer);
   const document = buildUnitDocument(model, {
     name: `creature-${displayId}`, textureFor, scale: display.scale, alpha: display.alpha, attachments, points,
+    effectScales: unitData.modelEffectScales(display.modelName, model.boundingBox),
   });
   return writeGlb(document);
 }
@@ -346,9 +388,10 @@ async function buildCharacterGlb(unitData, look) {
   unitData.characters ??= new CharacterData(unitData);
   const character = loadCharacter(unitData.characters, look);
   if (!character) return null;
+  const modelBuffer = unitData.characters.readFile(character.modelName);
   const document = buildUnitDocument(character.model, {
     name: 'character', textureFor: character.textureFor, textureMax: 256, attachments: character.attachments,
-    points: effectPoints(readM2Attachments(unitData.characters.readFile(character.modelName))),
+    points: modelEffectPoints(modelBuffer), effectScales: unitData.modelEffectScales(character.modelName, character.model.boundingBox),
   });
   return writeGlb(document);
 }

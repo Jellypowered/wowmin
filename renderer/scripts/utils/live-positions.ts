@@ -326,15 +326,16 @@ export class LiveAppearanceStore {
 export const LIVE_AURA_STALE_MS = 12_000;
 
 // The auras with spell art each unit wears, by unit key ('p<guid>' or
-// 'c<guid>'), from the module's unit aura lists.
+// 'c<guid>'), from the module's unit aura lists. A list that empties stays,
+// empty, until it goes stale, so its last aura is seen to end (its state
+// done art plays) rather than to drop out of sight.
 export class LiveAuraStore {
   private readonly auras = new Map<string, { at: number; spellIds: number[] }>();
 
   push(update: StreamUnitAuraUpdate, receivedAt: number): void {
     for (const unit of update.units) {
       const key = `${unit.creature ? 'c' : 'p'}${unit.guid}`;
-      if (unit.spellIds.length) this.auras.set(key, { at: receivedAt, spellIds: unit.spellIds });
-      else this.auras.delete(key);
+      this.auras.set(key, { at: receivedAt, spellIds: unit.spellIds });
     }
   }
 

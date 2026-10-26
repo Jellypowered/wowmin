@@ -16,6 +16,17 @@ export const IDENTITY_ROTATION = [0, 0, 0, 1];
 const M2_TEXTURE_COMPONENT_HARDCODED = 0;
 const M2_NO_INDEX = 0xFFFF;
 const M2_FIXED16_ONE = 0x7FFF;
+// The header's events (sounds, footsteps, a spell's release), each 36 bytes:
+// four-letter ID, data, bone, unused, position, then its track:
+// interpolation, global sequence, and per sequence the times it fires.
+const M2_EVENTS_OFFSET = 256;
+const M2_EVENT_SIZE = 36;
+export const M2_EVENT_BONE = 8;
+export const M2_EVENT_POSITION = 12;
+export const M2_EVENT_TRACK = 24;
+// The events a spell's missile is released at: $CSL, $CSR, $CST (left hand,
+// right hand, a thrown weapon) and $BWR (a bow or gun).
+export const RELEASE_EVENTS = ['$CSL', '$CSR', '$CST', '$BWR'];
 
 // Static pose: the first keyframe of the first animation that has one.
 export function firstTrackValue(track) {
@@ -37,6 +48,24 @@ export function staticBatchColor(model, colorIndex, textureWeightIndex) {
     tint: rgb ? [rgb[0], rgb[1], rgb[2]] : [1, 1, 1],
     opacity: Math.min(1, Math.max(0, opacity)),
   };
+}
+
+// Where the model's events with these IDs sit in the file: { name, base },
+// in header order; none if the event array runs past the file. Not exposed
+// by @wowserhq/format, so read from the header directly.
+export function findM2Events(bytes, names) {
+  if (!bytes || bytes.length < M2_EVENTS_OFFSET + 8) return [];
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const count = view.getUint32(M2_EVENTS_OFFSET, true);
+  const offset = view.getUint32(M2_EVENTS_OFFSET + 4, true);
+  if (offset + count * M2_EVENT_SIZE > bytes.length) return [];
+  const events = [];
+  for (let index = 0; index < count; index += 1) {
+    const base = offset + index * M2_EVENT_SIZE;
+    const name = String.fromCharCode(...bytes.subarray(base, base + 4));
+    if (names.includes(name)) events.push({ name, base });
+  }
+  return events;
 }
 
 export function skinFileName(modelName) {

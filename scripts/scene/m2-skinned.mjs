@@ -5,7 +5,9 @@
 import { M2Model, M2SkinProfile } from '@wowserhq/format';
 
 import { asBytes } from './chunks.mjs';
-import { expandSkinVertices, M2_VERTEX_SIZE, skinFileName, staticBatchColor } from './m2.mjs';
+import {
+  expandSkinVertices, findM2Events, M2_EVENT_TRACK, M2_VERTEX_SIZE, RELEASE_EVENTS, skinFileName, staticBatchColor,
+} from './m2.mjs';
 
 const M2_NO_LOOP = 0xFFFF;
 // Set on sequences whose keyframes are inside the .m2 rather than a .anim file.
@@ -23,6 +25,30 @@ const M2_BONE_TRACKS = { translationTrack: 16, rotationTrack: 36, scaleTrack: 56
 const M2_TRACK_TIMES = 4;
 const M2_TRACK_KEYS = 12;
 const M2_TRACK_INTERPOLATION_NONE = 0;
+
+// When in a sequence (ms) the model first releases a spell's missile, or
+// null if it never does. An external sequence's times are in its .anim
+// file (`animBytes`); the per-sequence entries pointing at them stay in the
+// .m2.
+export function releaseTimeMs(modelBytes, animBytes, sequenceIndex) {
+  const model = new DataView(modelBytes.buffer, modelBytes.byteOffset, modelBytes.byteLength);
+  const source = animBytes ? new DataView(animBytes.buffer, animBytes.byteOffset, animBytes.byteLength) : model;
+  let first = null;
+  for (const { base } of findM2Events(modelBytes, RELEASE_EVENTS)) {
+    const track = base + M2_EVENT_TRACK;
+    if (model.getInt16(track + 2, true) !== -1) continue;
+    const sequences = model.getUint32(track + 4, true);
+    if (sequenceIndex >= sequences) continue;
+    const entry = model.getUint32(track + 8, true) + sequenceIndex * 8;
+    if (entry + 8 > model.byteLength) continue;
+    const times = model.getUint32(entry, true);
+    const at = model.getUint32(entry + 4, true);
+    if (!times || at + 4 > source.byteLength) continue;
+    const time = source.getUint32(at, true);
+    if (first === null || time < first) first = time;
+  }
+  return first;
+}
 
 // AnimationData.dbc IDs of the animations exported, by the name the renderer
 // asks for.
@@ -61,6 +87,25 @@ export const UNIT_ANIMATIONS = {
   UseStandingLoop: 123,
   ChannelCastDirected: 124,
   ChannelCastOmni: 125,
+  // More that kits name: strikes, shouts and roars, falls, spins, and
+  // creatures' own casts.
+  Special2H: 58,
+  EmoteEat: 61,
+  EmoteCheer: 68,
+  EmoteRoar: 74,
+  EmoteShout: 81,
+  HoldThrown: 111,
+  KneelLoop: 115,
+  Knockdown: 121,
+  Whirlwind: 126,
+  UseStandingStart: 128,
+  UseStandingEnd: 129,
+  CreatureSpecial: 130,
+  CustomSpell01: 213,
+  CustomSpell02: 214,
+  CustomSpell03: 215,
+  CustomSpell04: 216,
+  Cower: 225,
   // A rider's seated pose.
   Mount: 91,
   // A flying mount in the air: moving, and staying in place.
@@ -228,13 +273,17 @@ export function loadSkinnedM2(modelName, readFile, { showSection = () => true, a
   const clips = selectSequences(model.sequences, animations, { external: true }).flatMap((sequence) => {
     const parentPivot = (bone) => model.bones[bone.parentIndex]?.pivot;
     if (!sequence.external) {
-      return [{ ...clipInfo(sequence), bones: model.bones.map((bone) => boneChannels(bone, parentPivot(bone), sequence.index)) }];
+      return [{
+        ...clipInfo(sequence), releaseMs: releaseTimeMs(modelBytes, null, sequence.index),
+        bones: model.bones.map((bone) => boneChannels(bone, parentPivot(bone), sequence.index)),
+      }];
     }
     const animBuffer = readFile(animFileName(modelName, model.sequences[sequence.index]));
     if (!animBuffer) return [];
     const animBytes = asBytes(animBuffer);
     return [{
       ...clipInfo(sequence),
+      releaseMs: releaseTimeMs(modelBytes, animBytes, sequence.index),
       bones: model.bones.map((bone, boneIndex) => boneChannelsFrom(bone, parentPivot(bone), (track) => {
         const trackName = Object.keys(M2_BONE_TRACKS).find((name) => bone[name] === track);
         return externalTrackKeys(modelBytes, animBytes, boneIndex, trackName, track, sequence.index);
@@ -247,6 +296,8 @@ export function loadSkinnedM2(modelName, readFile, { showSection = () => true, a
     indices: skin.indices,
     bones,
     clips,
+    // The model's bounding box: min x, y, z, max x, y, z.
+    boundingBox: Array.from(model.bounds.extent),
     textures: model.textures.map((texture) => ({ type: texture.component, filename: texture.filename, flags: texture.flags })),
     batches: skin.batches.flatMap((batch) => {
       if (!showSection(batch.skinSection.id)) return [];

@@ -507,11 +507,13 @@ export interface CreatureInfo {
   rank: number;
   // creature_template's unit_flags, flags_extra, npcflag, and type (10 not
   // specified, 11 totem, 12 non-combat pet), for telling scenery and
-  // summoned objects from units worth a nameplate.
+  // summoned objects from units worth a nameplate; and its type_flags (0x40:
+  // harmful spells don't colour it).
   unitFlags: number;
   flagsExtra: number;
   npcFlags: number;
   creatureType: number;
+  typeFlags: number;
 }
 
 export interface StreamPathUpdate {

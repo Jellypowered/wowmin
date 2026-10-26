@@ -42,9 +42,11 @@ import {
   blendLight, type BuildingBatchLight, buildingBatchLight, CLIENT_AMBIENT_GAIN, CLIENT_DIRECT_GAIN, characterAmbientScale, floorLight, INDOOR_LIGHT_DIRECTION, indoorLight, type LightColors,
   lightAt, type MapLights, nearestObjectLights, scaleAmbient, type Rgb, sunDirection, timeOfDay,
 } from '../utils/map-light';
+import { PARTICLE_GROUND_DEPTH } from '../utils/m2-tracks';
+import { type FaceCulling, TriangleGrid } from '../utils/triangle-grid';
 import type { CombatEffectStore, Point3, UnitKey } from '../utils/spell-events';
 import { applyIsoCamera, serverToThree, threeToServer } from './iso-camera';
-import { SpellEffectLayer, type UnitAnchorRole } from './spell-effects';
+import { ALL_SPELL_AIDS, type SpellAids, SpellEffectLayer, type UnitAnchorRole } from './spell-effects';
 import { buildLayerArray, BYTE_SHADING_SCALE, createTerrainMaterial, prepareAlphaAtlas } from './terrain-material';
 import { GameObjectLayer, type GameObjectPose } from './game-objects';
 import { type BearerAreaCircle, SpellVisualLayer, type UnitInfo } from './spell-visual-layer';
@@ -166,6 +168,18 @@ const TERRAIN_COLOR = 0x4a5a3c;
 const DEFAULT_UNIT_HEIGHT = 2;
 const CHEST_HEIGHT = 0.6;
 const HEAD_HEIGHT = 0.9;
+// A falling model (Blizzard's ice) finds the ground as the client does: a
+// ray from just above the area's middle towards a point this high over its
+// landing spot stops short of any roof (at this share of the way), then a
+// ray this far down from there finds the ground.
+const SHARD_START_LIFT = 1 / 6;
+const SHARD_SEARCH_HEIGHT = 50 / 3;
+const SHARD_ROOF_SHARE = 0.95;
+const SHARD_GROUND_DEPTH = 100 / 3;
+// Ground heights kept for particles before starting over, and new ones
+// looked up a frame (the rest of a frame's particles stay where they're born).
+const GROUND_CACHE_LIMIT = 4096;
+const GROUND_RAYS_PER_FRAME = 64;
 
 // Party fade, matching getSceneFade() in map-projection.ts: each volume keeps
 // its surroundings solid, fading out over the height range above and below and
@@ -278,7 +292,10 @@ float wowBayer4(vec2 position) {
   return (pattern[cell.x + cell.y * 4] + 0.5) / 16.0;
 }
 // Floor areas' light on this surface: none on walls, nor on floors well
-// above or below an area. The rim is about a pixel and a half wide.
+// above or below an area. The rim is about a pixel and a half wide. Only
+// the ground (onGround) takes it, as the client projects such circles onto
+// the ground's triangles alone: props, liquids, and see-through or glowing
+// batches above it are left as they are.
 vec3 wowFloorAreas() {
   int count = int(wowFloorAreaCountPacked.x);
   if (count == 0) return vec3(0.0);
@@ -347,6 +364,51 @@ for (int index = 0; index < WOW_MAX_VOLUMES; index++) {
 if (wowFade <= 0.0 || wowFade < wowBayer4(gl_FragCoord.xy)) discard;
 `;
 
+// Rays against the map's terrain and buildings, tested through a grid of
+// each solid mesh's triangles (built while the page is idle, or when first
+// needed). Straight down, in server coordinates:
+const SERVER_DOWN: Point3 = [0, 0, -1];
+// How far round a ray's box a mesh's box may lie and still be tested
+// (yards), for meshes whose box only grazes it.
+const RAY_BOX_MARGIN = 0.5;
+const gridVertex = new Vector3();
+// Idle time a grid build leaves unused (ms), and the wait between builds
+// where the browser has no idle callbacks.
+const GRID_IDLE_MARGIN_MS = 4;
+const GRID_FALLBACK_DELAY_MS = 50;
+
+// A solid mesh's triangles in server coordinates, gridded for rays, and
+// which faces its material lets a ray hit, as three.js's raycast decides.
+interface SolidGrid {
+  grid: TriangleGrid;
+  culling: FaceCulling;
+}
+
+function solidGridOf(mesh: Mesh): SolidGrid {
+  const position = mesh.geometry.getAttribute('position');
+  const points = new Float32Array(position.count * 3);
+  for (let index = 0; index < position.count; index += 1) {
+    gridVertex.fromBufferAttribute(position, index).applyMatrix4(mesh.matrixWorld);
+    // Server (x, y, z) is three.js's (x, z, -y).
+    points[index * 3] = gridVertex.x;
+    points[index * 3 + 1] = -gridVertex.z;
+    points[index * 3 + 2] = gridVertex.y;
+  }
+  const indices = mesh.geometry.getIndex();
+  const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+  const side = (material as Material | undefined)?.side ?? FrontSide;
+  // A mirroring transform turns the triangles' winding over.
+  const mirrored = mesh.matrixWorld.determinant() < 0;
+  const culling: FaceCulling = side === DoubleSide ? 'none' : (side === FrontSide) !== mirrored ? 'back' : 'front';
+  return { grid: TriangleGrid.build(points, indices ? indices.array : null), culling };
+}
+
+// Shown, with every parent shown.
+function drawnInScene(object: Object3D): boolean {
+  for (let node: Object3D | null = object; node; node = node.parent) if (!node.visible) return false;
+  return true;
+}
+
 // A WMO group's extras sit on its node: the mesh itself, or the group of
 // meshes holding its primitives.
 // One function for every material, so three.js shares the compiled program.
@@ -357,7 +419,13 @@ function injectPartyFade(shader: WebGLProgramParametersWithUniforms): void {
   shader.fragmentShader = FADE_FRAGMENT_DECLARATIONS + shader.fragmentShader
     .replace('#include <clipping_planes_fragment>', `#include <clipping_planes_fragment>\n${FADE_FRAGMENT}`)
     .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>\n${CLIENT_LIGHT_FRAGMENT}`)
-    .replace('#include <opaque_fragment>', '#include <opaque_fragment>\ngl_FragColor.rgb += wowFloorAreas();');
+    .replace('#include <opaque_fragment>', '#include <opaque_fragment>\n#ifdef WOW_FLOOR_AREAS\ngl_FragColor.rgb += wowFloorAreas();\n#endif');
+}
+
+// Marks a material as the ground, which takes the floor areas' light.
+function onGround<T extends Material>(material: T): T {
+  material.defines = { ...material.defines, WOW_FLOOR_AREAS: '' };
+  return material;
 }
 
 // A building batch's material (three.js calls it as the material's): its
@@ -608,9 +676,25 @@ export class InstanceSceneView {
   private readonly roots = new Map<string, Object3D>();
   // World bounds of each mesh, so wholly faded meshes are not drawn.
   private readonly meshBounds = new Map<Object3D, MeshBounds[]>();
+  // Of those, the map's terrain, buildings, liquids, and single props: the
+  // meshes ground rays may hit (instanced props are left out).
+  private readonly solidMeshes = new Map<Object3D, MeshBounds[]>();
+  // Their triangle grids, built in idle time after a scene loads (or at a
+  // ray's need, if it comes first).
+  private readonly solidGrids = new WeakMap<Mesh, SolidGrid>();
+  private readonly gridQueue: Mesh[] = [];
+  private gridsScheduled = false;
   private readonly states = new Map<string, SceneLoadState>();
   private readonly materials = new Map<string, Material>();
   private shown: Object3D | null = null;
+  // Ground heights for particles, for the scene and floors as last shown.
+  private readonly groundHeights = new Map<string, number | null>();
+  private groundKey = '';
+  private groundRays = 0;
+  // Rays cast against the map since the last frame drawn and the time they
+  // took (ms), for diagnosing slow frames.
+  private castCount = 0;
+  private castMs = 0;
   private lost = false;
   // Player and creature models; lit, unlike the scene.
   private readonly units: UnitModelLayer;
@@ -660,9 +744,10 @@ export class InstanceSceneView {
     this.units = new UnitModelLayer(this.redraw);
     this.scene.add(this.units.group);
     this.scene.add(this.effects.group);
-    this.spellVisuals = new SpellVisualLayer(this.redraw);
+    const ground = (point: Point3) => this.groundBelow(point);
+    this.spellVisuals = new SpellVisualLayer(this.redraw, ground);
     this.scene.add(this.spellVisuals.group);
-    this.gameObjects = new GameObjectLayer(this.redraw);
+    this.gameObjects = new GameObjectLayer(this.redraw, ground);
     this.scene.add(this.gameObjects.group);
     this.scene.add(this.ambient, ...this.objectLights);
     this.sun.position.set(0.4, 1, 0.6);
@@ -799,15 +884,30 @@ export class InstanceSceneView {
   // Places the store's live effects for the next render; call after
   // setUnits, so hand points follow this frame's animation. Area taunts
   // (`isTaunt`) keep their floor area even when the client's art plays too.
+  // `aids` says which of WowMin's own aids to draw beside the client's art;
+  // `creatureTypeFlags` gives a creature's type_flags (some colours skip
+  // some creatures).
   setEffects(store: CombatEffectStore | null, positions: ReadonlyMap<UnitKey, Point3>, now: number,
-    auras?: ReadonlyMap<UnitKey, readonly number[]>, isTaunt: (spellId: number) => boolean = () => false): number {
+    auras?: ReadonlyMap<UnitKey, readonly number[]>, isTaunt: (spellId: number) => boolean = () => false,
+    aids: SpellAids = ALL_SPELL_AIDS, creatureTypeFlags: (unit: UnitKey) => number = () => 0): number {
     if (this.lost) return 0;
     const before = this.effects.count + this.spellVisuals.count;
+    this.groundRays = 0;
     const anchor = (unit: UnitKey, role: UnitAnchorRole) => this.anchor(positions, unit, role);
     const units: UnitInfo = {
       anchor,
+      attachment: (unit, attachment, offset) => (positions.has(unit) ? this.units.attachmentOf(unit, attachment, offset) : null),
+      isDrawn: (unit) => this.units.isDrawn(unit),
       scale: (unit) => this.units.scaleOf(unit) ?? 1,
+      height: (unit) => this.units.heightOf(unit) ?? DEFAULT_UNIT_HEIGHT,
       facing: (unit) => this.units.orientationOf(unit) ?? 0,
+      ground: (center, target) => this.groundUnder(center, target),
+      releaseMs: (unit, clip) => this.units.releaseMsOf(unit, clip),
+      intersect: (from, to) => this.intersect(from, to),
+      blades: (unit) => this.units.bladesOf(unit),
+      effectScales: (unit) => this.units.effectScalesOf(unit),
+      attachmentTurn: (unit, attachment, out) => (positions.has(unit) ? this.units.attachmentTurnOf(unit, attachment, out) : null),
+      creatureTypeFlags,
     };
     this.spellVisuals.update(store, now, units, this.camera, auras);
     const looks = this.spellVisuals.unitLooks(now);
@@ -821,12 +921,114 @@ export class InstanceSceneView {
     }
     this.units.setLooks(looks);
     this.effects.update(store, now, anchor,
-      (entry) => this.spellVisuals.handles(entry) && !('radius' in entry && isTaunt(entry.spellId)));
-    const areas = this.setFloorAreas(store && auras ? this.spellVisuals.bearerAreas(auras) : [], anchor);
+      (entry) => this.spellVisuals.handles(entry) && !('radius' in entry && isTaunt(entry.spellId)), aids);
+    const areas = this.setFloorAreas(store && auras && aids.circles ? this.spellVisuals.bearerAreas(auras) : [], anchor);
     const count = this.effects.count + this.spellVisuals.count + areas;
     // One more frame after the last effect ends, to clear it.
     this.effectsShown = count > 0 || before > 0;
     return count;
+  }
+
+  // Where a falling model aimed at `target` lands, searched from `center`:
+  // the first surface under it, below any roof, or `center` if none.
+  private groundUnder(center: Point3, [x, y]: Point3): Point3 {
+    const root = this.shown;
+    if (!root) return center;
+    const start: Point3 = [center[0], center[1], center[2] + SHARD_START_LIFT];
+    const end: Point3 = [x, y, center[2] + SHARD_SEARCH_HEIGHT];
+    const length = Math.hypot(end[0] - start[0], end[1] - start[1], end[2] - start[2]);
+    const way = end.map((value, axis) => (value - start[axis]) / length) as Point3;
+    const roof = length > 0 ? this.cast(root, start, way, length) : null;
+    const top = roof === null ? end : start.map((value, axis) => value + way[axis] * roof * SHARD_ROOF_SHARE) as Point3;
+    const ground = this.cast(root, top, SERVER_DOWN, SHARD_GROUND_DEPTH);
+    return ground === null ? center : [top[0], top[1], top[2] - ground];
+  }
+
+  // The height of the first surface up to PARTICLE_GROUND_DEPTH below a
+  // point, as the client finds the ground for particles that start on it;
+  // kept by the half yard across (two up and down), since many are born
+  // close together.
+  private groundBelow([x, y, z]: Point3): number | null {
+    const root = this.shown;
+    if (!root) return null;
+    if (this.groundHeights.size > GROUND_CACHE_LIMIT) this.groundHeights.clear();
+    const key = `${Math.round(x * 2)},${Math.round(y * 2)},${Math.round(z / 2)}`;
+    const known = this.groundHeights.get(key);
+    if (known !== undefined) return known;
+    if (this.groundRays >= GROUND_RAYS_PER_FRAME) return null;
+    this.groundRays += 1;
+    const below = this.cast(root, [x, y, z], SERVER_DOWN, PARTICLE_GROUND_DEPTH);
+    const height = below === null ? null : z - below;
+    this.groundHeights.set(key, height);
+    return height;
+  }
+
+  // Where a segment first meets the map's terrain or buildings, as a share
+  // of its length, or null.
+  private intersect(from: Point3, to: Point3): number | null {
+    const root = this.shown;
+    if (!root) return null;
+    const length = Math.hypot(to[0] - from[0], to[1] - from[1], to[2] - from[2]);
+    if (length <= 0) return null;
+    const hit = this.cast(root, from, to.map((value, axis) => (value - from[axis]) / length) as Point3, length);
+    return hit === null ? null : hit / length;
+  }
+
+  // How far along a ray (server coordinates) from `start` along the unit
+  // `direction` it first meets the map's terrain or buildings (not its
+  // instanced props), drawn now, up to `far`; null if it doesn't. Only the
+  // meshes whose box meets the ray's are tested, each through its triangle
+  // grid.
+  private cast(root: Object3D, [ax, ay, az]: Point3, [dx, dy, dz]: Point3, far: number): number | null {
+    const startedAt = performance.now();
+    const bx = ax + dx * far;
+    const by = ay + dy * far;
+    const bz = az + dz * far;
+    const minX = Math.min(ax, bx) - RAY_BOX_MARGIN;
+    const maxX = Math.max(ax, bx) + RAY_BOX_MARGIN;
+    const minY = Math.min(ay, by) - RAY_BOX_MARGIN;
+    const maxY = Math.max(ay, by) + RAY_BOX_MARGIN;
+    const minZ = Math.min(az, bz) - RAY_BOX_MARGIN;
+    const maxZ = Math.max(az, bz) + RAY_BOX_MARGIN;
+    let best = far;
+    let found = false;
+    for (const bounds of this.solidMeshes.get(root) ?? []) {
+      if (bounds.minX > maxX || bounds.maxX < minX || bounds.minY > maxY || bounds.maxY < minY || bounds.minZ > maxZ || bounds.maxZ < minZ) continue;
+      if (!drawnInScene(bounds.mesh)) continue;
+      const { grid, culling } = this.solidGrid(bounds.mesh);
+      const distance = grid.cast(ax, ay, az, dx, dy, dz, best, culling);
+      if (distance !== null && distance <= best) {
+        best = distance;
+        found = true;
+      }
+    }
+    this.castCount += 1;
+    this.castMs += performance.now() - startedAt;
+    return found ? best : null;
+  }
+
+  private solidGrid(mesh: Mesh): SolidGrid {
+    let solid = this.solidGrids.get(mesh);
+    if (!solid) {
+      solid = solidGridOf(mesh);
+      this.solidGrids.set(mesh, solid);
+    }
+    return solid;
+  }
+
+  // Builds the queued meshes' grids while the page is idle (one at a time
+  // where the browser has no idle callbacks).
+  private buildGridsWhenIdle(): void {
+    if (this.gridsScheduled || !this.gridQueue.length) return;
+    this.gridsScheduled = true;
+    const build = (deadline?: IdleDeadline) => {
+      this.gridsScheduled = false;
+      if (!deadline) this.solidGrid(this.gridQueue.pop()!);
+      while (deadline && this.gridQueue.length && deadline.timeRemaining() > GRID_IDLE_MARGIN_MS) this.solidGrid(this.gridQueue.pop()!);
+      this.buildGridsWhenIdle();
+    };
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(build);
+    else setTimeout(build, GRID_FALLBACK_DELAY_MS);
   }
 
   // Puts bearer areas round their units' feet into the fade block, for the
@@ -852,6 +1054,7 @@ export class InstanceSceneView {
     if (this.lost) return 0;
     const fade = this.lastFade;
     const shown = fade ? poses.filter(({ position }) => isDrawnAt(position, fade)) : poses;
+    this.groundRays = 0;
     this.gameObjects.update(shown, now, this.camera);
     return this.gameObjects.count;
   }
@@ -910,6 +1113,10 @@ export class InstanceSceneView {
         bounds.push({ mesh: object, minX, maxX, minY, maxY, minZ, maxZ });
       });
       this.meshBounds.set(root, bounds);
+      const solid = bounds.filter((entry) => !(entry.mesh instanceof InstancedMesh));
+      this.solidMeshes.set(root, solid);
+      this.gridQueue.push(...solid.map((entry) => entry.mesh));
+      this.buildGridsWhenIdle();
       this.roots.set(url, root);
       const interiors = new Map<number, Mesh[]>();
       root.traverse((node) => {
@@ -950,6 +1157,10 @@ export class InstanceSceneView {
       ...active.flatMap((volume) => [volume.minX, volume.maxX, volume.minY, volume.maxY, volume.minZ, volume.maxZ]
         .map((value) => Math.round(value))),
     ].join('|');
+    if (visibilityKey !== this.groundKey) {
+      this.groundKey = visibilityKey;
+      this.groundHeights.clear();
+    }
     const lightKey = this.applyLighting(view.center);
     const frameKey = [
       visibilityKey, width, height, pixelRatio, view.pixelsPerUnit.toFixed(4),
@@ -1007,6 +1218,10 @@ export class InstanceSceneView {
     this.renderer.render(this.scene, this.camera);
     // Exposed for diagnosing slow scenes from the browser's developer tools.
     this.canvas.dataset.drawCalls = String(this.renderer.info.render.calls);
+    this.canvas.dataset.rayCasts = String(this.castCount);
+    this.canvas.dataset.rayCastMs = this.castMs.toFixed(3);
+    this.castCount = 0;
+    this.castMs = 0;
     this.canvas.dataset.triangles = String(this.renderer.info.render.triangles);
     this.canvas.dataset.buffer = `${this.canvas.width}x${this.canvas.height}`;
     return true;
@@ -1080,9 +1295,7 @@ export class InstanceSceneView {
     this.camera.updateMatrixWorld();
     this.raycaster.setFromCamera(new Vector2((x / width) * 2 - 1, 1 - (y / height) * 2), this.camera);
     for (const hit of this.raycaster.intersectObject(root, true)) {
-      let shown = true;
-      for (let object: Object3D | null = hit.object; object; object = object.parent) shown &&= object.visible;
-      if (!shown) continue;
+      if (!drawnInScene(hit.object)) continue;
       const point = threeToServer(hit.point);
       if (isDrawnAt(point, fade)) return point;
     }
@@ -1196,6 +1409,7 @@ export class InstanceSceneView {
     const vertexLit = Boolean(mesh.geometry.getAttribute('color'));
     const exteriorLit = vertexLit && isExteriorGroup(mesh);
     const building = vertexLit ? buildingBatch(mesh) : null;
+    const inBuilding = building !== null || buildingBatch(mesh) !== null;
     const floors = vertexLit ? null : propFloors(mesh);
     if (floors && !mesh.geometry.getAttribute('wowPropKind')) applyPropLight(mesh, floors);
     const propLightReady = Boolean(floors);
@@ -1211,12 +1425,12 @@ export class InstanceSceneView {
             color: new Color(TERRAIN_COLOR).multiplyScalar(vertexLit ? shadingScale : 1), vertexColors: vertexLit,
           });
           plain.onBeforeCompile = injectPartyFade;
-          return this.withFade(plain);
+          return this.withFade(onGround(plain));
         }
-        return this.withFade(createTerrainMaterial({
+        return this.withFade(onGround(createTerrainMaterial({
           layers: terrain.layers, alpha, origin: source.userData.origin as [number, number],
           vertexShaded: vertexLit, shadingScale, partyFade: injectPartyFade,
-        }));
+        })));
       }
       // Instanced props get their own copy: three.js re-derives the shader
       // program whenever a material switches between instanced and plain.
@@ -1224,12 +1438,15 @@ export class InstanceSceneView {
       // The map's own props are shaded by its light, a building's by the
       // floor under them as the client lights them (applyPropLight; scenes
       // exported before have no floors); glowing (blended) parts stay unlit.
+      const solid = (blend === 'opaque' || blend === 'alphaKey') && source.opacity >= 1;
       const opaque = !vertexLit && (blend === 'opaque' || blend === 'alphaKey');
+      // A building's solid batches are its floors as well as its walls.
+      const floor = solid && inBuilding;
       const propLit = opaque && propLightReady;
       const shaded = opaque && (propLit || isWorldProp(mesh));
       const light = building ? buildingBatchLight(building.batch, building.counts, building.unified, building.flags,
         (source.userData.wowMapObjFlags as number | undefined) ?? 0) : null;
-      const key = `${source.uuid}|${vertexLit}|${exteriorLit}|${shaded}|${propLit}|${mesh instanceof InstancedMesh}`
+      const key = `${source.uuid}|${vertexLit}|${exteriorLit}|${shaded}|${propLit}|${floor}|${mesh instanceof InstancedMesh}`
         + (building ? `|${light}|${building.unified ? building.ambient : ''}` : '');
       const cached = this.materials.get(key);
       if (cached) return cached;
@@ -1249,12 +1466,13 @@ export class InstanceSceneView {
         forceSinglePass: true,
         alphaTest: blend === 'alphaKey' ? 0.5 : 0,
         transparent: (blend !== 'opaque' && blend !== 'alphaKey') || source.opacity < 1,
-        depthWrite: (blend === 'opaque' || blend === 'alphaKey') && source.opacity >= 1,
+        depthWrite: solid,
         blending: blend === 'add' ? AdditiveBlending : blend === 'mod' || blend === 'mod2x' ? MultiplyBlending : NormalBlending,
         premultipliedAlpha: blend === 'mod' || blend === 'mod2x',
       });
       material.onBeforeCompile = injectPartyFade;
       if (propLit) material.defines = { ...material.defines, WOW_PROP_LIGHT: '' };
+      if (floor) onGround(material);
       if (building && light) {
         material.defines = {
           ...material.defines,

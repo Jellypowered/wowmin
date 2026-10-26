@@ -16,6 +16,7 @@ import {
   type Frustum,
   type Material,
   Matrix4,
+  Quaternion,
   Mesh,
   MeshBasicMaterial,
   MeshLambertMaterial,
@@ -37,6 +38,7 @@ import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js
 
 import type { LightColors } from '../utils/map-light';
 import type { Point3, StrikeKind } from '../utils/spell-events';
+import type { EffectScales } from '../utils/spell-kits';
 import {
   chooseUnitStance,
   getMoveTimeScale,
@@ -59,6 +61,9 @@ export interface UnitLook {
   color: number | null;
   alpha: number;
   indoor?: IndoorLook;
+  // Its animation held still (a kit's freeze): at this time into its loop
+  // (ms), or where it is when null.
+  freeze?: { atMs: number | null } | null;
 }
 
 // A unit's light indoors, and how far its light's direction leans from the
@@ -142,10 +147,10 @@ export interface UnitModelPose {
   // Recent attacks came from real events, so no made-up timed strikes.
   eventDriven?: boolean;
   // Animations the spell's kits name: a loop while casting or channelling,
-  // and a one-off as a spell fires or lands (clip names; skipped if the
-  // model lacks them).
-  kitLoop?: string | null;
-  kitOnce?: string | null;
+  // and a one-off as a spell fires or lands or a cast begins (clip names,
+  // the first the model has winning; skipped if it has none).
+  kitLoop?: string[] | null;
+  kitOnce?: string[] | null;
   // A mounted player's mount model: the mount moves and wears the ring, and
   // the rider sits on its saddle. On foot until the mount's model is ready.
   mountUrl?: string | null;
@@ -173,8 +178,16 @@ function copyMaterial(material: Material): Material {
 // The id a rider's mount is drawn under.
 const mountUnitId = (riderId: string): string => `${riderId}#mount`;
 
-// Effect points the converter exports on the skeleton.
+// Points on a unit WowMin's own drawing uses (its glows, plates, a rider's
+// saddle), by the M2 attachments that can serve each, the first the model
+// has winning: 22/21 the spell hands, 1/2 the hands, 15 the chest, 11 the
+// helm (20 the head), 17 the mouth (breath), 18 the name point above the
+// head, and 0 a mount's saddle (a character's shield otherwise; only mounts'
+// is used). The client's own art asks for attachments by ID instead.
 type UnitPointRole = 'handRight' | 'handLeft' | 'chest' | 'head' | 'breath' | 'overhead' | 'mount';
+const ROLE_ATTACHMENTS: Record<UnitPointRole, number[]> = {
+  handRight: [22, 1], handLeft: [21, 2], chest: [15], head: [11, 20], breath: [17, 11, 20], overhead: [18, 11], mount: [0],
+};
 
 // The ring on the floor under a model, with a pointer the way it faces.
 export interface UnitMarkerStyle {
@@ -194,6 +207,10 @@ interface ModelTemplate {
   // The clips' names, for choosing stance clips.
   clipNames?: ReadonlySet<string>;
   speeds?: Record<string, number>;
+  // When (seconds in) each cast clip lets a spell's missile go.
+  releases?: Record<string, number>;
+  // How the client sizes spell effects on the model.
+  effectScales?: EffectScales;
   // Floor ring radius in model units, from the model's footprint.
   radius?: number;
   // Standing height in model units (times the display scale).
@@ -264,7 +281,14 @@ interface UnitInstance {
   sheathItems: Object3D[];
   marker: UnitMarker;
   model: Object3D;
-  points: Map<string, Object3D>;
+  // The converter's effect points on its skeleton: attachments by M2 ID,
+  // and spell release events by name ('$CSL').
+  effectAttachments: Map<number, Object3D>;
+  effectEvents: Map<string, Object3D>;
+  // Its drawn weapons' blades (bottom and top), for swing trails.
+  blades: Array<{ item: Object3D; bottom: Object3D; top: Object3D }>;
+  // Whether a kit holds its animation still.
+  frozen: boolean;
   // How its spells change its model (UnitLook), as a key, and the shared
   // materials swapped out for changed copies, by mesh.
   look: string;
@@ -357,8 +381,21 @@ function mergeSkinnedParts(scene: Object3D): void {
 }
 
 const scratchVector = new Vector3();
+const scratchMatrix = new Matrix4();
+const scratchPosition = new Vector3();
+const scratchScale = new Vector3();
+const ZERO_OFFSET: Point3 = [0, 0, 0];
 const tintColor = new Color();
 const scratchSphere = new Sphere();
+
+// The first of a role's attachments a unit's model has.
+function rolePoint(unit: UnitInstance, role: UnitPointRole): Object3D | undefined {
+  for (const id of ROLE_ATTACHMENTS[role]) {
+    const point = unit.effectAttachments.get(id);
+    if (point) return point;
+  }
+  return undefined;
+}
 
 // Takes a cloned model's bones out of the scene graph (see
 // UnitInstance.skeleton): they go under a holder in the skinned mesh's own
@@ -486,14 +523,53 @@ export class UnitModelLayer {
   // unit isn't drawn as a model or its model has no such point.
   pointOf(id: string, role: UnitPointRole): Point3 | null {
     const unit = this.units.get(id);
-    const point = unit?.points.get(role);
-    if (!unit || !point) return null;
-    return threeToServer(this.pointWorld(unit, point, scratchVector));
+    const point = unit && rolePoint(unit, role);
+    return unit && point ? threeToServer(this.pointWorld(unit, point, scratchVector.set(0, 0, 0))) : null;
   }
 
-  // A point in a unit's skeleton, in world space.
-  private pointWorld(unit: UnitInstance, point: Object3D, target: Vector3): Vector3 {
-    return target.setFromMatrixPosition(point.matrixWorld).applyMatrix4(unit.skeletonToTop).applyMatrix4(unit.top.matrixWorld);
+  // When (ms into the clip) a drawn unit's cast clip lets a spell's missile
+  // go, or null if the unit isn't drawn, lacks the clip, or it never does.
+  releaseMsOf(id: string, clip: string): number | null {
+    const seconds = this.units.get(id)?.template.releases?.[clip];
+    return seconds === undefined ? null : seconds * 1000;
+  }
+
+  // How the client sizes spell effects on a drawn unit's model, or null.
+  effectScalesOf(id: string): EffectScales | null {
+    return this.units.get(id)?.template.effectScales ?? null;
+  }
+
+  // Whether a unit is drawn as its model, so its attachments are known.
+  isDrawn(id: string): boolean {
+    return this.units.has(id);
+  }
+
+  // A drawn unit's attachment (M2 ID), or its release event ('$CSL'), in
+  // server coordinates, `offset` (model space) from it the way the point
+  // turns; null if the unit isn't drawn or its model has no such point.
+  attachmentOf(id: string, attachment: number | string, offset: Point3 = ZERO_OFFSET): Point3 | null {
+    const unit = this.units.get(id);
+    const point = typeof attachment === 'number' ? unit?.effectAttachments.get(attachment) : unit?.effectEvents.get(attachment);
+    if (!unit || !point) return null;
+    return threeToServer(this.pointWorld(unit, point, scratchVector.set(offset[0], offset[1], offset[2])));
+  }
+
+  // Which way a drawn unit's attachment (M2 ID) is turned, in world space
+  // (three.js axes), as an effect riding on it turns; null if the unit
+  // isn't drawn or its model lacks it. Written into `out`.
+  attachmentTurnOf(id: string, attachment: number, out: Quaternion): Quaternion | null {
+    const unit = this.units.get(id);
+    const point = unit?.effectAttachments.get(attachment);
+    if (!unit || !point) return null;
+    scratchMatrix.multiplyMatrices(unit.top.matrixWorld, unit.skeletonToTop).multiply(point.matrixWorld);
+    scratchMatrix.decompose(scratchPosition, out, scratchScale);
+    return out;
+  }
+
+  // A point in a unit's skeleton, in world space: `local` is in the point's
+  // own space and is overwritten with the result.
+  private pointWorld(unit: UnitInstance, point: Object3D, local: Vector3): Vector3 {
+    return local.applyMatrix4(point.matrixWorld).applyMatrix4(unit.skeletonToTop).applyMatrix4(unit.top.matrixWorld);
   }
 
   // Which way a drawn unit faces (radians about Z), or null.
@@ -602,11 +678,11 @@ export class UnitModelLayer {
     const mount = this.unitFor(mountPose, template, nowMs);
     this.place(mount, mountPose, nowMs);
     shown.add(mountPose.id);
-    const saddle = mount.points.get('mount');
+    const saddle = rolePoint(mount, 'mount');
     if (!saddle) return null;
     // The saddle as of the mount's last pose, where the mount is now.
     mount.top.updateWorldMatrix(true, false);
-    const [x, y, z] = threeToServer(this.pointWorld(mount, saddle, scratchVector));
+    const [x, y, z] = threeToServer(this.pointWorld(mount, saddle, scratchVector.set(0, 0, 0)));
     return {
       ...pose, x, y, z, orientation: mount.root.rotation.z, riding: true,
       marker: { ...pose.marker, hidden: true },
@@ -650,6 +726,8 @@ export class UnitModelLayer {
       }));
       loading.clipNames = new Set(loading.clips.keys());
       loading.speeds = (root?.userData.wowClipSpeeds ?? {}) as Record<string, number>;
+      loading.releases = (root?.userData.wowClipReleases ?? {}) as Record<string, number>;
+      loading.effectScales = root?.userData.wowEffectScales as EffectScales | undefined;
       loading.scene = gltf.scene;
       loading.state = 'ready';
       this.onLoaded();
@@ -702,16 +780,25 @@ export class UnitModelLayer {
       sheathItems: [],
       marker,
       model,
-      points: new Map(),
+      effectAttachments: new Map(),
+      effectEvents: new Map(),
+      blades: [],
+      frozen: false,
       look: '',
       changed: new Map(),
       sitting: null,
     };
     model.traverse((object) => {
       if (object.userData.wowSheath) unit.sheathItems.push(object);
+      // Weapons ride on the model's top node, so their blades are found here.
+      if (object.userData.wowTrail === 'bottom') {
+        const top = object.parent?.children.find((sibling) => sibling.userData.wowTrail === 'top');
+        if (object.parent && top) unit.blades.push({ item: object.parent, bottom: object, top });
+      }
     });
     skeleton.traverse((object) => {
-      if (object.userData.wowPoint) unit.points.set(object.userData.wowPoint as string, object);
+      if (typeof object.userData.wowAttachment === 'number') unit.effectAttachments.set(object.userData.wowAttachment, object);
+      if (typeof object.userData.wowEvent === 'string') unit.effectEvents.set(object.userData.wowEvent, object);
     });
     this.pose(unit);
     // The clone gives each skinned part its own copy of the skeleton; parts
@@ -791,7 +878,7 @@ export class UnitModelLayer {
         : flight ? { loop: flight, strike: null } : getStanceClips(stance, pose.weapons, unit.template.clipNames!);
     // Standing or fighting, a cast or channel holds the pose its kit names.
     const still = stance !== 'walk' && stance !== 'run' && stance !== 'dead';
-    const kitLoop = still && !seated && pose.kitLoop && clips.has(pose.kitLoop) ? pose.kitLoop : null;
+    const kitLoop = still && !seated ? pose.kitLoop?.find((name) => clips.has(name)) ?? null : null;
     if (kitLoop) chosen.loop = kitLoop;
     if (stance !== unit.stance || chosen.loop !== unit.loopName) {
       unit.stance = stance;
@@ -808,10 +895,11 @@ export class UnitModelLayer {
       unit.loop.timeScale = getMoveTimeScale(unit.speed, unit.template.speeds?.[unit.loopName]);
     }
     const fighting = stance === 'melee' || stance === 'ranged' || stance === 'cast';
+    const kitOnce = still && !seated ? pose.kitOnce?.find((name) => clips.has(name)) ?? null : null;
     if (seated) {
       // No swings or casting poses in the saddle or on the ground.
-    } else if (still && pose.kitOnce && clips.has(pose.kitOnce)) {
-      this.playStrike(unit, pose.kitOnce);
+    } else if (kitOnce) {
+      this.playStrike(unit, kitOnce);
     } else if (pose.strike && (fighting || stance === 'stand')) {
       // A real attack: the clip for what was done, whatever the stance.
       const strike = getStanceClips(pose.strike, pose.weapons, unit.template.clipNames!).strike;
@@ -875,7 +963,33 @@ export class UnitModelLayer {
   // Changes units' models as their spells' kits ask (by unit ID); units
   // left out go back to their models' own look.
   setLooks(looks: ReadonlyMap<string, UnitLook>): void {
-    for (const [id, unit] of this.units) this.setLook(unit, looks.get(id) ?? null);
+    for (const [id, unit] of this.units) {
+      const look = looks.get(id) ?? null;
+      this.setFreeze(unit, look?.freeze ?? null);
+      this.setLook(unit, look);
+    }
+  }
+
+  // Holds a unit's animation still while a kit freezes it, at the kit's
+  // time into its loop where it names one.
+  private setFreeze(unit: UnitInstance, freeze: { atMs: number | null } | null): void {
+    if (Boolean(freeze) === unit.frozen) return;
+    unit.frozen = Boolean(freeze);
+    if (freeze?.atMs !== null && freeze?.atMs !== undefined && unit.loop) {
+      unit.loop.time = Math.min(freeze.atMs / 1000, unit.loop.getClip().duration);
+    }
+    unit.mixer.timeScale = unit.frozen ? 0 : 1;
+  }
+
+  // A drawn unit's blades (bottom and top, server coordinates) of the
+  // weapons it holds drawn.
+  bladesOf(id: string): Array<[Point3, Point3]> {
+    const unit = this.units.get(id);
+    if (!unit) return [];
+    return unit.blades.filter(({ item }) => item.visible).map(({ item, bottom, top }) => {
+      item.updateWorldMatrix(true, true);
+      return [threeToServer(scratchVector.setFromMatrixPosition(bottom.matrixWorld)), threeToServer(scratchVector.setFromMatrixPosition(top.matrixWorld))];
+    });
   }
 
   // Multiplies the unit's materials by a colour and an opacity, on copies

@@ -140,8 +140,11 @@ test('builds a skinned GLB document: joints at pivots, every animated channel in
     name: 'test',
     textureFor: () => null,
     scale: 1.5,
-    attachments: [{ bone: 1, position: [0.2, 0, 1.5], mesh: sword, textureFor: () => null, role: 'mainHand', sheath: 'drawn' }],
-    points: [{ role: 'handRight', bone: 1, position: [0.1, -0.4, 1.2] }, { role: 'overhead', bone: 9, position: [0, 0, 2] }],
+    attachments: [{
+      bone: 1, position: [0.2, 0, 1.5], mesh: sword, textureFor: () => null, role: 'mainHand', sheath: 'drawn',
+      trail: { bottom: [0, 0, 0.1], top: [0, 0, 1.2] },
+    }],
+    points: [{ attachment: 22, bone: 1, position: [0.1, -0.4, 1.2] }, { attachment: 18, bone: 9, position: [0, 0, 2] }],
   });
   const root = document.getRoot();
   const skin = root.listSkins()[0];
@@ -160,29 +163,26 @@ test('builds a skinned GLB document: joints at pivots, every animated channel in
   const item = skin.listJoints()[1].listChildren()[0];
   assert.deepEqual(item.getTranslation(), [0.2, 0, 0]);
   assert.deepEqual(item.getExtras(), { wowItem: 'mainHand', wowSheath: 'drawn' });
+  // A drawn weapon carries its blade's bottom and top for swing trails.
+  assert.deepEqual(item.listChildren().map((child) => [child.getExtras().wowTrail, child.getTranslation()]),
+    [['bottom', [0, 0, 0.1]], ['top', [0, 0, 1.2]]]);
   // Effect points ride on their bone too; one on a missing bone is skipped.
   const hand = skin.listJoints()[1].listChildren()[1];
-  assert.deepEqual(hand.getExtras(), { wowPoint: 'handRight' });
+  assert.deepEqual(hand.getExtras(), { wowAttachment: 22 });
   [0.1, -0.4, -0.3].forEach((value, axis) => near(hand.getTranslation()[axis], value, `hand ${axis}`));
-  assert.equal(root.listNodes().filter((node) => node.getExtras().wowPoint).length, 1);
+  assert.equal(root.listNodes().filter((node) => node.getExtras().wowAttachment !== undefined).length, 1);
 });
 
-test('picks effect points from the attachment table, preferring spell hands', async () => {
+test('keeps every attachment and release event as an effect point, the first of each', async () => {
   const { effectPoints } = await load('unit-model.mjs');
   const point = (id, bone) => ({ id, bone, position: [id, 0, 0] });
-  assert.deepEqual(effectPoints([point(1, 10), point(2, 11), point(22, 12), point(15, 13), point(11, 14)]), [
-    { role: 'handRight', bone: 12, position: [22, 0, 0] },
-    { role: 'handLeft', bone: 11, position: [2, 0, 0] },
-    { role: 'chest', bone: 13, position: [15, 0, 0] },
-    { role: 'head', bone: 14, position: [11, 0, 0] },
-    // No mouth point: breath falls back to the helm.
-    { role: 'breath', bone: 14, position: [11, 0, 0] },
-    { role: 'overhead', bone: 14, position: [11, 0, 0] },
+  assert.deepEqual(effectPoints([point(1, 10), point(22, 12), point(22, 13)], [
+    { name: '$CSL', bone: 4, position: [0, 1, 0] }, { name: '$CSL', bone: 5, position: [0, 2, 0] },
+  ]), [
+    { attachment: 1, bone: 10, position: [1, 0, 0] },
+    { attachment: 22, bone: 12, position: [22, 0, 0] },
+    { event: '$CSL', bone: 4, position: [0, 1, 0] },
   ]);
-  assert.deepEqual(effectPoints([point(17, 86), point(20, 56)]).filter((entry) => entry.role === 'breath'),
-    [{ role: 'breath', bone: 86, position: [17, 0, 0] }]);
-  // A mount's saddle (attachment 0), where its rider sits.
-  assert.deepEqual(effectPoints([point(0, 3)]), [{ role: 'mount', bone: 3, position: [0, 0, 0] }]);
   // Spiders and the like have no attachment points at all.
   assert.deepEqual(effectPoints([]), []);
 });
@@ -217,6 +217,18 @@ test('reads M2 attachment points from the header', async () => {
   // A count that runs past the file reads as none.
   buffer.writeUInt32LE(50, 240);
   assert.deepEqual(readM2Attachments(buffer), []);
+});
+
+test('reads the M2 events asked for from the header', async () => {
+  const { readM2Events } = await load('character.mjs');
+  const buffer = Buffer.alloc(400);
+  buffer.writeUInt32LE(2, 256);
+  buffer.writeUInt32LE(300, 260);
+  buffer.write('$CSR', 300, 'latin1'); buffer.writeUInt16LE(9, 308); buffer.writeFloatLE(1.5, 316);
+  buffer.write('$FSD', 336, 'latin1'); buffer.writeUInt16LE(3, 344);
+  assert.deepEqual(readM2Events(buffer, ['$CSR', '$CSL']), [{ name: '$CSR', bone: 9, position: [0, 1.5, 0] }]);
+  buffer.writeUInt32LE(50, 256);
+  assert.deepEqual(readM2Events(buffer, ['$CSR']), []);
 });
 
 test('chooses character geosets: body, hair by ID, groups by value, and gear overrides', async () => {
@@ -489,4 +501,49 @@ test('keeps spell art in its own versioned folder and clears only stale cache fo
   assert.equal(models.pathFor({ kind: 'effect', key: '398', params: {} }), path.join(root, art, 'effect', '398.glb'));
   assert.equal(models.pathFor({ kind: 'creature', key: '892', params: {} }), path.join(root, unit, 'creature', '892.glb'));
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('reads when a sequence first releases a spell, from the model or its .anim file', async () => {
+  const { releaseTimeMs } = await load('m2-skinned.mjs');
+  // Two events at 300 and 336: a footstep, and $CSR. Its track's times for
+  // sequence 1 are at 600 (one time, at 700: 250 ms).
+  const model = Buffer.alloc(800);
+  model.writeUInt32LE(2, 256);
+  model.writeUInt32LE(300, 260);
+  model.write('$FSD', 300, 'latin1');
+  model.write('$CSR', 336, 'latin1');
+  model.writeInt16LE(-1, 336 + 26);
+  model.writeUInt32LE(2, 336 + 28);
+  model.writeUInt32LE(600, 336 + 32);
+  model.writeUInt32LE(1, 608);
+  model.writeUInt32LE(700, 612);
+  model.writeUInt32LE(250, 700);
+  const bytes = new Uint8Array(model.buffer, model.byteOffset, model.byteLength);
+  assert.equal(releaseTimeMs(bytes, null, 1), 250);
+  assert.equal(releaseTimeMs(bytes, null, 0), null);
+  // An external sequence's times are in its .anim file.
+  const anim = Buffer.alloc(800);
+  anim.writeUInt32LE(90, 700);
+  assert.equal(releaseTimeMs(bytes, new Uint8Array(anim.buffer, anim.byteOffset, anim.byteLength), 1), 90);
+});
+
+test('reads how the client sizes a model\'s spell effects: its world and attached scales, and footprint', async () => {
+  const { UnitData } = await load('unit-model.mjs');
+  const fields = 30;
+  const header = Buffer.alloc(20);
+  header.write('WDBC');
+  header.writeUInt32LE(1, 4); header.writeUInt32LE(fields, 8); header.writeUInt32LE(fields * 4, 12);
+  const record = Buffer.alloc(fields * 4);
+  record.writeUInt32LE(7, 0); record.writeUInt32LE(1, 8);
+  record.writeFloatLE(0.5, 23 * 4); record.writeFloatLE(1.5, 24 * 4);
+  const strings = Buffer.from('\0Creature\\Ogre\\Ogre.mdx\0', 'latin1');
+  header.writeUInt32LE(strings.length, 16);
+  const files = { 'DBFilesClient\\CreatureModelData.dbc': Buffer.concat([header, record, strings]) };
+  const data = new UnitData((name) => files[name] ?? null);
+  // The model's bounding box: min x, y, z, max x, y, z.
+  const scales = data.modelEffectScales('Creature\\Ogre\\Ogre.m2', [-2, -5, 0, 2, 5, 6]);
+  assert.equal(scales.world, 0.5);
+  assert.equal(scales.attached, 1.5);
+  near(scales.footprint, 1.2, 'footprint');
+  assert.deepEqual(data.modelEffectScales('Creature\\Other\\Other.m2', null), { world: 1, attached: 1, footprint: 0 });
 });

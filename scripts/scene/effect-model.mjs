@@ -22,8 +22,10 @@ import { keyframeTimes, writeGlb } from './unit-model.mjs';
 
 // AnimationData.dbc IDs an effect plays: Stand once (its start); for effects
 // that last, then Hold looping (158, the idle) and Decay (159) as they end.
-// Without a Hold, a lasting effect loops Stand.
-export const EFFECT_SEQUENCES = { Stand: 0, Hold: 158, Decay: 159 };
+// Without a Hold, a lasting effect loops Stand. A missile loops Fly (144)
+// in flight and plays Impact (191) as it lands, where its model has them; a
+// lasting area's model plays Birth (127) first, where it has one.
+export const EFFECT_SEQUENCES = { Stand: 0, Hold: 158, Decay: 159, Fly: 144, Impact: 191, Birth: 127 };
 const M2_NO_LOOP = 0xFFFF;
 const M2_NO_INDEX = 0xFFFF;
 const M2_TRACK_INTERPOLATION_NONE = 0;
@@ -47,7 +49,9 @@ export function fromLibraryTrack(track, map = (value) => value) {
 }
 
 // The compact export form for a track, keeping only the clips exported (or
-// the loop's keys for a global track); null when it has no keys at all.
+// the loop's keys for a global track); null when it has no keys at all. A
+// clip past the track's last sequence takes the first sequence's keys, as
+// the client reads them; a sequence with no keys stays the default.
 export function exportTrack(track, clips) {
   if (!track) return null;
   const keys = {};
@@ -56,7 +60,7 @@ export function exportTrack(track, clips) {
     if (sequence?.times.length && sequence.values.length) keys.global = [sequence.times, sequence.values];
   } else {
     for (const clip of clips) {
-      const sequence = track.sequences[clip.index];
+      const sequence = track.sequences[clip.index < track.sequences.length ? clip.index : 0];
       if (sequence?.times.length && sequence.values.length) keys[clip.name] = [sequence.times, sequence.values];
     }
   }
@@ -84,9 +88,22 @@ export function exportRibbon(ribbon, clips) {
   return exported;
 }
 
-const sequenceKeys = (index) => (track) => (track.loopIndex === M2_NO_LOOP && track.sequenceTimes[index]
-  ? { times: track.sequenceTimes[index], values: track.sequenceKeys[index], step: track.trackType === M2_TRACK_INTERPOLATION_NONE }
-  : null);
+// A clip's keys for a bone track, falling back to the first sequence's as
+// exportTrack does. A track on a loop of no length never leaves its first
+// key, so every clip holds that key (Fan of Knives' knife bones are turned
+// on their side this way).
+const sequenceKeys = (clipIndex, loops) => (track) => {
+  if (track.loopIndex !== M2_NO_LOOP) {
+    const [times, values] = [track.sequenceTimes[0], track.sequenceKeys[0]];
+    return !loops[track.loopIndex] && times?.length && values?.length
+      ? { times: Uint32Array.of(0), values: values.slice(0, values.length / times.length), step: true }
+      : null;
+  }
+  const index = clipIndex < track.sequenceTimes.length ? clipIndex : 0;
+  return track.sequenceTimes[index]
+    ? { times: track.sequenceTimes[index], values: track.sequenceKeys[index], step: track.trackType === M2_TRACK_INTERPOLATION_NONE }
+    : null;
+};
 const loopKeys = (loop) => (track) => (track.loopIndex === loop && track.sequenceTimes[0]
   ? { times: track.sequenceTimes[0], values: track.sequenceKeys[0], step: track.trackType === M2_TRACK_INTERPOLATION_NONE }
   : null);
@@ -115,7 +132,7 @@ export function loadEffectM2(modelName, readFile) {
       name: clip.name,
       index: clip.index,
       duration: clip.duration,
-      bones: model.bones.map((bone) => boneChannelsFrom(bone, model.bones[bone.parentIndex]?.pivot, sequenceKeys(clip.index))),
+      bones: model.bones.map((bone) => boneChannelsFrom(bone, model.bones[bone.parentIndex]?.pivot, sequenceKeys(clip.index, loops))),
     })),
     globalClips: [...usedLoops].map((loop) => ({
       name: `global${loop}`,
@@ -165,16 +182,30 @@ function sequenceChannels(effect) {
   return paths;
 }
 
-export function buildEffectDocument(effect, { name, textureFor, textureMax = EFFECT_TEXTURE_MAX }) {
+// The GLB's document for an effect, with the models its particles are drawn
+// as (each emitter's particleModel, an index into `particleModels`): each
+// such model a root of its own beside the effect's, its node, texture, and
+// clip names prefixed `p<index>:`.
+export function buildEffectDocument(effect, { name, textureFor, textureMax = EFFECT_TEXTURE_MAX, particleModels = [] }) {
   const document = new Document();
   const buffer = document.createBuffer();
+  const scene = document.createScene(name);
+  scene.addChild(addEffectTree(document, buffer, effect, { name, textureFor, textureMax, prefix: '' }));
+  particleModels.forEach((model, index) => {
+    const root = addEffectTree(document, buffer, model.effect, { name: model.effect.name, textureFor: model.textureFor, textureMax, prefix: `p${index}:` });
+    root.setExtras({ ...root.getExtras(), wowParticleModel: index });
+    scene.addChild(root);
+  });
+  return document;
+}
+
+function addEffectTree(document, buffer, effect, { name, textureFor, textureMax, prefix }) {
   const accessor = (type, array) => document.createAccessor().setType(type).setArray(array).setBuffer(buffer);
-  const root = document.createNode(name);
-  document.createScene(name).addChild(root);
+  const root = document.createNode(`${prefix}${name}`);
 
   const joints = effect.bones.map((bone, index) => {
     const parent = effect.bones[bone.parentIndex];
-    const joint = document.createNode(`bone${index}`)
+    const joint = document.createNode(`${prefix}bone${index}`)
       .setTranslation(bone.pivot.map((value, axis) => value - (parent?.pivot[axis] ?? 0)));
     if (bone.flags & BONE_BILLBOARD_FLAGS) joint.setExtras({ wowBillboard: bone.flags & BONE_BILLBOARD_FLAGS });
     return joint;
@@ -199,7 +230,7 @@ export function buildEffectDocument(effect, { name, textureFor, textureMax = EFF
       images.set(source.name.toLowerCase(), image);
     }
     if (!image) return null;
-    const material = document.createMaterial(`texture${index}`).setBaseColorTexture(image).setAlphaMode('BLEND');
+    const material = document.createMaterial(`${prefix}texture${index}`).setBaseColorTexture(image).setAlphaMode('BLEND');
     return material.getName();
   });
 
@@ -218,12 +249,14 @@ export function buildEffectDocument(effect, { name, textureFor, textureMax = EFF
     const weightsAttribute = accessor('VEC4', weights);
     const mesh = document.createMesh(`${name}-mesh`);
     effect.batches.forEach((batch, index) => {
-      const material = document.createMaterial(`${name}#${index}`)
+      const material = document.createMaterial(`${prefix}${name}#${index}`)
         .setMetallicFactor(0)
         .setRoughnessFactor(1)
         .setDoubleSided(true)
         .setExtras({
           wowBlend: M2_BLEND[batch.blend] ?? 'opaque',
+          // The M2 material's blend number, read by the client's table.
+          wowBlendMode: batch.blend,
           wowTexture: textureMaterials[batch.textureIndex] ?? null,
           wowColor: exportTrack(batch.color, effect.clips),
           wowAlpha: exportTrack(batch.alpha, effect.clips),
@@ -242,12 +275,12 @@ export function buildEffectDocument(effect, { name, textureFor, textureMax = EFF
         .setIndices(accessor('SCALAR', Uint16Array.from(slice)))
         .setMaterial(material));
     });
-    root.addChild(document.createNode(`${name}-mesh`).setMesh(mesh).setSkin(skin));
+    root.addChild(document.createNode(`${prefix}${name}-mesh`).setMesh(mesh).setSkin(skin));
   }
 
   const channels = sequenceChannels(effect);
   const writeClip = (clip, paths) => {
-    const animation = document.createAnimation(clip.name);
+    const animation = document.createAnimation(`${prefix}${clip.name}`);
     paths.forEach((targets, boneIndex) => {
       const bone = effect.bones[boneIndex];
       const parent = effect.bones[bone.parentIndex];
@@ -290,21 +323,48 @@ export function buildEffectDocument(effect, { name, textureFor, textureMax = EFF
         ...exportRibbon(ribbon, effect.clips),
         textureMaterial: textureOf(ribbon.textures[0]),
         blend: effect.materials[ribbon.materials[0]]?.blend ?? 0,
+        // Each texture with its material is a pass of its own.
+        passes: ribbon.textures.map((texture, index) => ({
+          textureMaterial: textureOf(texture),
+          blend: effect.materials[ribbon.materials[index] ?? ribbon.materials[0]]?.blend ?? 0,
+        })),
         bonePivot: effect.bones[ribbon.bone]?.pivot ?? [0, 0, 0],
       })),
     },
   });
-  return document;
+  return root;
 }
 
-// The GLB for an effect model file, or null if the file is missing.
+const texturesOf = (effect, readFile) => (index) => {
+  const texture = effect.textures[index];
+  const blp = texture?.filename ? readFile(texture.filename) : null;
+  return blp ? { name: path.win32.basename(texture.filename), blp } : null;
+};
+
+// The GLB for an effect model file, or null if the file is missing. Emitters
+// whose particles are models, or that have child emitters (a model whose
+// emitters let particles go from each of theirs), get those models
+// alongside (one level deep, as the client has them), and their index as
+// particleModel or childEmitters.
 export async function buildEffectGlb(readFile, modelName) {
   const effect = loadEffectM2(modelName, readFile);
   if (!effect) return null;
-  const textureFor = (index) => {
-    const texture = effect.textures[index];
-    const blp = texture?.filename ? readFile(texture.filename) : null;
-    return blp ? { name: path.win32.basename(texture.filename), blp } : null;
+  const particleModels = [];
+  const indexOf = new Map();
+  const modelIndex = (filename) => {
+    const file = filename.replace(/\.md[xl]$/i, '.m2');
+    const key = file.toLowerCase();
+    if (!indexOf.has(key)) {
+      const model = loadEffectM2(file, readFile);
+      indexOf.set(key, model ? particleModels.push({ effect: model, textureFor: texturesOf(model, readFile) }) - 1 : null);
+    }
+    return indexOf.get(key);
   };
-  return writeGlb(buildEffectDocument(effect, { name: effect.name, textureFor }));
+  for (const emitter of effect.emitters) {
+    const model = emitter.modelFilename ? modelIndex(emitter.modelFilename) : null;
+    if (model !== null) emitter.particleModel = model;
+    const children = emitter.childEmittersFilename ? modelIndex(emitter.childEmittersFilename) : null;
+    if (children !== null) emitter.childEmitters = children;
+  }
+  return writeGlb(buildEffectDocument(effect, { name: effect.name, textureFor: texturesOf(effect, readFile), particleModels }));
 }

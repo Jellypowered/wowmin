@@ -374,10 +374,12 @@ test('parses unit aura lists and keeps each unit\'s latest until it goes stale o
   store.push(parsed, 1000);
   store.push({ units: [{ guid: 900, creature: true, spellIds: [853] }] }, 1000);
   assert.deepEqual(JSON.parse(JSON.stringify([...store.all(1000)])), [['p1', [48066, 48068]], ['c900', [853]]]);
-  // An empty list clears the unit; silence past the stale time drops it.
+  // An empty list clears the unit's auras but keeps it, so its last aura is
+  // seen to end; silence past the stale time drops it.
   store.push({ units: [{ guid: 900, creature: true, spellIds: [] }] }, 2000);
-  assert.deepEqual([...store.all(2000).keys()], ['p1']);
-  assert.equal(store.all(1000 + LIVE_AURA_STALE_MS + 1).size, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify([...store.all(2000)])), [['p1', [48066, 48068]], ['c900', []]]);
+  assert.deepEqual([...store.all(1000 + LIVE_AURA_STALE_MS + 1).keys()], ['c900']);
+  assert.equal(store.all(2000 + LIVE_AURA_STALE_MS + 1).size, 0);
 });
 
 test('interpolates creatures and drops ones that stop being sent', () => {
