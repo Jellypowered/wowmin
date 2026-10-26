@@ -19,6 +19,7 @@ import { CONTINENT_BOUNDS, worldToCanvas } from './utils/map-coords';
 import { getEnglishMotd, getServerUptime } from './utils/dashboard-data';
 import { calculateSessionTotalsAt, formatSessionReplayTime, isSessionRouteDiscontinuity } from './utils/session-replay';
 import { getClassIconHtml, getClassIconImage, getPlayerStateIconsHtml, getPlayerStateIndicators, getRacePortraitHtml, getResponsivePlayerIconScale, getStateIconImage, loadPlayerIconManifest } from './utils/player-icons';
+import { sceneExportNotice, sceneExportStatus } from '../../src/scene-export-version';
 import { formatBattlegroundOutcome } from '../../src/session-outcome';
 import { AppState, createInitialState, PlayerInfo } from './types/state';
 import type { CreatureInfo, StreamBotDecision, StreamCreatureSample, StreamStatus } from '../../src/types/api';
@@ -6492,6 +6493,10 @@ const $instanceCirclesBtn = $<HTMLButtonElement>('instance-circles-btn');
 const $instanceBotCard = $<HTMLElement>('instance-bot-card');
 const $instanceBotDecisions = $<HTMLElement>('instance-bot-decisions');
 const $instanceDebugOverlay = $<HTMLElement>('instance-debug-overlay');
+const $instanceSceneNotice = $<HTMLElement>('instance-scene-notice');
+const $instanceSceneNoticeText = $<HTMLElement>('instance-scene-notice-text');
+// Maps whose scene notice the viewer has dismissed, until the page reloads.
+const dismissedSceneNotices = new Set<number>();
 const $instanceWatchTitle = $<HTMLElement>('instance-watch-title');
 const $instanceWatchSubtitle = $<HTMLElement>('instance-watch-subtitle');
 const $instanceWatchStatus = $<HTMLElement>('instance-watch-status');
@@ -6525,6 +6530,9 @@ interface InstanceMapAssetMetadata {
 // <mapId>.scene.json, written by npm run extract:scenes.
 interface InstanceSceneMetadata {
   schemaVersion: number;
+  // The export's version (src/scene-export-version.ts); absent before it
+  // was kept.
+  exportVersion?: number;
   mapId: number;
   file: string;
   bounds: SceneBox;
@@ -7012,6 +7020,19 @@ async function loadInstanceScene(mapId: number): Promise<void> {
     instanceSceneLoads.delete(mapId);
     if (getSelectedInstanceSession()?.mapId === mapId) renderInstanceWatcher();
   }
+}
+
+// Says over the 3D view when the map's scene comes from an older export
+// than this WoWMin draws (or a newer one than it understands), and what to
+// run; hidden for current scenes, the flat map, and once dismissed.
+function renderInstanceSceneNotice(mapId: number | null): void {
+  if (!$instanceSceneNotice || !$instanceSceneNoticeText) return;
+  const scene = mapId === null ? null : getInstanceScene(mapId);
+  const notice = scene && instanceView3d && !dismissedSceneNotices.has(scene.mapId)
+    ? sceneExportNotice(sceneExportStatus(scene.exportVersion)) : null;
+  $instanceSceneNotice.hidden = !notice;
+  $instanceSceneNoticeText.textContent = notice ?? '';
+  if (scene) $instanceSceneNotice.dataset.mapId = String(scene.mapId);
 }
 
 function getInstanceSceneUrl(mapId: number): string | null {
@@ -8899,8 +8920,11 @@ function renderInstanceDebugOverlay(now: number): void {
   const frames = getInstanceDebugStats('frame', now);
   const perSecond = (kind: string) => (getInstanceDebugStats(kind, now).total / (INSTANCE_DEBUG_WINDOW_MS / 1000)).toFixed(1);
   const session = getSelectedInstanceSession();
+  const sceneExport = session ? getInstanceScene(session.mapId)?.exportVersion ?? 1 : null;
+  const sceneStatus = sceneExport === null ? 'current' : sceneExportStatus(sceneExport);
   const scene = $instanceWatchScene && !$instanceWatchScene.hidden
     ? `3D · ${$instanceWatchScene.dataset.drawCalls ?? '?'} draws · ${Math.round(Number($instanceWatchScene.dataset.triangles ?? 0) / 1000)}k tris · ${$instanceWatchScene.dataset.buffer ?? '?'} px`
+      + ` · export v${sceneExport}${sceneStatus === 'current' ? '' : ` (${sceneStatus})`}`
     : 'flat map';
   const floor = session ? getSelectedDungeonFloor(session) : null;
   const transform = getInstanceViewTransform();
@@ -8975,6 +8999,7 @@ function renderInstanceWatcher(): void {
       : null;
     $instanceWatchSubtitle.textContent = details
       ?? 'Sessions appear automatically while players or bots are inside an instance or battleground.';
+    renderInstanceSceneNotice(session?.mapId ?? null);
     $instanceFitBtn?.classList.remove('hidden');
     $instanceClearFocusBtn?.classList.toggle('hidden', !selectedInstancePlayerName);
   }
@@ -9292,6 +9317,10 @@ setInstanceFades(instanceFades, false);
 $instanceFadesBtn?.addEventListener('click', () => setInstanceFades(!instanceFades));
 setInstanceObjectLights(instanceObjectLights, false);
 $instanceObjectLightsBtn?.addEventListener('click', () => setInstanceObjectLights(!instanceObjectLights));
+$instanceSceneNotice?.querySelector('button')?.addEventListener('click', () => {
+  dismissedSceneNotices.add(Number($instanceSceneNotice.dataset.mapId));
+  $instanceSceneNotice.hidden = true;
+});
 $instanceAutoRefresh?.addEventListener('change', () => {
   if ($instanceAutoRefresh.checked) {
     void refreshInstanceWatcher();
