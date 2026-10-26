@@ -724,6 +724,11 @@ npm run extract:scenes -- --source "/path/to/WoW" --map 529
 npm run extract:scenes -- --source "/path/to/WoW" --all-instances
 ```
 
+Without `--source`, the command uses `WOWMIN_CLIENT_DATA`, from the
+environment or the same settings files the web service reads (`/etc/wowmin.env`,
+then `.env`), so `npm run extract:scenes -- --all-instances` is enough once
+it is set.
+
 A scene holds the map's buildings and their props, the props placed on the
 map, and the terrain and liquids of the area players use (each dungeon floor,
 or the world map's bounds), with props sharing a model drawn instanced. Every
